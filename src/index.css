@@ -12,3 +12,8 @@ html, body {
   height: 100%;
   touch-action: manipulation;
 }
+/* Verhindert Verrutschen und ungewolltes Handyscrollen bei Bildern, SVGs, PDFs und Canvas */
+img, svg, canvas, iframe, embed {
+  touch-action: none;
+  max-width: 100%;
+}
