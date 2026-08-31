@@ -3460,6 +3460,14 @@ const PDF_SAFE_RENDER_DPR_CAP = 2.0;
 // unabhängig von Gerätedichte. Browser-Canvas-Grenzen sind nicht einheitlich
 // spezifiziert; 4096px ist ein breit kompatibler, konservativer Wert.
 const PDF_SAFE_MAX_CANVAS_DIM_PX = 4096;
+// Nur für die Raster-Fallback-Stufe relevant (die Vektor-Stufe braucht kein
+// Re-Rendering, siehe renderPdfPageToSvgElement-Kommentar oben): erst ab dieser
+// zusätzlichen Zoomstufe gegenüber der zuletzt gerenderten Auflösung wird die
+// Bühne mit höherer Auflösung neu gerendert — verhindert unnötige Neu-Renderings
+// bei jeder minimalen Mausrad-/Pinch-Bewegung. 180ms Debounce liegt in der vom
+// Auftrag vorgegebenen Spanne von 150-200ms.
+const PDF_RASTER_RERENDER_ZOOM_FACTOR = 1.15;
+const PDF_RASTER_RERENDER_DEBOUNCE_MS = 180;
 
 // Wartet auf `promise`, bricht aber nach `ms` mit einer Ablehnung ab, falls sie bis
 // dahin nicht abgeschlossen ist — verhindert, dass ein hängendes (nicht fehlschlagendes,
@@ -3515,12 +3523,16 @@ async function renderPdfPageToSvgElement(pdfjsLib, page, operatorList) {
 
 // Sichere Raster-Fallback-Stufe (siehe Erläuterung oben) — fester, an devicePixelRatio
 // gekoppelter, aber hart gedeckelter Maßstab, zusätzlich hart begrenzte Canvas-
-// Pixelgröße. Rendert EINMALIG (kein Re-Rendering bei Zoom, identisch zum Vektor-Pfad
-// überlässt auch diese Stufe das Zoomen ausschließlich der CSS-Transformation der
-// äußeren "Bühne", siehe FloorPlanView).
-async function renderPdfPageToSafeCanvasElement(page) {
+// Pixelgröße. `extraScale` (Standard 1) ist der zusätzliche Zoom-Multiplikator: beim
+// ersten Rendering der Stufe ist er 1 (Basisauflösung für die volle Ansicht), bei
+// einem späteren, durch weiteres Hineinzoomen ausgelösten Nachladen (siehe
+// PdfPlanCanvas) entspricht er dem aktuellen App-Zoomfaktor, sodass die Bühne dann in
+// höherer, dem tatsächlichen Zoom entsprechender Auflösung neu gerendert wird — nur
+// begrenzt durch dieselbe harte PDF_SAFE_MAX_CANVAS_DIM_PX-Obergrenze wie beim
+// Erstrendering (Speicher-/GPU-Schutz bleibt in jedem Fall bestehen).
+async function renderPdfPageToSafeCanvasElement(page, extraScale = 1) {
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1.5 : 1.5;
-  const safeScale = Math.min(dpr, PDF_SAFE_RENDER_DPR_CAP);
+  const safeScale = Math.min(dpr, PDF_SAFE_RENDER_DPR_CAP) * Math.max(1, extraScale);
   let viewport = page.getViewport({ scale: safeScale });
   const largestDim = Math.max(viewport.width, viewport.height);
   if (largestDim > PDF_SAFE_MAX_CANVAS_DIM_PX) {
@@ -3533,9 +3545,23 @@ async function renderPdfPageToSafeCanvasElement(page) {
   return canvas;
 }
 
-const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url }, ref) {
+const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, ref) {
   const hostRef = useRef(null); // DOM-Container, in den je nach Rendering-Stufe entweder das SVG- oder das Canvas-Element eingehängt wird
   const [status, setStatus] = useState("loading"); // "loading" | "ready" | "error"
+
+  // Zoomabhängiges Nachladen betrifft ausschließlich die Raster-Fallback-Stufe — die
+  // bevorzugte Vektor-Stufe (SVG) ist bei jedem Zoomfaktor bereits mathematisch scharf
+  // und braucht dafür kein Re-Rendering (siehe Kommentar an renderPdfPageToSvgElement).
+  // tierRef hält fest, welche Stufe aktuell aktiv ist; pageRef die zugehörige pdf.js-
+  // Seite, damit ein späteres Nachladen nicht das komplette Dokument erneut anfragen
+  // muss. lastRasterScaleRef ist der Zoom-Multiplikator, mit dem die aktuell sichtbare
+  // Raster-Auflösung zuletzt gerendert wurde. loadGenerationRef schützt einen bereits
+  // laufenden Debounce-Timer davor, nach einem zwischenzeitlichen URL-Wechsel (neuer
+  // Plan) noch verspätet auf den nun falschen hostRef/pageRef zuzugreifen.
+  const tierRef = useRef(null); // 'vector' | 'raster' | null
+  const pageRef = useRef(null);
+  const lastRasterScaleRef = useRef(1);
+  const loadGenerationRef = useRef(0);
 
   // Lädt Dokument + erste Seite bei jeder neuen PDF-URL neu, versucht zuerst die
   // Vektor-Stufe (mit Zeitlimit) und fällt bei Fehlschlag/Zeitüberschreitung/zu hoher
@@ -3543,6 +3569,10 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url }, ref) {
   // an renderPdfPageToSvgElement/renderPdfPageToSafeCanvasElement).
   useEffect(() => {
     let cancelled = false;
+    loadGenerationRef.current += 1;
+    tierRef.current = null;
+    pageRef.current = null;
+    lastRasterScaleRef.current = 1;
     setStatus("loading");
 
     (async () => {
@@ -3562,9 +3592,13 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url }, ref) {
             PDF_SVG_RENDER_TIMEOUT_MS,
             "PDF-Vektor-Rendering"
           );
+          tierRef.current = "vector";
         } catch (svgErr) {
           console.warn("PDF-Vektor-Rendering nicht möglich/zu langsam, Fallback auf sichere Raster-Auflösung:", svgErr);
           renderedElement = await renderPdfPageToSafeCanvasElement(page);
+          tierRef.current = "raster";
+          pageRef.current = page;
+          lastRasterScaleRef.current = 1;
         }
         if (cancelled) return;
 
@@ -3582,6 +3616,37 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url }, ref) {
       cancelled = true;
     };
   }, [url]);
+
+  // Zoomabhängiges Nachladen der Raster-Fallback-Stufe: sobald spürbar weiter
+  // hineingezoomt wird, als die aktuell sichtbare Auflösung abdeckt, wird nach einer
+  // kurzen Zoom-Pause (Debounce) mit höherer, an devicePixelRatio UND aktuellem
+  // Zoomfaktor gekoppelter Auflösung neu gerendert (siehe
+  // renderPdfPageToSafeCanvasElement). Greift nicht während einer laufenden Zoom-
+  // Geste (die kommt über CSS transform: scale(...) der äußeren "Bühne", völlig ohne
+  // Neu-Rendering aus), sondern erst kurz nach deren Ende.
+  useEffect(() => {
+    if (tierRef.current !== "raster") return undefined;
+    if (!pageRef.current) return undefined;
+    if (zoomScale <= lastRasterScaleRef.current * PDF_RASTER_RERENDER_ZOOM_FACTOR) return undefined;
+
+    const myGeneration = loadGenerationRef.current;
+    const timer = setTimeout(async () => {
+      if (loadGenerationRef.current !== myGeneration) return; // zwischenzeitlich neuer Plan geladen
+      const page = pageRef.current;
+      const host = hostRef.current;
+      if (!page || !host) return;
+      try {
+        const canvas = await renderPdfPageToSafeCanvasElement(page, zoomScale);
+        if (loadGenerationRef.current !== myGeneration) return;
+        host.replaceChildren(canvas);
+        lastRasterScaleRef.current = zoomScale;
+      } catch (err) {
+        console.warn("Hochauflösendes Nachladen der PDF-Raster-Fallback-Stufe fehlgeschlagen, bisherige Auflösung bleibt sichtbar:", err);
+      }
+    }, PDF_RASTER_RERENDER_DEBOUNCE_MS);
+
+    return () => clearTimeout(timer);
+  }, [zoomScale]);
 
   return (
     <div ref={ref} className="relative aspect-[4/3] w-full overflow-hidden bg-white">
@@ -3715,7 +3780,7 @@ const SvgPlanCanvas = forwardRef(function SvgPlanCanvas({ url }, ref) {
 // vereinzelt dokumentierte Darstellungs-Eigenheiten bei komplexem HTML-Inhalt — sollte
 // es auf einem Baustellen-Tablet Auffälligkeiten geben, bitte melden, dann prüfen wir
 // gezielt nach.
-const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, children }, ref) {
+const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, zoomScale = 1, children }, ref) {
   const measureRef = useRef(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 
@@ -3746,7 +3811,7 @@ const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, children 
 
   return (
     <div ref={setRefs} className="relative w-full">
-      {planKind === "pdf" ? <PdfPlanCanvas url={url} /> : <SvgPlanCanvas url={url} />}
+      {planKind === "pdf" ? <PdfPlanCanvas url={url} zoomScale={zoomScale} /> : <SvgPlanCanvas url={url} />}
       {hasSize && (
         <svg
           viewBox={`0 0 ${stageSize.width} ${stageSize.height}`}
@@ -7402,7 +7467,7 @@ function FloorPlanView({
                   // eingebettet sind — beide skalieren dadurch über dieselbe SVG-Geometrie,
                   // nicht nur über eine daneben liegende, lediglich synchron transformierte
                   // HTML-Ebene. Details und Abwägungen siehe Kommentar bei PlanSvgStage.
-                  <PlanSvgStage ref={imgRef} planKind={isPdf ? "pdf" : "svg"} url={plan.image_url}>
+                  <PlanSvgStage ref={imgRef} planKind={isPdf ? "pdf" : "svg"} url={plan.image_url} zoomScale={scale}>
                     <PinsAndNotesLayer
                       visiblePins={visiblePins}
                       pinNumberById={pinNumberById}
