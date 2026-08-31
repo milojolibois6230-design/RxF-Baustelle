@@ -949,6 +949,103 @@ function generateOfflineId() {
   return `${OFFLINE_ID_PREFIX}${crypto.randomUUID()}`;
 }
 
+// ----------------------------------------------------------------------------------
+// OFFLINE-ANMELDUNG — Fallback für den verpflichtenden Login-Bildschirm (siehe
+// LoginScreen/App) ohne Netzverbindung
+// ----------------------------------------------------------------------------------
+// Auf der Baustelle ist zeitweise kein Netz vorhanden. Ein Passwort lässt sich ohne
+// Verbindung nicht gegen Supabase Auth prüfen — deshalb wird bei jeder erfolgreichen
+// ONLINE-Anmeldung (siehe handleSignIn in App()) ein gesalzener PBKDF2-Fingerabdruck
+// des Passworts (NICHT das Passwort selbst) lokal auf diesem Gerät hinterlegt. Eine
+// spätere Anmeldung ohne Netz vergleicht den Fingerabdruck des eingegebenen Passworts
+// gegen diesen gespeicherten Wert. Wichtige, bewusste Grenze: das entsperrt
+// ausschließlich die Ansicht der App (isAuthenticated) und die bereits offline
+// zwischengespeicherten Projektdaten — echte Schreibaktionen (Pin anlegen/verschieben,
+// Notiz, Foto, …) bleiben unverändert an eine echte Supabase-Session gebunden (siehe
+// requireAuth() in App()), weil Row-Level-Security serverseitig zwingend ein echtes
+// Auth-Token voraussetzt. Ohne mindestens eine erfolgreiche Online-Anmeldung auf
+// diesem Gerät ist eine Offline-Anmeldung bewusst NICHT möglich — ein Passwort
+// vollständig ohne jede vorherige Online-Prüfung "offline zu erfinden" wäre keine
+// echte Authentifizierung mehr, sondern eine Sicherheitslücke.
+const OFFLINE_AUTH_CACHE_KEY = "baudoc_offline_auth_v1";
+const OFFLINE_AUTH_PBKDF2_ITERATIONS = 120000;
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function deriveOfflineCredentialFingerprint(password, saltBytes) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: saltBytes, iterations: OFFLINE_AUTH_PBKDF2_ITERATIONS, hash: "SHA-256" },
+    keyMaterial,
+    256
+  );
+  return bytesToBase64(new Uint8Array(bits));
+}
+
+// Wird nach jeder erfolgreichen ONLINEN Anmeldung aufgerufen (handleSignIn). Bewusst
+// ohne Rückgabewert/geworfenen Fehler nach außen — ein Cache-Schreibfehler (z.B. sehr
+// alter Browser ohne Web Crypto, voller localStorage) darf die bereits erfolgreiche
+// Anmeldung nicht nachträglich als Fehler erscheinen lassen, er verkleinert lediglich
+// stillschweigend die Offline-Fallback-Abdeckung.
+async function cacheOfflineCredential(email, password) {
+  if (typeof crypto === "undefined" || !crypto.subtle) return;
+  try {
+    const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+    const fingerprint = await deriveOfflineCredentialFingerprint(password, saltBytes);
+    writeJsonStorage(OFFLINE_AUTH_CACHE_KEY, {
+      email: email.trim().toLowerCase(),
+      salt: bytesToBase64(saltBytes),
+      fingerprint,
+      cachedAt: Date.now(),
+    });
+  } catch (err) {
+    console.error("Offline-Zugangsdaten konnten nicht zwischengespeichert werden:", err);
+  }
+}
+
+async function verifyOfflineCredential(email, password) {
+  if (typeof crypto === "undefined" || !crypto.subtle) return false;
+  const cached = readJsonStorage(OFFLINE_AUTH_CACHE_KEY, null);
+  if (!cached || cached.email !== email.trim().toLowerCase()) return false;
+  try {
+    const saltBytes = base64ToBytes(cached.salt);
+    const fingerprint = await deriveOfflineCredentialFingerprint(password, saltBytes);
+    return fingerprint === cached.fingerprint;
+  } catch (err) {
+    console.error("Offline-Anmeldung konnte nicht geprüft werden:", err);
+    return false;
+  }
+}
+
+// Unterscheidet eine echte Verbindungsstörung (→ Offline-Fallback erlaubt) von einer
+// aktiven, autoritativen Ablehnung durch Supabase selbst (z.B. falsches Passwort bei
+// bestehender Verbindung → Offline-Fallback NICHT erlauben, sonst könnte ein veralteter
+// lokaler Fingerabdruck eine inzwischen serverseitig widerrufene Anmeldung übertünchen).
+// Heuristik, kein exakter Vertragstest: Netzwerkfehler äußern sich browser- und
+// laufzeitübergreifend uneinheitlich (u.a. als TypeError, als Supabase-eigener
+// AuthRetryableFetchError, oder — über withTimeout — als eigene Zeitlimit-Meldung).
+function isNetworkFailure(err) {
+  if (!err) return false;
+  if (err.name === "AuthRetryableFetchError") return true;
+  if (err instanceof TypeError) return true;
+  const msg = String(err?.message || "");
+  if (msg.includes("Zeitlimit")) return true;
+  if (/failed to fetch|network|internet|Verbindung/i.test(msg)) return true;
+  return false;
+}
+
 // ---- Lese-Cache (Abschnitt 15.1) --------------------------------------------------
 
 function cacheProjectsOffline(projects) {
@@ -3651,6 +3748,152 @@ const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, children 
 });
 
 // ----------------------------------------------------------------------------------
+// LOGIN-BILDSCHIRM — verpflichtende Anmeldesperre nach dem Intro (siehe isAuthenticated
+// in App()): solange isAuthenticated false ist, wird ausschließlich dieser vollflächige
+// Bildschirm gerendert, weder Kopfzeile/Navigation noch Projektlisten oder Baupläne
+// existieren währenddessen im Rendering-Baum. Eigenständig von AuthModal weiter unten
+// (das bleibt der schlanke Inline-Dialog, mit dem ein bereits eingeloggter Betrachter
+// innerhalb der App zusätzlich eine Bearbeitungs-Session eröffnet/registriert) — hier
+// geht es um den Zugriff auf die App als Ganzes.
+// ----------------------------------------------------------------------------------
+function LoginScreen({ onLogin, onRegister }) {
+  // Registrieren ist bewusst als sekundärer, eingeklappter Link statt eines
+  // gleichwertigen zweiten Tabs gestaltet (anders als im internen AuthModal weiter
+  // unten) — die Aufgabenstellung beschreibt hier explizit einen Anmelde-Bildschirm.
+  // Ganz weglassen ging aber nicht: ohne ihn gäbe es hinter der neuen App-
+  // Zugriffssperre keinen Weg mehr, überhaupt ein erstes Konto anzulegen (Supabase-
+  // Auth-Zugangsdaten selbst entstehen ausschließlich über signUp, die
+  // Benutzerverwaltung im Hauptbereich legt nur das fachliche Profil in app_users an,
+  // siehe createUser) — das hätte eine bestehende Kernfunktion faktisch unerreichbar
+  // gemacht.
+  const [mode, setMode] = useState("login"); // "login" | "register"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+
+  const switchMode = (next) => {
+    setMode(next);
+    setError("");
+    setInfo("");
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!email.trim() || !password) {
+      setError("Bitte E-Mail und Passwort eingeben.");
+      return;
+    }
+    setError("");
+    setInfo("");
+    setSubmitting(true);
+    try {
+      if (mode === "login") {
+        await onLogin(email.trim(), password);
+        // Bei Erfolg übernimmt App() über isAuthenticated den Wechsel zur
+        // Hauptanwendung — dieser Bildschirm wird dadurch unmounted, ein
+        // Zurücksetzen von submitting hier wäre wirkungslos bzw. würde nur unnötig
+        // knapp vor dem Unmount rendern.
+      } else {
+        await onRegister(email.trim(), password);
+        setInfo("Registrierung erfolgreich. Falls eine Bestätigungs-E-Mail erforderlich ist, bitte den Posteingang prüfen und danach anmelden.");
+        switchMode("login");
+        setSubmitting(false);
+      }
+    } catch (err) {
+      console.error("Anmeldung fehlgeschlagen:", err);
+      setError(err?.message || "Anmeldung fehlgeschlagen. Bitte erneut versuchen.");
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-100 px-4">
+      <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl sm:p-8">
+        <div className="mb-6 flex flex-col items-center gap-2 text-center">
+          <BrandLogotype tone="brand" size="md" />
+          <p className="text-sm text-slate-500">Baustellendokumentation — Anmeldung erforderlich</p>
+        </div>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <FieldLabel>E-Mail</FieldLabel>
+            <input
+              type="email"
+              autoComplete="username"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              disabled={submitting}
+              placeholder="name@firma.de"
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+          <div>
+            <FieldLabel>Passwort</FieldLabel>
+            <div className="relative">
+              <input
+                type={showPassword ? "text" : "password"}
+                autoComplete={mode === "login" ? "current-password" : "new-password"}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={submitting}
+                placeholder="••••••••"
+                className={`${TEXT_INPUT_CLASS} pr-10`}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                tabIndex={-1}
+                title={showPassword ? "Passwort verbergen" : "Passwort anzeigen"}
+                className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 transition hover:text-slate-600"
+              >
+                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+          </div>
+          {error && (
+            <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+          {info && <p className="text-xs font-medium text-emerald-600">{info}</p>}
+          <button
+            type="submit"
+            disabled={submitting}
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {submitting ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : mode === "login" ? (
+              <LogIn size={16} />
+            ) : (
+              <UserPlus size={16} />
+            )}
+            {mode === "login" ? "Anmelden" : "Registrieren"}
+          </button>
+        </form>
+        <div className="mt-4 text-center">
+          <button
+            type="button"
+            onClick={() => switchMode(mode === "login" ? "register" : "login")}
+            disabled={submitting}
+            className="text-xs font-semibold text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {mode === "login" ? "Noch kein Konto? Registrieren" : "Bereits ein Konto? Anmelden"}
+          </button>
+        </div>
+        <p className="mt-4 text-center text-[11px] leading-relaxed text-slate-400">
+          Ohne Netzverbindung ist eine Anmeldung möglich, wenn an diesem Gerät zuvor bereits
+          einmal online angemeldet wurde.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
 // AUTH-MODAL — Anmelden / Registrieren (Supabase Auth, E-Mail + Passwort)
 // ----------------------------------------------------------------------------------
 
@@ -6074,7 +6317,15 @@ function PinsAndNotesLayer({
   startNoteDrag,
   noteDragMovedRef,
   onNoteClick,
+  isEditMode = false,
 }) {
+  // Drag-&-Drop ist zusätzlich zur Anmeldung (session) an den Bearbeitungs-Modus
+  // gekoppelt (siehe isEditMode-Kommentar in FloorPlanView) — ist isEditMode aus,
+  // ist canDrag false und PinMarker/PlanNoteMarker brechen jeden Drag-Start bereits
+  // in ihrem eigenen onPointerDown-Handler ab (kein stopPropagation, das Event
+  // bubblet ungehindert zum Viewport hoch), Tippen/Klicken zum Öffnen bleibt davon
+  // unberührt, weil onClick unabhängig vom draggable-Zustand ausgelöst wird.
+  const canDrag = !!session && isEditMode;
   return (
     <>
       {visiblePins.map((pin) => (
@@ -6082,7 +6333,7 @@ function PinsAndNotesLayer({
           key={pin.id}
           pin={draggingPinId === pin.id && dragPos ? { ...pin, x: dragPos.x, y: dragPos.y } : pin}
           number={pinNumberById.get(pin.id)}
-          draggable={!!session}
+          draggable={canDrag}
           isDragging={draggingPinId === pin.id}
           viewScale={scale}
           onDragStart={(e) => startDrag(pin, e)}
@@ -6100,7 +6351,7 @@ function PinsAndNotesLayer({
           <PlanNoteMarker
             key={note.id}
             note={draggingNoteId === note.id && noteDragPos ? { ...note, x: noteDragPos.x, y: noteDragPos.y } : note}
-            draggable={!!session}
+            draggable={canDrag}
             isDragging={draggingNoteId === note.id}
             viewScale={scale}
             onDragStart={(e) => startNoteDrag(note, e)}
@@ -6179,6 +6430,21 @@ function FloorPlanView({
   const dragMovedRef = useRef(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
 
+  // Bearbeitungs-Modus (Edit Mode): standardmäßig AUS ("Positionen fixiert"), damit
+  // Pins/Notizen auf Mobilgeräten beim Zoomen/Verschieben mit zwei Fingern nicht
+  // versehentlich gegriffen werden — landet eine der beiden Pinch-Zoom-Berührungen
+  // exakt auf einem Pin, würde PinMarker/PlanNoteMarker sie sonst per stopPropagation()
+  // abfangen und in ein Pin-Verschieben statt in die Zoom-Geste des Viewports übersetzen
+  // (siehe handleViewportPointerDown/Move weiter unten). Erst ein bewusstes Umschalten
+  // auf "Pins verschieben" gibt das Drag-&-Drop wieder frei (siehe draggable-Prop in
+  // PinsAndNotesLayer). Tippen/Klicken zum Öffnen der Detailkarte bleibt in JEDEM
+  // Zustand uneingeschränkt möglich, weil der onClick-Handler unabhängig von draggable
+  // ausgelöst wird — nur der onPointerDown-basierte Drag-Start ist an isEditMode
+  // gekoppelt. Wird beim Wechsel der Grundrissskizze zurückgesetzt (siehe Effekt bei
+  // Zoom/Pan-Reset), damit man nie versehentlich im freigeschalteten Zustand auf einen
+  // anderen Plan wechselt.
+  const [isEditMode, setIsEditMode] = useState(false);
+
   // Skizzen-Notizen (Plan Annotations) — eigener, vom Mängel-Pin-Modus getrennter
   // "Werkzeug"-Zustand: solange noteMode aktiv ist, legt ein Tap auf den Plan eine
   // neue Notiz statt eines Pins an (siehe handleViewportPointerUp). showNotes
@@ -6233,10 +6499,13 @@ function FloorPlanView({
   const pinchGestureRef = useRef(null); // { startDistance, startScale, startTranslate }
 
   // Beim Wechsel der Grundrissskizze Zoom/Pan zurücksetzen, damit jede Skizze wieder
-  // in der ursprünglichen 100%-Ansicht startet.
+  // in der ursprünglichen 100%-Ansicht startet. isEditMode wird bewusst mit
+  // zurückgesetzt (immer "Positionen fixiert" beim Öffnen einer Skizze) — sicherer
+  // Standardzustand statt eines versehentlich "mitgenommenen" freigeschalteten Modus.
   useEffect(() => {
     setScale(1);
     setTranslate({ x: 0, y: 0 });
+    setIsEditMode(false);
   }, [plan?.id]);
 
   // Math.max(..., 0.0001) verhindert rein defensiv eine Division durch 0 in
@@ -6674,9 +6943,15 @@ function FloorPlanView({
               : creatingNote
               ? "Notiz wird platziert…"
               : noteMode
-              ? "Notiz-Modus aktiv: Auf den Plan tippen, um eine Notiz zu platzieren — bestehende Notizen lassen sich per Ziehen verschieben."
+              ? `Notiz-Modus aktiv: Auf den Plan tippen, um eine Notiz zu platzieren.${
+                  isEditMode ? " Bestehende Notizen lassen sich per Ziehen verschieben." : " Positionen sind fixiert — zum Verschieben bestehender Notizen \"Pins verschieben\" aktivieren."
+                }`
               : session
-              ? "Auf den Grundriss tippen, um einen neuen Pin zu setzen — bestehende Pins lassen sich per Ziehen verschieben. Mit dem Mausrad, per Zwei-Finger-Geste oder über die Zoom-Buttons lässt sich der Plan stufenlos vergrößern und verschieben."
+              ? `Auf den Grundriss tippen, um einen neuen Pin zu setzen.${
+                  isEditMode
+                    ? " Bestehende Pins lassen sich per Ziehen verschieben."
+                    : " Positionen sind fixiert — zum Verschieben bestehender Pins \"Pins verschieben\" aktivieren, praktisch beim Zoomen mit zwei Fingern auf dem Handy."
+                } Mit dem Mausrad, per Zwei-Finger-Geste oder über die Zoom-Buttons lässt sich der Plan stufenlos vergrößern und verschieben.`
               : "Nur Ansicht — zum Setzen oder Verschieben von Pins bitte anmelden. Zoomen und Verschieben des Grundrisses ist auch ohne Anmeldung möglich."}
           </p>
         </div>
@@ -6690,6 +6965,24 @@ function FloorPlanView({
           <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700 ring-1 ring-inset ring-emerald-200">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> {done} erledigt
           </span>
+          {session && (
+            <button
+              type="button"
+              onClick={() => setIsEditMode((v) => !v)}
+              title={
+                isEditMode
+                  ? "Pins/Notizen sind entsperrt — per Ziehen verschiebbar. Klicken, um wieder zu fixieren."
+                  : "Pins/Notizen sind fixiert — Zoomen/Verschieben mit zwei Fingern kann sie nicht versehentlich verschieben. Klicken, um das Verschieben freizugeben."
+              }
+              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-semibold shadow-sm transition ${
+                isEditMode
+                  ? "bg-[#FF2A00] text-white hover:bg-[#E02400]"
+                  : "border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+              }`}
+            >
+              {isEditMode ? "✏️ Pins verschieben" : "🔒 Positionen fixiert"}
+            </button>
+          )}
           {session && (
             <button
               type="button"
@@ -6891,6 +7184,7 @@ function FloorPlanView({
                       startNoteDrag={startNoteDrag}
                       noteDragMovedRef={noteDragMovedRef}
                       onNoteClick={onNoteClick}
+                      isEditMode={isEditMode}
                     />
                   </>
                 )}
@@ -6920,6 +7214,7 @@ function FloorPlanView({
                       startNoteDrag={startNoteDrag}
                       noteDragMovedRef={noteDragMovedRef}
                       onNoteClick={onNoteClick}
+                      isEditMode={isEditMode}
                     />
                   </PlanSvgStage>
                 )}
@@ -6949,6 +7244,7 @@ function FloorPlanView({
                       startNoteDrag={startNoteDrag}
                       noteDragMovedRef={noteDragMovedRef}
                       onNoteClick={onNoteClick}
+                      isEditMode={isEditMode}
                     />
                   </>
                 )}
@@ -8313,6 +8609,16 @@ function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [authModalOpen, setAuthModalOpen] = useState(false);
 
+  // Verpflichtende App-Zugriffssperre (siehe LoginScreen): getrennt von "session", weil
+  // sie zusätzlich zur echten Supabase-Session auch über die Offline-Anmeldung
+  // (verifyOfflineCredential) freigeschaltet werden kann, ohne dass dabei eine echte,
+  // RLS-fähige Session entsteht. authSource hält fest, auf welchem Weg — steuert u.a.
+  // die Kopfzeilen-Anzeige weiter unten. Default false: vor der ersten erfolgreichen
+  // Anmeldung (bzw. bevor eine bereits von Supabase persistierte Session geladen ist)
+  // ist ausschließlich der Login-Bildschirm sichtbar.
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authSource, setAuthSource] = useState(null); // 'online' | 'offline' | null
+
   useEffect(() => {
     let mounted = true;
     supabase.auth.getSession().then(({ data, error }) => {
@@ -8330,9 +8636,28 @@ function App() {
     };
   }, []);
 
+  // Sobald eine echte Supabase-Session vorliegt (frisch angemeldet, oder von Supabase
+  // selbst aus einer früheren Sitzung persistiert und beim Start automatisch
+  // wiederhergestellt — das funktioniert dank localStorage-Persistenz sogar ohne
+  // Netzverbindung), gilt die App-Zugriffssperre als aufgehoben. Bewusst einseitig
+  // (setzt nur auf true, nie zurück auf false) — das Abmelden läuft ausschließlich
+  // über handleAppLogout weiter unten, damit ein kurzzeitig null werdendes "session"
+  // während eines Auth-Übergangs nicht versehentlich zurück auf den Login-Bildschirm
+  // wechselt, während z. B. die Offline-Anmeldung bereits aktiv ist.
+  useEffect(() => {
+    if (session) {
+      setIsAuthenticated(true);
+      setAuthSource("online");
+    }
+  }, [session]);
+
   // Zentraler Guard für alle Schreibaktionen: Gäste (kein session) bekommen statt der
   // Aktion das Login-Modal angezeigt (Klick auf "Neues Projekt", "Bearbeiten",
-  // "Löschen", Pin setzen/verschieben, Etage hinzufügen, …).
+  // "Löschen", Pin setzen/verschieben, Etage hinzufügen, …). Bewusst weiterhin an
+  // "session" (nicht "isAuthenticated") gebunden: die App-Zugriffssperre erlaubt zwar
+  // per Offline-Anmeldung das Betrachten der App, tatsächliche Schreibaktionen
+  // benötigen aber zwingend eine echte, RLS-fähige Supabase-Session (siehe
+  // OFFLINE-ANMELDUNG-Kommentar bei verifyOfflineCredential weiter oben).
   const requireAuth = () => {
     if (!session) {
       setAuthModalOpen(true);
@@ -8344,6 +8669,11 @@ function App() {
   const handleSignIn = async (email, password) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) throw error;
+    // Fingerabdruck für eine spätere Offline-Anmeldung an diesem Gerät aktualisieren —
+    // bewusst ohne await/eigene Fehlerbehandlung hier: cacheOfflineCredential fängt
+    // Fehler bereits intern ab und darf die gerade erfolgreiche Anmeldung nicht
+    // nachträglich blockieren oder verzögern.
+    cacheOfflineCredential(email, password);
   };
 
   const handleSignUp = async (email, password) => {
@@ -8359,6 +8689,44 @@ function App() {
       console.error("Abmelden fehlgeschlagen:", err);
       setGlobalError("Abmelden ist fehlgeschlagen. Bitte erneut versuchen.");
     }
+  };
+
+  // Login-Bildschirm-Handler (siehe LoginScreen): versucht zuerst die echte Online-
+  // Anmeldung (über handleSignIn, mit Zeitlimit gegen ein hängendes Funkloch-Fetch),
+  // weicht bei einer tatsächlichen Verbindungsstörung (nicht bei aktiv von Supabase
+  // abgelehnten Zugangsdaten, siehe isNetworkFailure) auf die lokale Offline-Anmeldung
+  // aus. Wirft bei endgültigem Fehlschlag, damit LoginScreen die Meldung anzeigen kann.
+  const handleGateLogin = async (email, password) => {
+    if (isOnline()) {
+      try {
+        await withTimeout(handleSignIn(email, password), 9000, "Online-Anmeldung");
+        return;
+      } catch (err) {
+        if (!isNetworkFailure(err)) throw err;
+        console.warn("Online-Anmeldung nicht erreichbar, versuche Offline-Anmeldung:", err);
+      }
+    }
+    const offlineOk = await verifyOfflineCredential(email, password);
+    if (offlineOk) {
+      setIsAuthenticated(true);
+      setAuthSource("offline");
+      return;
+    }
+    throw new Error(
+      isOnline()
+        ? "Anmeldung fehlgeschlagen. Bitte Zugangsdaten prüfen."
+        : "Keine Internetverbindung und keine passenden, auf diesem Gerät zwischengespeicherten Zugangsdaten gefunden. Für die Offline-Anmeldung ist einmalig eine erfolgreiche Online-Anmeldung auf diesem Gerät erforderlich."
+    );
+  };
+
+  // Vollständiges Abmelden aus Sicht der App-Zugriffssperre: löst bei Bedarf zusätzlich
+  // die echte Supabase-Session auf (handleSignOut) und setzt in jedem Fall isAuthenticated/
+  // authSource zurück — auch im reinen Offline-Anmeldefall, in dem es ohnehin keine
+  // echte Session zum Auflösen gibt.
+  const handleAppLogout = async () => {
+    if (session) await handleSignOut();
+    setIsAuthenticated(false);
+    setAuthSource(null);
   };
 
   // -------------------------------------------------------------------------------
@@ -8489,7 +8857,12 @@ function App() {
     };
   }, []);
 
+  // An isAuthenticated statt an [] gebunden: solange die verpflichtende App-
+  // Zugriffssperre aktiv ist (siehe LoginScreen), sollen Projektdaten erst gar nicht im
+  // Hintergrund abgerufen werden — nicht nur nicht angezeigt. Feuert erneut, sobald
+  // isAuthenticated von false auf true wechselt (erfolgreiche Anmeldung).
   useEffect(() => {
+    if (!isAuthenticated) return undefined;
     let cancelled = false;
     (async () => {
       setLoadingProjects(true);
@@ -8521,12 +8894,15 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isAuthenticated]);
 
   // Gewerke sind öffentlich lesbar und unabhängig vom ausgewählten Projekt — werden
-  // deshalb einmalig beim Start geladen (inkl. automatischer Erstbefüllung des
-  // Standard-Katalogs, falls die Tabelle noch leer ist, siehe fetchTrades()).
+  // deshalb einmalig nach erfolgreicher Anmeldung geladen (inkl. automatischer
+  // Erstbefüllung des Standard-Katalogs, falls die Tabelle noch leer ist, siehe
+  // fetchTrades()). Ebenfalls an isAuthenticated statt an [] gebunden, aus demselben
+  // Grund wie beim Projekte-Abruf direkt darüber.
   useEffect(() => {
+    if (!isAuthenticated) return undefined;
     let cancelled = false;
     (async () => {
       try {
@@ -8540,7 +8916,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isAuthenticated]);
 
   // Die Benutzerliste enthält E-Mail-Adressen (RLS-Policy: nur "authenticated" darf
   // lesen) und wird deshalb erst nach erfolgreichem Login geladen.
@@ -9755,6 +10131,15 @@ function App() {
   return (
     <div className="min-h-screen w-full bg-slate-50 font-sans text-slate-900">
       <SplashScreen />
+      {/* Verpflichtende App-Zugriffssperre (siehe isAuthenticated in App()): solange sie
+          aktiv ist, wird ausschließlich LoginScreen gerendert — weder Kopfzeile/
+          Navigation noch Projektlisten, Etagen, Grundrisse oder Pins existieren dann im
+          Rendering-Baum, entsprechende Datenabrufe (siehe DATA-FETCHING-Effekte weiter
+          oben) laufen ebenfalls erst nach erfolgreicher Anmeldung an. */}
+      {!isAuthenticated ? (
+        <LoginScreen onLogin={handleGateLogin} onRegister={handleSignUp} />
+      ) : (
+        <>
       {/* Top bar — klares Weiß mit feiner Umrandung statt einer dunklen Fläche: passt
           sich damit nahtlos in das übrige, helle Anwendungsdesign ein. Die Wortmarke
           steht jetzt in Markenrot (tone="brand") statt in Weiß, da der Untergrund
@@ -9836,19 +10221,38 @@ function App() {
                   <User size={13} /> Angemeldet als {session.user?.email}
                 </span>
                 <button
-                  onClick={handleSignOut}
+                  onClick={handleAppLogout}
                   className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
                 >
                   <LogOut size={13} /> Abmelden
                 </button>
               </>
             ) : (
-              <button
-                onClick={() => setAuthModalOpen(true)}
-                className="inline-flex items-center gap-1.5 rounded-md bg-[#FF2A00] px-2.5 py-1.5 font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
-              >
-                <LogIn size={13} /> Anmelden
-              </button>
+              // An dieser Stelle ist isAuthenticated zwingend true (siehe App-
+              // Zugriffssperre weiter oben) — dieser Zweig ist also ausschließlich die
+              // Offline-Anmeldung (verifyOfflineCredential): keine echte, RLS-fähige
+              // Supabase-Session vorhanden. Schreibaktionen bleiben in diesem Zustand
+              // weiterhin über requireAuth() an eine echte Online-Anmeldung gebunden
+              // (dort öffnet sich bei Bedarf ganz normal das AuthModal) — hier geht es
+              // ausschließlich um das Beenden der App-Zugriffssperre selbst.
+              <>
+                <span
+                  className="hidden items-center gap-1.5 text-amber-600 sm:flex"
+                  title="Offline angemeldet — für Bearbeitungen ist zusätzlich eine Online-Anmeldung erforderlich, sobald wieder Netz verfügbar ist."
+                >
+                  {/* authSource dient hier als Plausibilitätsprüfung: session ist null, das
+                      kann nach der App-Zugriffssperre weiter oben nur die Offline-Anmeldung
+                      sein — bleibt authSource dennoch unerwartet leer, wird trotzdem kein
+                      irreführendes "Offline" behauptet. */}
+                  <WifiOff size={13} /> {authSource === "offline" ? "Offline angemeldet" : "Angemeldet"}
+                </span>
+                <button
+                  onClick={handleAppLogout}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
+                >
+                  <LogOut size={13} /> Abmelden
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -10066,6 +10470,8 @@ function App() {
           generatedBy={currentActor?.name}
           onClose={() => setPdfExportModalState(null)}
         />
+      )}
+        </>
       )}
     </div>
   );
