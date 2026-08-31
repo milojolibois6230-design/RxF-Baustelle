@@ -3530,7 +3530,11 @@ async function renderPdfPageToSvgElement(pdfjsLib, page, operatorList) {
 // höherer, dem tatsächlichen Zoom entsprechender Auflösung neu gerendert wird — nur
 // begrenzt durch dieselbe harte PDF_SAFE_MAX_CANVAS_DIM_PX-Obergrenze wie beim
 // Erstrendering (Speicher-/GPU-Schutz bleibt in jedem Fall bestehen).
-async function renderPdfPageToSafeCanvasElement(page, extraScale = 1) {
+// `renderTaskRef` (optional) hält den zuletzt gestarteten pdf.js-RenderTask dieser
+// Stufe fest: zoomt der Nutzer weiter, während ein vorheriges Nachladen noch läuft,
+// wird dieses zuerst sauber per renderTask.cancel() abgebrochen, statt zwei
+// Render-Durchläufe parallel um dasselbe Canvas konkurrieren zu lassen.
+async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTaskRef = null) {
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1.5 : 1.5;
   const safeScale = Math.min(dpr, PDF_SAFE_RENDER_DPR_CAP) * Math.max(1, extraScale);
   let viewport = page.getViewport({ scale: safeScale });
@@ -3538,10 +3542,22 @@ async function renderPdfPageToSafeCanvasElement(page, extraScale = 1) {
   if (largestDim > PDF_SAFE_MAX_CANVAS_DIM_PX) {
     viewport = page.getViewport({ scale: safeScale * (PDF_SAFE_MAX_CANVAS_DIM_PX / largestDim) });
   }
+  if (renderTaskRef?.current) {
+    try {
+      renderTaskRef.current.cancel();
+    } catch {
+      // pdf.js wirft beim Abbrechen eines bereits abgeschlossenen/fehlgeschlagenen
+      // Tasks eine RenderingCancelledException — hier unkritisch, da ohnehin sofort
+      // ein neues Rendering folgt.
+    }
+  }
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
-  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+  const renderTask = page.render({ canvasContext: canvas.getContext("2d"), viewport });
+  if (renderTaskRef) renderTaskRef.current = renderTask;
+  await renderTask.promise;
+  if (renderTaskRef && renderTaskRef.current === renderTask) renderTaskRef.current = null;
   return canvas;
 }
 
@@ -3562,6 +3578,11 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
   const pageRef = useRef(null);
   const lastRasterScaleRef = useRef(1);
   const loadGenerationRef = useRef(0);
+  // Zuletzt gestarteter pdf.js-RenderTask der Raster-Fallback-Stufe — wird per
+  // renderTask.cancel() sauber abgebrochen, sobald ein neueres Rendering
+  // (Zoom-Nachladen oder Komponenten-Unmount) es überholt, siehe
+  // renderPdfPageToSafeCanvasElement.
+  const renderTaskRef = useRef(null);
 
   // Lädt Dokument + erste Seite bei jeder neuen PDF-URL neu, versucht zuerst die
   // Vektor-Stufe (mit Zeitlimit) und fällt bei Fehlschlag/Zeitüberschreitung/zu hoher
@@ -3573,6 +3594,7 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
     tierRef.current = null;
     pageRef.current = null;
     lastRasterScaleRef.current = 1;
+    renderTaskRef.current = null;
     setStatus("loading");
 
     (async () => {
@@ -3595,7 +3617,7 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
           tierRef.current = "vector";
         } catch (svgErr) {
           console.warn("PDF-Vektor-Rendering nicht möglich/zu langsam, Fallback auf sichere Raster-Auflösung:", svgErr);
-          renderedElement = await renderPdfPageToSafeCanvasElement(page);
+          renderedElement = await renderPdfPageToSafeCanvasElement(page, 1, renderTaskRef);
           tierRef.current = "raster";
           pageRef.current = page;
           lastRasterScaleRef.current = 1;
@@ -3614,6 +3636,14 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
 
     return () => {
       cancelled = true;
+      if (renderTaskRef.current) {
+        try {
+          renderTaskRef.current.cancel();
+        } catch {
+          // siehe Kommentar an renderPdfPageToSafeCanvasElement — unkritisch.
+        }
+        renderTaskRef.current = null;
+      }
     };
   }, [url]);
 
@@ -3636,7 +3666,7 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
       const host = hostRef.current;
       if (!page || !host) return;
       try {
-        const canvas = await renderPdfPageToSafeCanvasElement(page, zoomScale);
+        const canvas = await renderPdfPageToSafeCanvasElement(page, zoomScale, renderTaskRef);
         if (loadGenerationRef.current !== myGeneration) return;
         host.replaceChildren(canvas);
         lastRasterScaleRef.current = zoomScale;
