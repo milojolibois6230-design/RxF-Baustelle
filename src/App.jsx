@@ -3573,16 +3573,17 @@ async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTask
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
-  // Verhindert, dass der Browser den Canvas-Inhalt weich/bilinear interpoliert, wenn
-  // seine CSS-Anzeigegröße (durch den äußeren Zoom-Transform, siehe FloorPlanView)
-  // gerade größer ist als sein tatsächlicher Pixelpuffer — konkret im kurzen Fenster
-  // zwischen zwei Zoomschritten, bevor das debounced Nachladen mit passender
-  // Auflösung greift. Statt einer verschwommenen Zwischenansicht bleibt der Plan in
-  // dieser kurzen Phase sichtbar knackig/blockig statt unscharf; sobald das
-  // Nachladen abgeschlossen ist und der Puffer die Zielauflösung erreicht, hat diese
-  // Einstellung keinen sichtbaren Effekt mehr (nahezu 1:1-Darstellung).
-  canvas.style.imageRendering = "crisp-edges";
-  const renderTask = page.render({ canvasContext: canvas.getContext("2d"), viewport });
+  // KEIN image-rendering: crisp-edges/pixelated hier (war testweise gesetzt, wieder
+  // entfernt): das unterdrückt genau die weiche Kantenglättung, auf die dünne
+  // CAD-Linien und feine Grautöne in echten Bauplänen angewiesen sind, um überhaupt
+  // sichtbar zu bleiben — mit crisp-edges wirkten sie fast unsichtbar/durchsichtig.
+  // Stattdessen wird die Bildglättung des Canvas-Kontexts hier explizit UND in
+  // bestmöglicher Qualität aktiviert (Standard von Browsern ist zwar ohnehin "an",
+  // explizit gesetzt schließt aber jede abweichende Annahme aus).
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  const renderTask = page.render({ canvasContext: ctx, viewport });
   if (renderTaskRef) renderTaskRef.current = renderTask;
   await renderTask.promise;
   if (renderTaskRef && renderTaskRef.current === renderTask) renderTaskRef.current = null;
