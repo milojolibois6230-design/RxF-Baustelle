@@ -3450,11 +3450,13 @@ async function loadPdfDocument(pdfjsLib, url) {
 const PDF_SVG_MAX_OPERATORS = 40000; // Heuristik, keine belastbare Browser-Spezifikation — bei Bedarf an echten Baustellen-Plänen nachjustieren.
 const PDF_SVG_RENDER_TIMEOUT_MS = 6000;
 // "Sicherer" Render-Maßstab für die Raster-Fallback-Stufe: an devicePixelRatio
-// gekoppelt, aber hart bei 2.0 gedeckelt — deutlich niedriger als die 3.5–4.0, die in
-// einer früheren Version für einen anderen (bereits separaten) Rasterisierungspfad
-// verwendet wurden, und bewusst konservativ, weil diese Stufe explizit für PDFs
-// gedacht ist, bei denen bereits die "leichtere" Vektor-Stufe an ihre Grenzen kam.
-const PDF_SAFE_RENDER_DPR_CAP = 2.0;
+// gekoppelt, aber hart bei 3.0 gedeckelt (auf ausdrücklichen Wunsch von zuvor 2.0
+// angehoben, Fallback-Wert ohne bekannten devicePixelRatio ebenfalls von 1.5 auf 2
+// angehoben) — Math.min(devicePixelRatio || 2, 3) entspricht damit exakt der
+// angeforderten Formel. Gilt weiterhin nur für die Raster-Fallback-Stufe, die
+// ohnehin nur für PDFs greift, bei denen bereits die "leichtere" Vektor-Stufe an
+// ihre Grenzen kam (siehe PDF_SVG_MAX_OPERATORS).
+const PDF_SAFE_RENDER_DPR_CAP = 3.0;
 // Harte Obergrenze für die tatsächliche Canvas-Pixelbreite/-höhe dieser Fallback-
 // Stufe — verhindert einen GPU-/RAM-Überlauf bei großformatigen Papiergrößen (A0/A1),
 // unabhängig von Gerätedichte. Auf ausdrücklichen Wunsch von 8192px auf 16384px
@@ -3469,6 +3471,13 @@ const PDF_SAFE_RENDER_DPR_CAP = 2.0;
 // Speicherüberlauf. Betrifft ausschließlich die Raster-Fallback-Stufe (siehe
 // PdfPlanCanvas/renderPdfPageToSafeCanvasElement) — die bevorzugte Vektor-Stufe ist
 // davon nicht betroffen und bleibt für die meisten Baupläne der genutzte Pfad.
+// Ehrlicher Hinweis zur genauen Zahl: dass Safari oberhalb von genau 16384px ein
+// leeres/weißes Canvas zeigt, kann ich nicht aus eigener, verlässlicher Kenntnis
+// bestätigen — WebKit hat historisch dokumentierte, aber je nach Version
+// unterschiedliche Canvas-Flächen-/Kantenlimits gehabt. 16384px als Obergrenze ist
+// in jedem Fall ein sinnvoller, verbreitet genutzter Wert, deshalb hier so gesetzt;
+// bei echten Tests auf den eingesetzten iPads bitte gezielt auf ein leeres Canvas
+// bei sehr großen Plänen achten, falls dieses Limit tatsächlich greift.
 const PDF_SAFE_MAX_CANVAS_DIM_PX = 16384;
 // Nur für die Raster-Fallback-Stufe relevant (die Vektor-Stufe braucht kein
 // Re-Rendering, siehe renderPdfPageToSvgElement-Kommentar oben): erst ab dieser
@@ -3545,7 +3554,7 @@ async function renderPdfPageToSvgElement(pdfjsLib, page, operatorList) {
 // wird dieses zuerst sauber per renderTask.cancel() abgebrochen, statt zwei
 // Render-Durchläufe parallel um dasselbe Canvas konkurrieren zu lassen.
 async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTaskRef = null) {
-  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1.5 : 1.5;
+  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 2 : 2;
   const safeScale = Math.min(dpr, PDF_SAFE_RENDER_DPR_CAP) * Math.max(1, extraScale);
   let viewport = page.getViewport({ scale: safeScale });
   const largestDim = Math.max(viewport.width, viewport.height);
@@ -3564,6 +3573,15 @@ async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTask
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
+  // Verhindert, dass der Browser den Canvas-Inhalt weich/bilinear interpoliert, wenn
+  // seine CSS-Anzeigegröße (durch den äußeren Zoom-Transform, siehe FloorPlanView)
+  // gerade größer ist als sein tatsächlicher Pixelpuffer — konkret im kurzen Fenster
+  // zwischen zwei Zoomschritten, bevor das debounced Nachladen mit passender
+  // Auflösung greift. Statt einer verschwommenen Zwischenansicht bleibt der Plan in
+  // dieser kurzen Phase sichtbar knackig/blockig statt unscharf; sobald das
+  // Nachladen abgeschlossen ist und der Puffer die Zielauflösung erreicht, hat diese
+  // Einstellung keinen sichtbaren Effekt mehr (nahezu 1:1-Darstellung).
+  canvas.style.imageRendering = "crisp-edges";
   const renderTask = page.render({ canvasContext: canvas.getContext("2d"), viewport });
   if (renderTaskRef) renderTaskRef.current = renderTask;
   await renderTask.promise;
