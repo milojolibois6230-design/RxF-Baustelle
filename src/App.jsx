@@ -64,7 +64,6 @@ import {
   Undo2,
   Eraser,
   Mic,
-  LayoutDashboard,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -482,14 +481,10 @@ const FLOOR_UPLOAD_HINT = "Grundriss hochladen (SVG, PNG, JPG, PDF, DWG, DXF)";
 // Projekte inkl. einer "leichten" Etagen-/Pin-Zusammenfassung (nur id + status) laden.
 // Das reicht aus, um in der Projektübersicht Vorschaubild, Etagenzahl und offene
 // Pins darzustellen, ohne pro Karte einen eigenen Request abzusetzen.
-// due_date/priority sind hier bewusst mit in der Pin-Kurzfassung enthalten (nicht nur
-// id/status wie in den analogen Etagen-/Skizzen-Abrufen weiter unten) — sie werden für
-// die KPI-Kacheln des Dashboards (siehe countPins, DashboardScreen) über alle Projekte
-// hinweg aggregiert, ohne dafür einen eigenen, zusätzlichen Request zu benötigen.
 async function fetchProjectsWithSummary() {
   const { data, error } = await supabase
     .from("projects")
-    .select("*, floors(id, name, image_url, file_type, pins(id, status, due_date, priority))")
+    .select("*, floors(id, name, image_url, file_type, pins(id, status))")
     .order("created_at", { ascending: false });
   if (error) throw error;
   return data ?? [];
@@ -3037,70 +3032,12 @@ function PinActivityHistory({ entries }) {
   );
 }
 
-// Erweiterte Pin-Zusammenfassung eines Projekts (oder Etagenmengen). Ursprünglich nur
-// total/open für die Karten in ProjectOverview — für das Dashboard (DashboardScreen)
-// um die vollständige Status-Aufschlüsselung sowie "kritische" Pins ergänzt, ohne die
-// bestehende Aufrufstelle anzupassen (zusätzliche Felder werden dort schlicht nicht
-// gelesen). "critical" zählt jeden noch nicht erledigten Pin, der ENTWEDER überfällig
-// ist (due_date in der Vergangenheit) ODER hohe Priorität trägt, GENAU EINMAL — ein Pin
-// kann beides zugleich sein, würde sonst doppelt in den Warn-Zähler einfließen.
-// overdue/highPriority bleiben zusätzlich einzeln ausgewiesen, für die Aufschlüsselung
-// in der Karte selbst.
 function countPins(floors) {
   const all = (floors || []).flatMap((f) => f.pins || []);
-  const todayIso = new Date().toISOString().slice(0, 10);
-  let open = 0;
-  let bearbeitung = 0;
-  let erledigt = 0;
-  let overdue = 0;
-  let highPriority = 0;
-  let critical = 0;
-  for (const pin of all) {
-    if (pin.status === "offen") open++;
-    else if (pin.status === "bearbeitung") bearbeitung++;
-    else if (pin.status === "erledigt") erledigt++;
-    if (pin.status !== "erledigt") {
-      const isOverdue = !!pin.due_date && pin.due_date < todayIso;
-      const isHighPriority = pin.priority === "hoch";
-      if (isOverdue) overdue++;
-      if (isHighPriority) highPriority++;
-      if (isOverdue || isHighPriority) critical++;
-    }
-  }
-  return { total: all.length, open, bearbeitung, erledigt, overdue, highPriority, critical };
-}
-
-// Aggregiert countPins() über MEHRERE Projekte hinweg (für die KPI-Kacheln des
-// Dashboards, die projektübergreifend zählen) — summiert einfach jedes Einzelfeld.
-function aggregatePinCounts(projects) {
-  const totals = { total: 0, open: 0, bearbeitung: 0, erledigt: 0, overdue: 0, highPriority: 0, critical: 0 };
-  for (const project of projects || []) {
-    const c = countPins(project.floors);
-    totals.total += c.total;
-    totals.open += c.open;
-    totals.bearbeitung += c.bearbeitung;
-    totals.erledigt += c.erledigt;
-    totals.overdue += c.overdue;
-    totals.highPriority += c.highPriority;
-    totals.critical += c.critical;
-  }
-  return totals;
-}
-
-// Letzte System-Aktionen über ALLE Projekte hinweg, für den Aktivitäten-Feed des
-// Dashboards (Abschnitt B) — pin_activity_log ist bewusst öffentlich lesbar (siehe
-// supabase_schema_v5, Policy pin_activity_log_public_read), der verschachtelte Embed
-// bis zur Projekt-Ebene (pin_activity_log -> pins -> floors -> projects) nutzt
-// ausschließlich bereits bestehende Fremdschlüssel, exakt wie beim umgekehrten Embed
-// in fetchProjectsWithSummary (projects -> floors -> pins) weiter oben.
-async function fetchRecentActivity(limit = 15) {
-  const { data, error } = await supabase
-    .from("pin_activity_log")
-    .select("id, action, detail, actor_email, actor_name, created_at, pins(id, title, floor_id, floors(id, name, project_id, projects(id, name)))")
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (error) throw error;
-  return data ?? [];
+  return {
+    total: all.length,
+    open: all.filter((p) => p.status === "offen").length,
+  };
 }
 
 function LoadingBlock({ label = "Wird geladen…" }) {
@@ -5111,204 +5048,6 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
             {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
             {mode === "create" ? "Projekt anlegen" : "Änderungen speichern"}
           </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ----------------------------------------------------------------------------------
-// SCREEN 0: DASHBOARD — zentrale Startseite nach der Anmeldung (Login → Dashboard →
-// Projekt-/Bauplanansicht). Rein lesend/orientierend: KPI-Kacheln (Abschnitt A),
-// projektübergreifender Aktivitäten-Feed (Abschnitt B) und ein schneller Zugriff auf
-// die zuletzt angelegten Projekte (Abschnitt C). Anlegen/Bearbeiten/Löschen von
-// Projekten bleibt bewusst vollständig der bestehenden ProjectOverview vorbehalten
-// (dort erreichbar über "Alle Projekte verwalten") — das Dashboard verdoppelt diese
-// Funktionen nicht, sondern verweist gezielt dorthin.
-// ----------------------------------------------------------------------------------
-
-// Eine einzelne KPI-Kachel (Abschnitt A). "tone" steuert ausschließlich die Akzentfarbe
-// von Icon-Kachel und optionalem Zahlenwert — der übrige Kartenrahmen bleibt für alle
-// drei Kacheln identisch, damit sie als zusammengehöriges Set wirken.
-const KPI_TONE_CLASSES = {
-  neutral: { iconBg: "bg-slate-100", iconText: "text-slate-600", valueText: "text-slate-900" },
-  brand: { iconBg: "bg-[#FF2A00]/10", iconText: "text-[#FF2A00]", valueText: "text-slate-900" },
-  danger: { iconBg: "bg-red-50", iconText: "text-[#FF2A00]", valueText: "text-[#FF2A00]" },
-};
-
-function KpiCard({ icon: Icon, label, value, tone = "neutral", children }) {
-  const t = KPI_TONE_CLASSES[tone] || KPI_TONE_CLASSES.neutral;
-  return (
-    <div className="flex flex-col gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-      <div className="flex items-center gap-3">
-        <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${t.iconBg} ${t.iconText}`}>
-          <Icon size={19} />
-        </div>
-        <div className="min-w-0">
-          <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">{label}</p>
-          <p className={`text-2xl font-bold tabular-nums leading-tight ${t.valueText}`}>{value}</p>
-        </div>
-      </div>
-      {children}
-    </div>
-  );
-}
-
-// Aktivitäten-Feed (Abschnitt B) — dieselbe Aktions-Bezeichnung/Icon-Zuordnung
-// (PIN_ACTIVITY_META) wie im Verlauf des einzelnen Pins (siehe PinActivityHistory),
-// hier zusätzlich um Baustellen-Name und Pin-Titel (Betreff) ergänzt, da der Eintrag
-// projektübergreifend statt im Kontext eines bereits geöffneten Pins angezeigt wird.
-function DashboardActivityFeed({ entries, loading }) {
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 py-8 text-sm text-slate-400">
-        <Loader2 size={16} className="animate-spin" /> Aktivitäten werden geladen…
-      </div>
-    );
-  }
-  if (!entries || entries.length === 0) {
-    return <p className="py-8 text-center text-sm text-slate-400">Noch keine Aktivitäten vorhanden.</p>;
-  }
-  return (
-    <ul className="divide-y divide-slate-100">
-      {entries.map((entry) => {
-        const meta = PIN_ACTIVITY_META[entry.action] || { label: entry.action, icon: History };
-        const Icon = meta.icon;
-        const projectName = entry.pins?.floors?.projects?.name || null;
-        const pinTitle = entry.pins?.title || null;
-        return (
-          <li key={entry.id} className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
-            <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-slate-100 text-slate-500">
-              <Icon size={13} />
-            </span>
-            <div className="min-w-0 flex-1">
-              <p className="text-sm text-slate-700">
-                <span className="font-semibold text-slate-900">{meta.label}</span>
-                {pinTitle && <span className="text-slate-500"> · {pinTitle}</span>}
-              </p>
-              {entry.detail && <p className="truncate text-xs text-slate-500">{entry.detail}</p>}
-              <p className="mt-0.5 text-[11px] text-slate-400">
-                {formatDateTime(entry.created_at)}
-                {projectName && <> · {projectName}</>} · {entry.actor_name || entry.actor_email || "Unbekannt"}
-              </p>
-            </div>
-          </li>
-        );
-      })}
-    </ul>
-  );
-}
-
-function DashboardScreen({ projects, loadingProjects, activity, loadingActivity, onOpenProject, onShowAllProjects }) {
-  const stats = aggregatePinCounts(projects);
-  // Abschnitt C zeigt bewusst nur einen kompakten Ausschnitt (die zuletzt angelegten
-  // Projekte, projects ist bereits nach created_at absteigend sortiert, siehe
-  // fetchProjectsWithSummary) — eine vollständige, durchsuchbare Liste mit
-  // Anlegen/Bearbeiten/Löschen bleibt ProjectOverview vorbehalten.
-  const DASHBOARD_QUICK_ACCESS_LIMIT = 6;
-  const quickAccessProjects = projects.slice(0, DASHBOARD_QUICK_ACCESS_LIMIT);
-
-  return (
-    <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
-      <div className="mb-6 flex items-center gap-3">
-        <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#FF2A00] text-white shadow-sm">
-          <LayoutDashboard size={20} />
-        </div>
-        <div>
-          <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">Dashboard</h1>
-          <p className="text-sm text-slate-500">Überblick über alle Baustellen, Mängel und die letzten Aktivitäten</p>
-        </div>
-      </div>
-
-      {/* Abschnitt A — KPI-Kacheln */}
-      {loadingProjects ? (
-        <LoadingBlock label="Kennzahlen werden geladen…" />
-      ) : (
-        <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
-          <KpiCard icon={Building2} label="Aktive Baustellen / Objekte" value={projects.length} tone="brand" />
-
-          <KpiCard icon={MapPin} label="Mängel- &amp; Pin-Status" value={stats.total} tone="neutral">
-            <div className="flex items-center justify-between gap-2 border-t border-slate-100 pt-3 text-xs font-semibold">
-              <span className={`inline-flex items-center gap-1.5 ${STATUS.offen.text}`}>
-                <span className={`h-1.5 w-1.5 rounded-full ${STATUS.offen.dot}`} /> {stats.open} offen
-              </span>
-              <span className={`inline-flex items-center gap-1.5 ${STATUS.bearbeitung.text}`}>
-                <span className={`h-1.5 w-1.5 rounded-full ${STATUS.bearbeitung.dot}`} /> {stats.bearbeitung} in Arbeit
-              </span>
-              <span className={`inline-flex items-center gap-1.5 ${STATUS.erledigt.text}`}>
-                <span className={`h-1.5 w-1.5 rounded-full ${STATUS.erledigt.dot}`} /> {stats.erledigt} erledigt
-              </span>
-            </div>
-          </KpiCard>
-
-          <KpiCard icon={AlertTriangle} label="Kritische Fristen / Dringende Mängel" value={stats.critical} tone="danger">
-            <p className="border-t border-slate-100 pt-3 text-xs text-slate-500">
-              {stats.overdue} überfällig · {stats.highPriority} hohe Priorität
-            </p>
-          </KpiCard>
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
-        {/* Abschnitt B — Aktivitäten-Feed */}
-        <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5 lg:col-span-2">
-          <div className="mb-1 flex items-center gap-2">
-            <History size={16} className="text-slate-400" />
-            <h2 className="text-sm font-bold text-slate-900">Letzte Aktivitäten</h2>
-          </div>
-          <DashboardActivityFeed entries={activity} loading={loadingActivity} />
-        </div>
-
-        {/* Abschnitt C — Schnellzugriff / Projekt-Auswahl */}
-        <div className="lg:col-span-3">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-bold text-slate-900">Zuletzt angelegte Baustellen</h2>
-            <button
-              onClick={onShowAllProjects}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 transition hover:text-[#FF2A00]"
-            >
-              Alle Projekte verwalten <ChevronRight size={13} />
-            </button>
-          </div>
-
-          {loadingProjects ? (
-            <LoadingBlock label="Projekte werden geladen…" />
-          ) : quickAccessProjects.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-slate-300 bg-white py-12 text-center text-sm text-slate-400">
-              Noch keine Projekte vorhanden.
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              {quickAccessProjects.map((project) => {
-                const c = countPins(project.floors);
-                return (
-                  <button
-                    key={project.id}
-                    onClick={() => onOpenProject(project.id)}
-                    className="group flex flex-col gap-2 rounded-xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <h3 className="min-w-0 truncate font-semibold text-slate-900">{project.name}</h3>
-                      {c.open > 0 && (
-                        <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[#FF2A00] px-2 py-0.5 text-[10px] font-bold text-white">
-                          {c.open} offen
-                        </span>
-                      )}
-                    </div>
-                    <p className="truncate text-xs text-slate-500">{project.address}</p>
-                    <div className="mt-1 flex items-center justify-between border-t border-slate-100 pt-2">
-                      <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
-                        <Layers size={13} className="text-slate-400" /> {(project.floors || []).length} Etagen · {c.total} Pins
-                      </span>
-                      <span className="inline-flex items-center gap-1 text-xs font-semibold text-[#FF2A00] opacity-0 transition group-hover:opacity-100">
-                        Plan anzeigen <ChevronRight size={13} />
-                      </span>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
         </div>
       </div>
     </div>
@@ -9014,19 +8753,7 @@ function App() {
   const [creatingNote, setCreatingNote] = useState(false);
   const [globalError, setGlobalError] = useState(null);
 
-  const [screen, setScreen] = useState("dashboard"); // dashboard | projects | floors | sketches | plan
-
-  // Erzwingt den in der Aufgabenstellung vorgegebenen Ablauf "Login → Dashboard →
-  // Projekt-/Bauplanansicht" auch bei einer ERNEUTEN Anmeldung innerhalb derselben
-  // Sitzung (App() wird beim Ab-/Anmelden nicht neu gemountet, "screen" bliebe sonst
-  // unverändert auf dem zuletzt besuchten Bildschirm stehen). Der initiale Default
-  // oben ("dashboard") deckt bereits den allerersten Aufruf ab, dieser Effekt greift
-  // zusätzlich bei jedem weiteren Wechsel von nicht angemeldet auf angemeldet (siehe
-  // isAuthenticated weiter oben).
-  useEffect(() => {
-    if (isAuthenticated) setScreen("dashboard");
-  }, [isAuthenticated]);
-
+  const [screen, setScreen] = useState("projects"); // projects | floors | sketches | plan
   const [selectedProjectId, setSelectedProjectId] = useState(null);
   const [selectedFloorId, setSelectedFloorId] = useState(null);
   const [selectedFloorPlanId, setSelectedFloorPlanId] = useState(null);
@@ -9047,13 +8774,6 @@ function App() {
 
   const [trades, setTrades] = useState([]); // Gewerke-Katalog (unabhängig vom ausgewählten Projekt)
   const [tradesAdminOpen, setTradesAdminOpen] = useState(false);
-
-  // Projektübergreifender Aktivitäten-Feed für das Dashboard (Abschnitt B, siehe
-  // DashboardActivityFeed/fetchRecentActivity) — bewusst eigener State statt Teil von
-  // "pins", da er über alle Projekte hinweg läuft und unabhängig davon geladen wird,
-  // welche Grundrissskizze gerade geöffnet ist (oder ob überhaupt eine geöffnet ist).
-  const [activity, setActivity] = useState([]);
-  const [loadingActivity, setLoadingActivity] = useState(true);
 
   const [users, setUsers] = useState([]); // app_users, nur für angemeldete Nutzer ladbar (RLS)
   const [usersAdminOpen, setUsersAdminOpen] = useState(false);
@@ -9191,31 +8911,6 @@ function App() {
       } catch (err) {
         console.error("Gewerke konnten nicht geladen werden:", err);
         if (!cancelled) setGlobalError("Gewerke konnten nicht geladen werden. Bitte erneut versuchen.");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [isAuthenticated]);
-
-  // Aktivitäten-Feed des Dashboards (Abschnitt B) — ebenfalls erst nach erfolgreicher
-  // Anmeldung geladen, aus demselben Grund wie Projekte/Gewerke direkt darüber. Ein
-  // fehlgeschlagener Abruf blendet den Feed lediglich leer aus (Dashboard bleibt sonst
-  // voll funktionsfähig) statt eine globale Fehlermeldung auszulösen — die Kennzahlen
-  // in Abschnitt A hängen nicht von den Aktivitäten ab.
-  useEffect(() => {
-    if (!isAuthenticated) return undefined;
-    let cancelled = false;
-    (async () => {
-      setLoadingActivity(true);
-      try {
-        const data = await fetchRecentActivity();
-        if (!cancelled) setActivity(data);
-      } catch (err) {
-        console.error("Aktivitäten konnten nicht geladen werden:", err);
-        if (!cancelled) setActivity([]);
-      } finally {
-        if (!cancelled) setLoadingActivity(false);
       }
     })();
     return () => {
@@ -10460,20 +10155,6 @@ function App() {
               <BrandLogotype tone="brand" size="sm" />
               <span className="hidden text-slate-400 sm:inline">· BauDoc</span>
             </span>
-            {/* Gut sichtbarer, von jedem Bildschirm aus erreichbarer Dashboard-Button
-                (siehe DashboardScreen) — bewusst als eigenständige, hervorgehobene
-                Kachel statt eines reinen Textlinks wie die übrigen Breadcrumb-
-                Stationen, damit er auch aus tief verschachtelten Bauplan-Ansichten
-                sofort ins Auge fällt. */}
-            <button
-              onClick={() => setScreen("dashboard")}
-              title="Zurück zum Dashboard"
-              className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1 font-semibold transition ${
-                screen === "dashboard" ? "bg-[#FF2A00] text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
-              }`}
-            >
-              <LayoutDashboard size={13} /> Dashboard
-            </button>
             <span className="text-slate-300">/</span>
             <button
               onClick={() => setScreen("projects")}
@@ -10578,17 +10259,6 @@ function App() {
       </div>
 
       <ErrorBanner message={globalError} onClose={() => setGlobalError(null)} />
-
-      {screen === "dashboard" && (
-        <DashboardScreen
-          projects={projects}
-          loadingProjects={loadingProjects}
-          activity={activity}
-          loadingActivity={loadingActivity}
-          onOpenProject={openProject}
-          onShowAllProjects={() => setScreen("projects")}
-        />
-      )}
 
       {screen === "projects" && (
         <ProjectOverview
