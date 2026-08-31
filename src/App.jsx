@@ -64,6 +64,9 @@ import {
   Undo2,
   Eraser,
   Mic,
+  Star,
+  LayoutGrid,
+  List,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -480,11 +483,13 @@ const FLOOR_UPLOAD_HINT = "Grundriss hochladen (SVG, PNG, JPG, PDF, DWG, DXF)";
 
 // Projekte inkl. einer "leichten" Etagen-/Pin-Zusammenfassung (nur id + status) laden.
 // Das reicht aus, um in der Projektübersicht Vorschaubild, Etagenzahl und offene
-// Pins darzustellen, ohne pro Karte einen eigenen Request abzusetzen.
+// Pins darzustellen, ohne pro Karte einen eigenen Request abzusetzen. priority ist seit
+// dem Dringlichkeits-Indikator/der "Nach Dringlichkeit"-Sortierung in ProjectOverview
+// (siehe countUrgentPins) mit dabei — id/status allein reichten dafür nicht mehr.
 async function fetchProjectsWithSummary() {
   const { data, error } = await supabase
     .from("projects")
-    .select("*, floors(id, name, image_url, file_type, pins(id, status))")
+    .select("*, floors(id, name, image_url, file_type, pins(id, status, priority))")
     .order("created_at", { ascending: false });
   if (error) throw error;
   return data ?? [];
@@ -3040,6 +3045,16 @@ function countPins(floors) {
   };
 }
 
+// Anzahl der noch offenen, als hoch/dringend eingestuften Mängel-Pins eines Projekts
+// (Status "offen" UND Priorität "hoch") — für den Dringlichkeits-Indikator und die
+// "Nach Dringlichkeit"-Sortierung in ProjectOverview. Bewusst eine eigene, schmale
+// Hilfsfunktion statt einer erneuten Erweiterung von countPins(), die zuletzt bewusst
+// wieder auf total/open zurückgesetzt wurde — hier wird ausschließlich diese eine,
+// fest definierte Kombination gebraucht.
+function countUrgentPins(floors) {
+  return (floors || []).flatMap((f) => f.pins || []).filter((p) => p.status === "offen" && p.priority === "hoch").length;
+}
+
 function LoadingBlock({ label = "Wird geladen…" }) {
   return (
     <div className="flex flex-col items-center justify-center gap-3 py-20 text-slate-400">
@@ -5058,12 +5073,72 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
 // SCREEN 1: PROJECT OVERVIEW
 // ----------------------------------------------------------------------------------
 
-function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, onCreateProject, onEditProject, onDeleteProject }) {
-  const filtered = projects.filter(
+// Kleiner, unabhängiger Favoriten-Stern — in Grid- wie Listenansicht identisch, daher
+// als eigene Komponente statt doppelt inline formuliert. stopPropagation() ist hier
+// zwingend: der Stern sitzt in beiden Ansichten auf/neben einer Fläche, die selbst
+// einen Klick zum Öffnen des Projekts auslöst (Karten-Button bzw. Tabellenzeile) — ohne
+// stopPropagation würde ein Klick auf den Stern zusätzlich das Projekt öffnen.
+function FavoriteStarButton({ active, onToggle, size = 16, className = "" }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle();
+      }}
+      title={active ? "Von Favoriten entfernen" : "Als Favorit markieren"}
+      className={`rounded-full p-1 transition hover:scale-110 ${className}`}
+    >
+      <Star size={size} className={active ? "fill-yellow-400 text-yellow-400" : "fill-transparent text-slate-300"} />
+    </button>
+  );
+}
+
+// Dringlichkeits-Badge (Status "offen" + Priorität "hoch", siehe countUrgentPins) —
+// ebenfalls in beiden Ansichten identisch. Rendert nichts, wenn count 0 ist, damit
+// Aufrufer nicht jedes Mal selbst darauf prüfen müssen.
+function UrgentPinsBadge({ count, compact = false }) {
+  if (!count) return null;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full bg-[#FF2A00] font-bold text-white shadow ${
+        compact ? "px-2 py-0.5 text-[11px]" : "px-2.5 py-1 text-xs"
+      }`}
+      title={`${count} offene(r) Mängel-Pin(s) mit hoher Priorität`}
+    >
+      <AlertCircle size={compact ? 11 : 12} /> {count} kritisch
+    </span>
+  );
+}
+
+function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, query, setQuery, onCreateProject, onEditProject, onDeleteProject }) {
+  const [viewMode, setViewMode] = useState("grid"); // 'grid' | 'list'
+  const [filterTab, setFilterTab] = useState("all"); // 'all' | 'favorites'
+  const [sortBy, setSortBy] = useState("default"); // 'default' | 'urgency' | 'name'
+
+  const favoriteCount = projects.filter((p) => p.is_favorite).length;
+
+  const searched = projects.filter(
     (p) =>
       p.name.toLowerCase().includes(query.toLowerCase()) ||
       p.address.toLowerCase().includes(query.toLowerCase())
   );
+  const tabFiltered = filterTab === "favorites" ? searched.filter((p) => p.is_favorite) : searched;
+  // Array.prototype.sort ist seit ES2019 stabil — bei sortBy "default" bleibt die vom
+  // Server gelieferte Reihenfolge (created_at absteigend) exakt erhalten, bei "urgency"
+  // dient sie als impliziter, sinnvoller Tiebreaker für gleich dringende Projekte.
+  const sorted = [...tabFiltered].sort((a, b) => {
+    if (sortBy === "name") return a.name.localeCompare(b.name, "de");
+    if (sortBy === "urgency") return countUrgentPins(b.floors) - countUrgentPins(a.floors);
+    return 0;
+  });
+
+  const emptyMessage =
+    projects.length === 0
+      ? "Noch keine Projekte vorhanden."
+      : filterTab === "favorites" && favoriteCount === 0
+      ? "Noch keine Favoriten markiert — auf den Stern eines Projekts tippen, um es hier anzupinnen."
+      : `Kein Projekt gefunden für „${query}“.`;
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
@@ -5085,7 +5160,7 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
         </button>
       </div>
 
-      <div className="relative mb-6">
+      <div className="relative mb-4">
         <Search className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
         <input
           value={query}
@@ -5095,12 +5170,138 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
         />
       </div>
 
+      {/* Steuerungsleiste: Filter-Tabs links, Sortierung + Ansichts-Toggle rechts. */}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-sm">
+          <button
+            onClick={() => setFilterTab("all")}
+            className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+              filterTab === "all" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+            }`}
+          >
+            Alle Projekte
+          </button>
+          <button
+            onClick={() => setFilterTab("favorites")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+              filterTab === "favorites" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+            }`}
+          >
+            <Star size={12} className={filterTab === "favorites" ? "fill-white" : "fill-slate-400 text-slate-400"} />
+            Favoriten
+            {favoriteCount > 0 && (
+              <span
+                className={`inline-flex min-w-[1.1rem] items-center justify-center rounded-full px-1 text-[10px] font-bold ${
+                  filterTab === "favorites" ? "bg-white/25 text-white" : "bg-slate-200 text-slate-600"
+                }`}
+              >
+                {favoriteCount}
+              </span>
+            )}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value)}
+            title="Sortierung"
+            className="rounded-lg border border-slate-200 bg-white py-1.5 pl-2.5 pr-7 text-xs font-semibold text-slate-600 shadow-sm outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4"
+          >
+            <option value="default">Standard</option>
+            <option value="urgency">Nach Dringlichkeit</option>
+            <option value="name">Name (A-Z)</option>
+          </select>
+          <div className="inline-flex items-center overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+            <button
+              onClick={() => setViewMode("grid")}
+              title="Kachelansicht"
+              className={`flex items-center justify-center p-1.5 transition ${
+                viewMode === "grid" ? "bg-[#FF2A00] text-white" : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+              }`}
+            >
+              <LayoutGrid size={15} />
+            </button>
+            <button
+              onClick={() => setViewMode("list")}
+              title="Listenansicht"
+              className={`flex items-center justify-center p-1.5 transition ${
+                viewMode === "list" ? "bg-[#FF2A00] text-white" : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+              }`}
+            >
+              <List size={15} />
+            </button>
+          </div>
+        </div>
+      </div>
+
       {loading ? (
         <LoadingBlock label="Projekte werden geladen…" />
+      ) : sorted.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-slate-300 bg-white py-16 text-center text-sm text-slate-400">{emptyMessage}</div>
+      ) : viewMode === "list" ? (
+        <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+          <table className="w-full min-w-[720px] text-left text-sm">
+            <thead>
+              <tr className="border-b border-slate-100 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                <th className="w-10 px-3 py-2.5"></th>
+                <th className="px-3 py-2.5">Projekt</th>
+                <th className="px-3 py-2.5">Adresse / Objekt</th>
+                <th className="px-3 py-2.5 text-center">Offene Pins</th>
+                <th className="px-3 py-2.5 text-center">Kritische Fristen</th>
+                <th className="px-3 py-2.5">Status</th>
+                <th className="w-24 px-3 py-2.5"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {sorted.map((project) => {
+                const { total, open } = countPins(project.floors);
+                const urgent = countUrgentPins(project.floors);
+                return (
+                  <tr key={project.id} onClick={() => onOpenProject(project.id)} className="cursor-pointer transition hover:bg-slate-50">
+                    <td className="px-3 py-2.5">
+                      <FavoriteStarButton active={!!project.is_favorite} onToggle={() => onToggleFavorite(project)} />
+                    </td>
+                    <td className="px-3 py-2.5 font-semibold text-slate-900">{project.name}</td>
+                    <td className="max-w-[220px] truncate px-3 py-2.5 text-slate-500">{project.address}</td>
+                    <td className="px-3 py-2.5 text-center">
+                      {open > 0 ? (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-xs font-bold text-[#FF2A00]">
+                          <AlertTriangle size={11} /> {open}
+                        </span>
+                      ) : (
+                        <span className="text-slate-300">–</span>
+                      )}
+                      <span className="ml-1.5 text-[11px] text-slate-400">/ {total}</span>
+                    </td>
+                    <td className="px-3 py-2.5 text-center">
+                      {urgent > 0 ? <UrgentPinsBadge count={urgent} compact /> : <span className="text-slate-300">–</span>}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <ProjectStatusBadge status={project.status} />
+                    </td>
+                    <td className="px-3 py-2.5 text-right">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenProject(project.id);
+                        }}
+                        className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-[#FF2A00] hover:text-white"
+                      >
+                        Öffnen <ChevronRight size={12} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {filtered.map((project) => {
+          {sorted.map((project) => {
             const { total, open } = countPins(project.floors);
+            const urgent = countUrgentPins(project.floors);
             // heroFloor.image_url ist nur bei Bestandsprojekten aus der Zeit vor der
             // Grundrisskizzen-Ebene (v7) noch gesetzt — neue Geschosse sind reine
             // Namens-Container ohne eigenen Grundriss (siehe createFloor), daher fällt
@@ -5110,8 +5311,17 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
             return (
               <div
                 key={project.id}
-                className="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md"
+                className="group relative flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md"
               >
+                {/* Der Stern liegt als eigenständiges Element ÜBER dem Karten-Button (nicht
+                    darin verschachtelt) — ein <button> innerhalb eines <button> wäre
+                    ungültiges HTML und würde Klicks unvorhersehbar auflösen. */}
+                <FavoriteStarButton
+                  active={!!project.is_favorite}
+                  onToggle={() => onToggleFavorite(project)}
+                  size={17}
+                  className="absolute left-2 top-2 z-10 bg-slate-900/40 backdrop-blur-sm hover:bg-slate-900/60"
+                />
                 <button onClick={() => onOpenProject(project.id)} className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[#FF2A00]/30">
                   <div className="relative h-32 w-full overflow-hidden bg-slate-900">
                     {!heroFloor && (
@@ -5164,13 +5374,14 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
                         <Briefcase size={13} className="text-slate-400" /> {project.project_leader}
                       </p>
                     )}
-                    <div className="mt-1 flex items-center gap-4 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                    <div className="mt-1 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3 text-xs text-slate-500">
                       <span className="inline-flex items-center gap-1.5">
                         <Layers size={14} className="text-slate-400" /> {(project.floors || []).length} Etagen
                       </span>
                       <span className="inline-flex items-center gap-1.5">
                         <MapPin size={14} className="text-slate-400" /> {total} Pins
                       </span>
+                      {urgent > 0 && <UrgentPinsBadge count={urgent} compact />}
                     </div>
                   </div>
                 </button>
@@ -5197,11 +5408,6 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
               </div>
             );
           })}
-          {filtered.length === 0 && (
-            <div className="col-span-full rounded-xl border border-dashed border-slate-300 bg-white py-16 text-center text-sm text-slate-400">
-              {projects.length === 0 ? "Noch keine Projekte vorhanden." : `Kein Projekt gefunden für „${query}“.`}
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -9309,6 +9515,22 @@ function App() {
     setDeleteConfirm({ target: proj });
   };
 
+  // Favoriten-Stern in ProjectOverview (Grid- & Listenansicht) — optimistisches Update
+  // mit Rollback, damit der Klick sofort sichtbar reagiert, ein Speicherfehler aber nicht
+  // stillschweigend zu einem falschen Favoriten-Status in der Oberfläche führt.
+  const handleToggleProjectFavorite = async (project) => {
+    if (!requireAuth()) return;
+    const nextValue = !project.is_favorite;
+    setProjects((prev) => prev.map((p) => (p.id === project.id ? { ...p, is_favorite: nextValue } : p)));
+    try {
+      await updateProject(project.id, { is_favorite: nextValue });
+    } catch (err) {
+      console.error("Favoriten-Status konnte nicht gespeichert werden:", err);
+      setProjects((prev) => prev.map((p) => (p.id === project.id ? { ...p, is_favorite: !nextValue } : p)));
+      setGlobalError("Favoriten-Status konnte nicht gespeichert werden. Bitte erneut versuchen.");
+    }
+  };
+
   const handleSaveProject = async (fields) => {
     if (projectModalState.mode === "create") {
       const created = await createProject(fields);
@@ -10265,6 +10487,7 @@ function App() {
           projects={projects}
           loading={loadingProjects}
           onOpenProject={openProject}
+          onToggleFavorite={handleToggleProjectFavorite}
           query={query}
           setQuery={setQuery}
           onCreateProject={openCreateProject}
