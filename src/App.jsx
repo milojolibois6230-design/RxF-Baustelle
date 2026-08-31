@@ -473,6 +473,49 @@ const FLOOR_UPLOAD_ACCEPT =
 const FLOOR_UPLOAD_HINT = "Grundriss hochladen (SVG, PNG, JPG, PDF, DWG, DXF)";
 
 // ----------------------------------------------------------------------------------
+// PLATZHALTER-COVERFOTOS FÜR PROJEKT-KACHELN OHNE EIGENES GRUNDRISSBILD
+// ----------------------------------------------------------------------------------
+// Feste, kuratierte Auswahl generischer Architektur-/Baustellen-Fotos (Unsplash,
+// direkt über CDN-URLs verlinkt) für Projekte, die noch kein eigenes Grundriss-/
+// Vorschaubild haben (siehe heroFloor in ProjectOverview). Bewusst NICHT über den
+// von Unsplash 2021 angekündigten und inzwischen abgeschalteten Source-Dienst
+// (source.unsplash.com) bezogen — der liefert seit der Abschaltung keine Bilder
+// mehr — sondern über eine feste, kleine Liste einzelner, direkt referenzierter
+// Foto-URLs. Da diese Bilder generische Fremdmotive zeigen und NICHT die tatsächliche
+// Baustelle, wird die Kachel zusätzlich mit dem Hinweis "Platzhalterbild"
+// gekennzeichnet (siehe ProjectOverview), damit auf der Übersicht nie der Eindruck
+// entsteht, es handle sich um ein echtes Foto des jeweiligen Projekts. Ehrlicher
+// Hinweis: die Erreichbarkeit einzelner externer Foto-URLs kann sich künftig ändern,
+// deshalb hat ProjectCoverImage einen Fallback auf das bisherige neutrale Icon,
+// falls ein Foto nicht lädt.
+const PROJECT_PLACEHOLDER_IMAGES = [
+  "https://images.unsplash.com/photo-1541888946425-d0fbb186a5b7?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1449824913935-59a10b8d2000?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1487958449943-2429e8be8625?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1517581177682-a085bb7ffb15?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1541976590-713941681591?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1523217582562-09d0def993a6?q=80&w=800&auto=format&fit=crop",
+];
+
+// Einfacher, deterministischer String-Hash (djb2-Variante) — wählt für jedes Projekt
+// anhand seiner stabilen ID immer denselben Platzhalter aus derselben festen Liste,
+// kein Zufall bei jedem Neuladen der Übersicht.
+function hashStringToIndex(str, length) {
+  let hash = 5381;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    hash = (hash * 33) ^ s.charCodeAt(i);
+  }
+  return Math.abs(hash) % length;
+}
+
+function getProjectPlaceholderImage(project) {
+  return PROJECT_PLACEHOLDER_IMAGES[hashStringToIndex(project?.id, PROJECT_PLACEHOLDER_IMAGES.length)];
+}
+
+// ----------------------------------------------------------------------------------
 // SUPABASE DATA LAYER
 // Alle Netzwerkzugriffe sind hier gebündelt: reine async Funktionen, die entweder
 // Daten zurückgeben oder werfen (try/catch passiert jeweils beim Aufrufer in App()).
@@ -5235,6 +5278,71 @@ function UrgentPinsBadge({ count, compact = false }) {
   );
 }
 
+// Bildfläche der Projekt-Kachel (Grid-Ansicht, siehe ProjectOverview): eigenes
+// Grundriss-/Vorschaubild, falls vorhanden (heroFloor, unverändert gegenüber bisher),
+// sonst ein deterministisches, kuratiertes Platzhalterfoto (siehe
+// getProjectPlaceholderImage). Eigene Komponente statt Inline-JSX in der .map()-
+// Schleife, weil der Bild-Fallback (Platzhalterfoto lädt nicht) einen eigenen
+// useState-Hook braucht — Hooks dürfen nicht innerhalb einer Schleife aufgerufen
+// werden.
+function ProjectCoverImage({ project, heroFloor, heroKind }) {
+  const [placeholderFailed, setPlaceholderFailed] = useState(false);
+
+  if (heroKind === "cad") {
+    return (
+      <div
+        className="flex h-full w-full items-center justify-center bg-[#0b1220]"
+        style={{
+          backgroundImage:
+            "linear-gradient(rgba(56,189,248,0.16) 1px, transparent 1px), linear-gradient(90deg, rgba(56,189,248,0.16) 1px, transparent 1px)",
+          backgroundSize: "16px 16px",
+        }}
+      >
+        <Ruler size={26} className="text-sky-300/80" />
+      </div>
+    );
+  }
+  if (heroKind === "pdf") {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-slate-800">
+        <FileText size={26} className="text-rose-400/80" />
+      </div>
+    );
+  }
+  if (heroKind === "image" && heroFloor) {
+    // Nur echte Bilddateien werden per <img> gerendert — .dwg/.dxf/.pdf laufen über
+    // die Zweige oben, damit kein <img> mit einer falschen Datei fehlschlägt und die
+    // Karte leer bleibt.
+    return (
+      <img
+        src={heroFloor.image_url}
+        alt=""
+        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+      />
+    );
+  }
+  // Kein eigenes Grundriss-/Vorschaubild vorhanden: statt des früher reinen Icon-
+  // Platzhalters jetzt ein generisches, aber klar als solches gekennzeichnetes
+  // Architektur-/Baustellenfoto (siehe "Platzhalterbild"-Hinweis in ProjectOverview).
+  // Schlägt das externe Foto fehl (Netzwerk, Offline, künftig nicht mehr erreichbare
+  // URL), fällt die Kachel automatisch auf das bisherige neutrale Icon zurück.
+  if (placeholderFailed) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-slate-800">
+        <Building2 size={26} className="text-slate-500" />
+      </div>
+    );
+  }
+  return (
+    <img
+      src={getProjectPlaceholderImage(project)}
+      alt=""
+      onError={() => setPlaceholderFailed(true)}
+      className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+    />
+  );
+}
+
 function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, query, setQuery, onCreateProject, onEditProject, onDeleteProject }) {
   const [viewMode, setViewMode] = useState("grid"); // 'grid' | 'list'
   const [filterTab, setFilterTab] = useState("all"); // 'all' | 'favorites'
@@ -5447,43 +5555,17 @@ function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, q
                   className="absolute left-2 top-2 z-10 bg-slate-900/40 backdrop-blur-sm hover:bg-slate-900/60"
                 />
                 <button onClick={() => onOpenProject(project.id)} className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[#FF2A00]/30">
-                  <div className="relative h-32 w-full overflow-hidden bg-slate-900">
-                    {!heroFloor && (
-                      <div className="flex h-full w-full items-center justify-center bg-slate-800">
-                        <Building2 size={26} className="text-slate-500" />
-                      </div>
-                    )}
-                    {heroKind === "cad" && (
-                      <div
-                        className="flex h-full w-full items-center justify-center bg-[#0b1220]"
-                        style={{
-                          backgroundImage:
-                            "linear-gradient(rgba(56,189,248,0.16) 1px, transparent 1px), linear-gradient(90deg, rgba(56,189,248,0.16) 1px, transparent 1px)",
-                          backgroundSize: "16px 16px",
-                        }}
-                      >
-                        <Ruler size={26} className="text-sky-300/80" />
-                      </div>
-                    )}
-                    {heroKind === "pdf" && (
-                      <div className="flex h-full w-full items-center justify-center bg-slate-800">
-                        <FileText size={26} className="text-rose-400/80" />
-                      </div>
-                    )}
-                    {heroKind === "image" && heroFloor && (
-                      // Nur echte Bilddateien werden per <img> gerendert — .dwg/.dxf/.pdf
-                      // laufen über die Zweige oben, damit kein <img> mit einer falschen
-                      // Datei fehlschlägt und die Karte leer bleibt.
-                      <img
-                        src={heroFloor.image_url}
-                        alt=""
-                        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
-                      />
-                    )}
+                  <div className="relative h-40 w-full overflow-hidden rounded-t-xl bg-slate-900">
+                    <ProjectCoverImage project={project} heroFloor={heroFloor} heroKind={heroKind} />
                     <div className="absolute inset-0 bg-gradient-to-t from-slate-900/90 via-slate-900/10 to-transparent" />
                     <span className="absolute bottom-2 left-3 text-xs font-semibold uppercase tracking-wider text-white/90">
                       {project.status}
                     </span>
+                    {!heroFloor && (
+                      <span className="absolute bottom-2 right-3 rounded-full bg-slate-900/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-white/80 backdrop-blur-sm">
+                        Platzhalterbild
+                      </span>
+                    )}
                     {open > 0 && (
                       <span className="absolute right-3 top-2.5 inline-flex items-center gap-1 rounded-full bg-[#FF2A00] px-2 py-0.5 text-[11px] font-bold text-white shadow">
                         <AlertTriangle size={11} /> {open} offen
