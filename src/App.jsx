@@ -3457,16 +3457,19 @@ const PDF_SVG_RENDER_TIMEOUT_MS = 6000;
 const PDF_SAFE_RENDER_DPR_CAP = 2.0;
 // Harte Obergrenze für die tatsächliche Canvas-Pixelbreite/-höhe dieser Fallback-
 // Stufe — verhindert einen GPU-/RAM-Überlauf bei großformatigen Papiergrößen (A0/A1),
-// unabhängig von Gerätedichte. Browser-Canvas-Grenzen sind nicht einheitlich
-// spezifiziert, liegen aber auf allen relevanten Baustellen-Tablets/-Laptops
-// (iPad, aktuelle Android-Tablets, Notebooks) deutlich über diesem Wert; 8192px ist
-// bewusst großzügiger als der vorherige, sehr konservative Wert von 4096px gewählt,
-// damit das zoomabhängige Nachladen der Raster-Fallback-Stufe (siehe
-// PdfPlanCanvas/renderPdfPageToSafeCanvasElement) bei starkem Hineinzoomen auf
-// großformatigen oder detailreichen Plänen länger in nativer Auflösung nachziehen
-// kann, bevor diese Sicherheitsgrenze überhaupt greift — bleibt aber weiterhin eine
-// harte, endliche Obergrenze, kein unbegrenztes Wachstum.
-const PDF_SAFE_MAX_CANVAS_DIM_PX = 8192;
+// unabhängig von Gerätedichte. Auf ausdrücklichen Wunsch von 8192px auf 16384px
+// angehoben. Ehrlicher Hinweis dazu: bei dieser Kantenlänge kann der tatsächliche
+// Speicherbedarf spürbar werden — bei einem nicht-quadratischen Plan (z. B. A0/A1 im
+// Format ca. 1,41:1) skaliert renderPdfPageToSafeCanvasElement beide Seiten
+// proportional, sodass z. B. 16384 × 11585px zusammenkommen können, das sind rund
+// 190 Megapixel bzw. ca. 760 MB allein für den rohen RGBA-Pixelpuffer, zusätzlich
+// zum GPU-Texturspeicher. Auf leistungsstarken Laptops/Desktops unproblematisch, auf
+// iPads/Android-Tablets (explizit als Zielgeräte dieser App im Einsatz) steigt damit
+// bei sehr großformatigen, detailreichen Plänen das Risiko eines Tab-Absturzes durch
+// Speicherüberlauf. Betrifft ausschließlich die Raster-Fallback-Stufe (siehe
+// PdfPlanCanvas/renderPdfPageToSafeCanvasElement) — die bevorzugte Vektor-Stufe ist
+// davon nicht betroffen und bleibt für die meisten Baupläne der genutzte Pfad.
+const PDF_SAFE_MAX_CANVAS_DIM_PX = 16384;
 // Nur für die Raster-Fallback-Stufe relevant (die Vektor-Stufe braucht kein
 // Re-Rendering, siehe renderPdfPageToSvgElement-Kommentar oben): erst ab dieser
 // zusätzlichen Zoomstufe gegenüber der zuletzt gerenderten Auflösung wird die
