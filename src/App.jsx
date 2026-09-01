@@ -980,18 +980,24 @@ async function updatePinPhotoUrl(photo, newDataUrl, actor) {
 // ----------------------------------------------------------------------------------
 // Zweck: einmal geladene Projekte/Etagen/Pins bleiben auch ohne Internetverbindung
 // nutzbar (Anzeigen, Zoomen/Verschieben, neue Pins setzen, Text/Beschreibung/Gewerk
-// erfassen, Fotos aufnehmen, Status ändern). Alle drei Kern-Datensätze werden nach
-// jedem erfolgreichen Laden UND nach jeder lokalen Änderung als einfaches JSON in
-// localStorage gespiegelt (baudoc_offline_cache_v1). Offline getätigte Schreib-
-// aktionen landen zusätzlich als Eintrag in einer geordneten Warteschlange
-// (baudoc_offline_sync_queue_v1) und werden automatisch abgearbeitet, sobald wieder
-// eine Verbindung besteht (siehe flushSyncQueue in App()).
+// erfassen, Status ändern, Fotos aufnehmen UND Pins wieder löschen). Alle drei
+// Kern-Datensätze werden nach jedem erfolgreichen Laden UND nach jeder lokalen
+// Änderung als einfaches JSON in localStorage gespiegelt (baudoc_offline_cache_v1).
+// Offline getätigte Schreibaktionen landen zusätzlich als Eintrag in einer
+// geordneten Warteschlange (baudoc_offline_sync_queue_v1, Eintragstypen create_pin/
+// update_pin/upload_photo/update_photo/delete_pin) und werden automatisch
+// abgearbeitet, sobald wieder eine Verbindung besteht (siehe flushSyncQueue in
+// App()). Die eigentlichen Binärdaten (Grundriss-PDFs, Foto-Bilddateien) laufen
+// NICHT über diese Warteschlange, sondern über den separaten IndexedDB-Asset-Cache
+// weiter unten (siehe ASSET_CACHE_DB_NAME/useOfflineCapableAssetUrl) — dort geht es
+// um das reine ANZEIGEN bereits vorhandener Dateien offline, hier um das SCHREIBEN
+// neuer/geänderter Daten.
 //
-// Bewusste Begrenzung des Umfangs: Löschen von Pins/Aufgaben/Fotos sowie Aufgaben-
-// Verwaltung bleiben an eine bestehende Verbindung gebunden (siehe requireOnline-
-// Guards in den jeweiligen Handlern in App()) — das sind seltenere, weniger
-// zeitkritische Baustellen-Aktionen, und ihr Wegfall im Offline-Fall hält die
-// Synchronisationslogik überschaubar und nachvollziehbar.
+// Bewusste Begrenzung des Umfangs: die Aufgabenverwaltung (Pin-Teilaufgaben/Todos)
+// sowie das Löschen/Bearbeiten einzelner Fotos bleiben an eine bestehende Verbindung
+// gebunden (siehe requireOnline-Guards in den jeweiligen Handlern in App()) — das
+// sind seltenere, weniger zeitkritische Baustellen-Aktionen, und ihr Wegfall im
+// Offline-Fall hält die Synchronisationslogik überschaubar und nachvollziehbar.
 //
 // Bekannte, bewusst in Kauf genommene Grenzen (siehe Einordnung in der Auslieferung):
 // - localStorage ist auf wenige MB pro Origin begrenzt. Offline aufgenommene Fotos
@@ -1291,6 +1297,198 @@ function dataUrlToFile(dataUrl, fileName, mimeType) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
   return new File([bytes], fileName, { type: mime });
+}
+
+// ----------------------------------------------------------------------------------
+// OFFLINE-ASSET-CACHE (IndexedDB) — Grundriss-Baupläne (PDF/SVG) & Pin-Fotos
+// ----------------------------------------------------------------------------------
+// Der obige Lese-Cache (OFFLINE_CACHE_KEY, localStorage) deckt ausschließlich die
+// JSON-Metadaten von Projekten/Etagen/Pins ab — die eigentlichen BINÄRDATEN
+// (Grundriss-PDFs, Foto-Bilddateien) hängen bislang an Supabase-Storage-URLs, die
+// ohne Netzverbindung schlicht nicht laden. IndexedDB ist dafür die richtige Wahl:
+// deutlich höheres Speicherlimit als localStorage (typischerweise ein nennenswerter
+// Anteil des freien Datenträgerplatzes statt weniger MB) und nativer Blob-Support
+// ohne Umweg über Base64-Zeichenketten.
+//
+// Funktionsweise: jede Ressourcen-URL (ein Grundriss oder ein Foto) wird bei jedem
+// erfolgreichen ONLINEN Anzeigen im Hintergrund zusätzlich als Blob unter genau
+// dieser URL als Schlüssel abgelegt (siehe cacheAssetForOfflineUseInBackground/
+// useOfflineCapableAssetUrl unten) — "best effort", ein Fehlschlag (z.B. Speicher-
+// platz voll, IndexedDB im privaten Modus mancher Browser gesperrt) darf die
+// eigentliche Anzeige nie blockieren oder abbrechen. Beim OFFLINEN Öffnen wird
+// zuerst dieser Cache geprüft; liegt der Plan/das Foto dort bereits vor, wird er
+// direkt von dort geladen statt über Supabase. Ehrlicher Hinweis, weil unvermeidbar:
+// ein Plan/Foto, das auf diesem Gerät noch nie ONLINE geöffnet wurde, kann naturgemäß
+// nicht offline verfügbar sein — das ist keine Lücke dieser Implementierung, sondern
+// die Grenze jedes Offline-Caches. Ein offline aufgenommenes/noch unsynchronisiertes
+// Foto (data:-URL, siehe fileToDataUrl) ist bereits vollständig lokal und läuft
+// bewusst NICHT durch diesen Cache.
+const ASSET_CACHE_DB_NAME = "baudoc_asset_cache_v1";
+const ASSET_CACHE_STORE = "assets";
+const ASSET_CACHE_DB_VERSION = 1;
+
+let assetCacheDbPromise = null;
+function openAssetCacheDb() {
+  if (typeof indexedDB === "undefined") {
+    return Promise.reject(new Error("IndexedDB ist in dieser Umgebung nicht verfügbar."));
+  }
+  if (assetCacheDbPromise) return assetCacheDbPromise;
+  assetCacheDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(ASSET_CACHE_DB_NAME, ASSET_CACHE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(ASSET_CACHE_STORE)) {
+        db.createObjectStore(ASSET_CACHE_STORE, { keyPath: "url" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => {
+      assetCacheDbPromise = null;
+      reject(request.error || new Error("IndexedDB konnte nicht geöffnet werden."));
+    };
+  });
+  return assetCacheDbPromise;
+}
+
+async function cacheAssetBlob(url, blob) {
+  try {
+    const db = await openAssetCacheDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(ASSET_CACHE_STORE, "readwrite");
+      tx.objectStore(ASSET_CACHE_STORE).put({ url, blob, cachedAt: Date.now() });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    // Best effort — siehe Erläuterung oben (Speicherplatz voll, IndexedDB gesperrt, …).
+    console.error(`Offline-Zwischenspeicherung fehlgeschlagen für "${url}":`, err);
+  }
+}
+
+async function getCachedAssetBlob(url) {
+  try {
+    const db = await openAssetCacheDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(ASSET_CACHE_STORE, "readonly");
+      const req = tx.objectStore(ASSET_CACHE_STORE).get(url);
+      req.onsuccess = () => resolve(req.result?.blob || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+// Lädt eine Ressource, die der Browser bereits selbst über <img>/pdf.js anzeigt (und
+// damit schon einmal über das Netz geholt hat), ein ZWEITES Mal im Hintergrund nach,
+// rein um sie als Blob im Offline-Cache abzulegen — ehrlicher Kompromiss: das kostet
+// beim erstmaligen Online-Betrachten eines Plans/Fotos zusätzliches Datenvolumen,
+// ist dafür aber die einfachste robuste Lösung, ohne die eigentliche Anzeige (bei
+// PDFs inkl. der Lazy-Loading-Range-Requests aus der letzten Anforderung) anzufassen
+// oder zu verlangsamen — der Zwischenspeicher-Download läuft komplett unabhängig
+// nebenher. inflightAssetCaches verhindert doppelte Parallel-Anfragen für dieselbe
+// URL (z.B. Foto gleichzeitig in Galerie UND Lightbox sichtbar).
+const inflightAssetCaches = new Set();
+function cacheAssetForOfflineUseInBackground(url) {
+  if (!url || url.startsWith("data:") || url.startsWith("blob:") || inflightAssetCaches.has(url)) return;
+  inflightAssetCaches.add(url);
+  fetch(url)
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.blob();
+    })
+    .then((blob) => cacheAssetBlob(url, blob))
+    .catch((err) => console.warn(`Hintergrund-Zwischenspeicherung fehlgeschlagen für "${url}":`, err))
+    .finally(() => inflightAssetCaches.delete(url));
+}
+
+// Holt den Textinhalt einer Ressource (native .svg-Grundrisse, siehe SvgPlanCanvas)
+// — online per direktem fetch() (der dabei ohnehin bereits vorliegende Blob wird
+// gleich mit im Cache abgelegt, KEIN zweiter Download nötig), offline zuerst aus dem
+// Cache, nur wenn dort nichts vorliegt als letzter, dann typischerweise
+// fehlschlagender Versuch wie bisher — kein Verhaltensunterschied gegenüber vorher
+// für einen noch nie online geöffneten Plan.
+async function fetchAssetTextWithOfflineCache(url) {
+  if (isOnline()) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    cacheAssetBlob(url, blob); // best effort, nicht blockierend abgewartet
+    return await blob.text();
+  }
+  const cachedBlob = await getCachedAssetBlob(url);
+  if (cachedBlob) return await cachedBlob.text();
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.text();
+}
+
+// React-Hook: liefert die tatsächlich zu verwendende Quelle für eine Supabase-
+// Storage-URL (Grundriss-PDF oder Pin-Foto). Online unverändert die Original-URL
+// (der Browser lädt dort direkt und am schnellsten, inkl. eigenem HTTP-Cache) plus
+// ein angestoßener Hintergrund-Download in den Offline-Asset-Cache; offline
+// stattdessen, sofern bereits einmal zwischengespeichert, eine lokale object:-URL
+// aus genau diesem Cache. data:-URLs (offline aufgenommene, noch nicht
+// synchronisierte Fotos) werden unverändert durchgereicht. Reagiert außerdem
+// selbstständig auf einen Verbindungswechsel (eigene online/offline-Listener), ohne
+// dass online/offline als Prop durch PlanSvgStage/PdfPlanCanvas durchgereicht werden
+// müsste.
+function useOfflineCapableAssetUrl(url) {
+  const [online, setOnline] = useState(() => isOnline());
+  const [resolvedUrl, setResolvedUrl] = useState(() => (url && !url.startsWith("data:") && !isOnline() ? null : url));
+  const objectUrlRef = useRef(null);
+
+  useEffect(() => {
+    const handleOnline = () => setOnline(true);
+    const handleOffline = () => setOnline(false);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+    if (!url || url.startsWith("data:") || url.startsWith("blob:")) {
+      setResolvedUrl(url);
+      return undefined;
+    }
+    if (online) {
+      setResolvedUrl(url);
+      cacheAssetForOfflineUseInBackground(url);
+      return undefined;
+    }
+    setResolvedUrl(null); // während der Cache-Abfrage nichts (Falsches) anzeigen
+    getCachedAssetBlob(url).then((blob) => {
+      if (cancelled) return;
+      if (blob) {
+        const objectUrl = URL.createObjectURL(blob);
+        objectUrlRef.current = objectUrl;
+        setResolvedUrl(objectUrl);
+      } else {
+        // Nie online zwischengespeichert — ehrlicher, unveränderter Fallback auf die
+        // Original-URL (schlägt offline weiterhin fehl, wie schon vor diesem Cache).
+        setResolvedUrl(url);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [url, online]);
+
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    };
+  }, []);
+
+  return resolvedUrl;
 }
 
 // ----------------------------------------------------------------------------------
@@ -3355,9 +3553,12 @@ function SplashScreen({ onFinished }) {
 }
 
 // Kompakter Verbindungs-/Synchronisations-Status in der Kopfzeile (Abschnitt 15.3):
-// grün = online und nichts ausstehend, bernstein = offline (Änderungen werden lokal
-// gespeichert), blau = online, aber die Warteschlange wird gerade abgearbeitet bzw.
-// wartet noch auf den nächsten Synchronisationslauf.
+// grün = online und nichts ausstehend ("Online"), bernstein/orange = offline
+// ("Offline (X ausstehend)", Änderungen werden lokal gespeichert), blau-blinkend =
+// online, aber die Warteschlange wird gerade aktiv abgearbeitet
+// ("Synchronisiere…") bzw. wartet noch auf den nächsten Synchronisationslauf.
+// animate-pulse (statt nur des rotierenden Icons) erzeugt das angeforderte
+// "blinkende" Erscheinungsbild des gesamten Status-Badges während der Synchronisation.
 function OfflineStatusIndicator({ online, pendingCount, syncing }) {
   if (!online) {
     return (
@@ -3366,7 +3567,7 @@ function OfflineStatusIndicator({ online, pendingCount, syncing }) {
         className="inline-flex items-center gap-1.5 rounded-md bg-amber-900/40 px-2.5 py-1.5 font-semibold text-amber-300"
       >
         <WifiOff size={13} />
-        <span className="hidden sm:inline">Offline{pendingCount > 0 ? ` · ${pendingCount} ausstehend` : " · wird lokal gespeichert"}</span>
+        <span className="hidden sm:inline">{pendingCount > 0 ? `Offline (${pendingCount} ausstehend)` : "Offline · wird lokal gespeichert"}</span>
       </span>
     );
   }
@@ -3374,10 +3575,10 @@ function OfflineStatusIndicator({ online, pendingCount, syncing }) {
     return (
       <span
         title="Offline erfasste Änderungen werden mit der Datenbank synchronisiert."
-        className="inline-flex items-center gap-1.5 rounded-md bg-blue-900/40 px-2.5 py-1.5 font-semibold text-blue-300"
+        className={`inline-flex items-center gap-1.5 rounded-md bg-blue-900/40 px-2.5 py-1.5 font-semibold text-blue-300 ${syncing ? "animate-pulse" : ""}`}
       >
         {syncing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-        <span className="hidden sm:inline">{syncing ? "Synchronisiert…" : `${pendingCount} ausstehend`}</span>
+        <span className="hidden sm:inline">{syncing ? "Synchronisiere…" : `${pendingCount} ausstehend`}</span>
       </span>
     );
   }
@@ -3785,6 +3986,13 @@ function isRenderCancelledError(err) {
 const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, ref) {
   const hostRef = useRef(null); // DOM-Container, in den je nach Rendering-Stufe entweder das SVG- oder das Canvas-Element eingehängt wird
   const [status, setStatus] = useState("loading"); // "loading" | "ready" | "error"
+  // Offline-Asset-Cache (siehe useOfflineCapableAssetUrl oben): online identisch mit
+  // url, offline — sofern zuvor mindestens einmal online geöffnet — eine lokale
+  // object:-URL aus IndexedDB. pdf.js akzeptiert eine object:-URL an genau derselben
+  // Stelle wie eine echte Netz-URL (siehe loadPdfDocument unten), keine Sonderlogik
+  // nötig. resolvedUrl ist kurzzeitig null, während offline der Cache abgefragt
+  // wird — das eigentliche Laden startet erst, sobald ein Wert feststeht.
+  const resolvedUrl = useOfflineCapableAssetUrl(url);
 
   // Zoomabhängiges Nachladen betrifft ausschließlich die Raster-Fallback-Stufe — die
   // bevorzugte Vektor-Stufe (SVG) ist bei jedem Zoomfaktor bereits mathematisch scharf
@@ -3810,6 +4018,7 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
   // Komplexität automatisch auf die sichere Raster-Stufe zurück (siehe Kommentar oben
   // an renderPdfPageToSvgElement/renderPdfPageToSafeCanvasElement).
   useEffect(() => {
+    if (!resolvedUrl) return undefined; // offline: Cache-Abfrage in useOfflineCapableAssetUrl läuft noch
     let cancelled = false;
     loadGenerationRef.current += 1;
     tierRef.current = null;
@@ -3821,7 +4030,7 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
     (async () => {
       try {
         const pdfjsLib = await loadPdfJs();
-        const pdf = await loadPdfDocument(pdfjsLib, url);
+        const pdf = await loadPdfDocument(pdfjsLib, resolvedUrl);
         if (cancelled) return;
         const page = await pdf.getPage(1);
         if (cancelled) return;
@@ -3873,7 +4082,7 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
         renderTaskRef.current = null;
       }
     };
-  }, [url]);
+  }, [resolvedUrl]);
 
   // Zoomabhängiges Nachladen der Raster-Fallback-Stufe: sobald spürbar weiter
   // hineingezoomt wird, als die aktuell sichtbare Auflösung abdeckt, wird nach einer
@@ -3975,11 +4184,10 @@ const SvgPlanCanvas = forwardRef(function SvgPlanCanvas({ url }, ref) {
     let cancelled = false;
     setStatus("loading");
     setMarkup(null);
-    fetch(url)
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.text();
-      })
+    // Offline-Asset-Cache (siehe fetchAssetTextWithOfflineCache oben): online wie
+    // bisher ein direkter fetch(), offline — sofern zuvor mindestens einmal online
+    // geöffnet — aus IndexedDB statt von Supabase.
+    fetchAssetTextWithOfflineCache(url)
       .then((text) => {
         if (cancelled) return;
         setMarkup(sanitizeSvgMarkup(text));
@@ -8714,6 +8922,53 @@ function PhotoMarkupEditor({ photo, onClose, onSave }) {
   );
 }
 
+// Einzelnes Vorschaubild in der Fotogalerie eines Pins (siehe PinModal unten) —
+// eigene Komponente statt eines Inline-Ausdrucks innerhalb von photos.map(), weil
+// useOfflineCapableAssetUrl (Offline-Asset-Cache, siehe oben) einen eigenen React-
+// Hook je Foto braucht, das ist innerhalb einer .map()-Callback-Funktion nicht
+// zulässig (Regeln der Hooks). Reicht die aufgelöste (online: unveränderte, offline:
+// ggf. lokale object:-URL) sowohl an das Vorschaubild selbst als auch an den
+// Lightbox-Trigger weiter, damit beide dieselbe, bereits zwischengespeicherte
+// Quelle verwenden.
+function PinPhotoThumb({ photo, readOnly, onZoom, onRemove, onMarkup }) {
+  const resolvedUrl = useOfflineCapableAssetUrl(photo.photo_url);
+  const displayUrl = resolvedUrl || photo.photo_url;
+  return (
+    <div className="group relative aspect-square overflow-hidden rounded-lg border border-slate-200">
+      <img
+        src={displayUrl}
+        alt=""
+        className="h-full w-full cursor-zoom-in object-cover transition group-hover:opacity-90"
+        onClick={() => onZoom(displayUrl)}
+      />
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 transition group-hover:bg-black/20">
+        <ZoomIn size={16} className="text-white opacity-0 transition group-hover:opacity-100" />
+      </div>
+      {!readOnly && (
+        <button
+          onClick={() => onRemove(photo)}
+          className="absolute right-1 top-1 rounded-full bg-slate-900/70 p-0.5 text-white opacity-0 transition group-hover:opacity-100"
+        >
+          <X size={12} />
+        </button>
+      )}
+      {/* Foto-Markup-Editor-Trigger — bewusst dauerhaft sichtbar (nicht erst bei Hover
+          wie die Löschen-Schaltfläche), damit das Werkzeug auf den kleinen
+          Vorschaubildern gut auffindbar bleibt (siehe Anforderung "gut sichtbares
+          Stift-/Bearbeiten-Icon"). */}
+      {!readOnly && (
+        <button
+          onClick={() => onMarkup(photo)}
+          title="Foto bearbeiten (Markup)"
+          className="absolute bottom-1 left-1 inline-flex items-center justify-center rounded-full bg-white/90 p-1 text-slate-700 shadow transition hover:bg-white hover:text-[#FF2A00]"
+        >
+          <PenTool size={12} />
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ----------------------------------------------------------------------------------
 // PIN DETAIL MODAL
 // ----------------------------------------------------------------------------------
@@ -9130,38 +9385,14 @@ function PinModal({
             />
             <div className="grid grid-cols-4 gap-2">
               {photos.map((photo) => (
-                <div key={photo.id} className="group relative aspect-square overflow-hidden rounded-lg border border-slate-200">
-                  <img
-                    src={photo.photo_url}
-                    alt=""
-                    className="h-full w-full cursor-zoom-in object-cover transition group-hover:opacity-90"
-                    onClick={() => setLightboxSrc(photo.photo_url)}
-                  />
-                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 transition group-hover:bg-black/20">
-                    <ZoomIn size={16} className="text-white opacity-0 transition group-hover:opacity-100" />
-                  </div>
-                  {!readOnly && (
-                    <button
-                      onClick={() => onRemovePhoto(photo)}
-                      className="absolute right-1 top-1 rounded-full bg-slate-900/70 p-0.5 text-white opacity-0 transition group-hover:opacity-100"
-                    >
-                      <X size={12} />
-                    </button>
-                  )}
-                  {/* Foto-Markup-Editor-Trigger — bewusst dauerhaft sichtbar (nicht erst
-                      bei Hover wie die Löschen-Schaltfläche), damit das Werkzeug auf den
-                      kleinen Vorschaubildern gut auffindbar bleibt (siehe Anforderung
-                      "gut sichtbares Stift-/Bearbeiten-Icon"). */}
-                  {!readOnly && (
-                    <button
-                      onClick={() => setMarkupPhoto(photo)}
-                      title="Foto bearbeiten (Markup)"
-                      className="absolute bottom-1 left-1 inline-flex items-center justify-center rounded-full bg-white/90 p-1 text-slate-700 shadow transition hover:bg-white hover:text-[#FF2A00]"
-                    >
-                      <PenTool size={12} />
-                    </button>
-                  )}
-                </div>
+                <PinPhotoThumb
+                  key={photo.id}
+                  photo={photo}
+                  readOnly={readOnly}
+                  onZoom={setLightboxSrc}
+                  onRemove={onRemovePhoto}
+                  onMarkup={setMarkupPhoto}
+                />
               ))}
               {uploadingPhotos && (
                 <div className="flex aspect-square flex-col items-center justify-center gap-1 rounded-lg border border-slate-200 bg-slate-50 text-slate-400">
@@ -10055,6 +10286,16 @@ function App() {
           // im Online-Fall (siehe updatePinPhotoUrl), inkl. Aufräumen der alten Version.
           await updatePinPhotoUrl({ id: item.photoId, pin_id: targetPinId, photo_url: item.oldPhotoUrl }, item.dataUrl, item.actor);
           await logPinActivity(targetPinId, "photo_edited", "Foto bearbeitet (offline erfasst, synchronisiert)", item.actor);
+        } else if (item.type === "delete_pin") {
+          // Offline-Löschung (siehe handleDeletePin) — photos wurde beim Einreihen des
+          // Warteschlangen-Eintrags mitgeschickt (der lokale Zustand kennt den Pin zu
+          // diesem Zeitpunkt ja bereits nicht mehr), deletePin() räumt damit wie im
+          // Online-Fall auch die zugehörigen Storage-Dateien mit auf. Ein etwaiger noch
+          // davor in der Warteschlange stehender update_pin-Eintrag für denselben Pin
+          // (Bearbeitung vor der Löschung, beides offline) läuft in der Reihenfolge der
+          // Warteschlange einfach vorher durch — unschädlich, das Ergebnis ist ohnehin
+          // "gelöscht".
+          await deletePin({ id: targetPinId, pin_photos: item.photos || [] });
         }
         processedAny = true;
         const remaining = readSyncQueue().filter((q) => q.id !== item.id);
@@ -10717,10 +10958,12 @@ function App() {
     }
   };
 
-  // Löschen von Pins sowie die gesamte Aufgabenverwaltung (unten) bleiben bewusst an
-  // eine bestehende Verbindung gebunden (siehe Kommentar am Anfang des Offline-Moduls
-  // in der Datenschicht) — requireOnline gibt dafür eine klare, sofortige Rückmeldung
-  // statt eines rohen Netzwerkfehlers.
+  // Die gesamte Aufgabenverwaltung (unten) bleibt bewusst an eine bestehende
+  // Verbindung gebunden (siehe Kommentar am Anfang des Offline-Moduls in der
+  // Datenschicht) — requireOnline gibt dafür eine klare, sofortige Rückmeldung statt
+  // eines rohen Netzwerkfehlers. Das Löschen eines Pins selbst ist seit der
+  // Erweiterung der Offline-Synchronisation um Löschungen (siehe handleDeletePin/
+  // "delete_pin" in flushSyncQueue) NICHT mehr an requireOnline gebunden.
   const requireOnline = (actionLabel) => {
     if (online) return true;
     setGlobalError(`${actionLabel} ist offline nicht möglich. Bitte bei bestehender Internetverbindung erneut versuchen.`);
@@ -10729,8 +10972,30 @@ function App() {
 
   const handleDeletePin = async (pinId) => {
     if (!floor || !plan) return;
-    if (!requireOnline("Ein Pin kann")) return;
     const pinToDelete = pins.find((p) => p.id === pinId);
+    if (!online || isPinPendingSync(pinId)) {
+      // Offline-First (Erweiterung Löschungen): ein Pin, der auf diesem Gerät noch nie
+      // synchronisiert wurde (offline angelegt, siehe isOfflineId/readOfflineIdMap),
+      // existiert serverseitig noch gar nicht — dafür reicht es, ihn samt aller noch
+      // ausstehenden Warteschlangen-Einträge (create_pin/update_pin/upload_photo/
+      // update_photo) ersatzlos zu entfernen, statt einen "delete_pin"-Eintrag
+      // anzulegen, der beim Synchronisieren ohnehin ins Leere liefe. Ein bereits
+      // synchronisierter Pin bekommt stattdessen einen eigenen "delete_pin"-Eintrag,
+      // der die Löschung nachholt, sobald wieder eine Verbindung besteht.
+      if (isOfflineId(pinId) && !readOfflineIdMap()[pinId]) {
+        const remaining = readSyncQueue().filter((q) => q.localId !== pinId && q.pinId !== pinId);
+        writeSyncQueue(remaining);
+        setSyncQueue(remaining);
+      } else {
+        setSyncQueue(
+          enqueueSyncItem({ type: "delete_pin", pinId, photos: pinToDelete?.pin_photos || [], actor: currentActor })
+        );
+      }
+      setPins((prev) => prev.filter((p) => p.id !== pinId));
+      removePinSummary(floor.id, plan.id, pinId);
+      setModalState(null);
+      return;
+    }
     try {
       await deletePin(pinToDelete || { id: pinId, pin_photos: [] });
       setPins((prev) => prev.filter((p) => p.id !== pinId));
