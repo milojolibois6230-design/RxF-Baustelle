@@ -1312,6 +1312,94 @@ function resolveOfflineId(id) {
   return readOfflineIdMap()[id] || id;
 }
 
+// ---- Client-seitige Foto-Komprimierung (vor JEDEM Speichern/Upload) ---------------
+// Skaliert ein neu aufgenommenes/ausgewähltes Mangel-Foto auf dem Client herunter und
+// re-encodiert es als JPEG, BEVOR es überhaupt an die Offline-Warteschlange oder den
+// Online-Upload übergeben wird (siehe einziger Aufrufer handleUploadPhotos unten) —
+// läuft vollständig lokal über ein <canvas>, ohne externen Dienst, und funktioniert
+// dadurch unverändert auch ohne Netzverbindung. Nutzen dafür: kleinere data:-URLs im
+// localStorage-Sync-Queue-Eintrag (dessen Größe sonst schnell an praktische
+// localStorage-Grenzen stößt, siehe OFFLINE_SYNC_QUEUE_KEY), kleinere IndexedDB-
+// Cache-Einträge und spürbar schnellere Uploads auf der Baustelle bei schwachem
+// Empfang. Wirft absichtlich NIE einen Fehler nach außen: schlägt das Dekodieren
+// eines einzelnen, ggf. exotischen Bildformats fehl, wird unverändert die
+// Original-Datei zurückgegeben (nur mit einer Konsolenwarnung) — ein einzelnes
+// fehlerhaftes Foto darf niemals den gesamten Foto-Upload blockieren.
+function compressImage(file, maxWidth = 1920, maxHeight = 1080, quality = 0.8) {
+  return new Promise((resolve) => {
+    if (!file || !file.type || !file.type.startsWith("image/")) {
+      resolve(file);
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    const cleanup = () => URL.revokeObjectURL(objectUrl);
+    const fallbackToOriginal = (reason) => {
+      cleanup();
+      console.warn("Foto-Komprimierung übersprungen, Original wird verwendet:", reason);
+      resolve(file);
+    };
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const naturalWidth = img.naturalWidth || img.width;
+        const naturalHeight = img.naturalHeight || img.height;
+        if (!naturalWidth || !naturalHeight) {
+          fallbackToOriginal("Bildabmessungen konnten nicht ermittelt werden.");
+          return;
+        }
+        // Nur verkleinern, nie vergrößern — ein bereits kleineres Foto (z.B. Nahaufnahme
+        // aus einer älteren/einfacheren Kamera) bleibt in seiner Originalauflösung, wird
+        // aber trotzdem als JPEG mit der Ziel-Qualität re-encodiert (siehe unten), damit
+        // z.B. unkomprimierte PNG-Aufnahmen ebenfalls von der Komprimierung profitieren.
+        const downscale = Math.min(1, maxWidth / naturalWidth, maxHeight / naturalHeight);
+        const targetWidth = Math.max(1, Math.round(naturalWidth * downscale));
+        const targetHeight = Math.max(1, Math.round(naturalHeight * downscale));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        const ctx = canvas.getContext("2d", { alpha: false });
+        if (!ctx) {
+          fallbackToOriginal("2D-Canvas-Context nicht verfügbar.");
+          return;
+        }
+        // Weißer Hintergrund vor dem Zeichnen: JPEG kennt keine Transparenz — ohne dies
+        // würde ein transparenter Bildbereich (z.B. bei einem PNG-Foto) sonst je nach
+        // Browser schwarz statt weiß dargestellt werden.
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, targetWidth, targetHeight);
+        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+        canvas.toBlob(
+          (blob) => {
+            cleanup();
+            if (!blob) {
+              console.warn("Foto-Komprimierung übersprungen, Original wird verwendet: toBlob lieferte kein Ergebnis.");
+              resolve(file);
+              return;
+            }
+            // Dateiname bleibt erhalten (nur die Endung wird auf .jpg vereinheitlicht,
+            // da die Ausgabe jetzt immer JPEG ist) — sanitizeFileName() beim eigentlichen
+            // Storage-Upload (siehe uploadPinPhoto) greift unverändert auf diesen Namen zu.
+            const baseName = (file.name || "foto").replace(/\.[a-zA-Z0-9]+$/, "");
+            const compressedFile = new File([blob], `${baseName}.jpg`, {
+              type: "image/jpeg",
+              lastModified: Date.now(),
+            });
+            resolve(compressedFile);
+          },
+          "image/jpeg",
+          quality
+        );
+      } catch (err) {
+        fallbackToOriginal(err);
+      }
+    };
+    img.onerror = (err) => fallbackToOriginal(err);
+    img.src = objectUrl;
+  });
+}
+
 // ---- Foto-Konvertierung für die Offline-Warteschlange -----------------------------
 // Offline aufgenommene/ausgewählte Fotos werden als data:-URL (Base64) an einen Pin
 // gehängt und in derselben Form in die Warteschlange gelegt. Beim Synchronisieren
@@ -11408,13 +11496,20 @@ function App() {
   const handleUploadPhotos = async (pinId, files) => {
     for (const file of files) {
       try {
+        // Client-seitige Komprimierung IMMER zuerst, für Offline- UND Online-Pfad
+        // gleichermaßen — beide Zweige unten arbeiten ab hier ausschließlich mit
+        // compressedFile, nie mit dem unkomprimierten Original. compressImage()
+        // wirft nie selbst (siehe dortiger Kommentar), ein einzelnes fehlerhaftes
+        // Foto fällt also bestenfalls auf die Originaldatei zurück, blockiert aber
+        // nie den Upload als solchen.
+        const compressedFile = await compressImage(file);
         // Offline-First (Punkt 15): das Foto wird sofort als data:-URL am Pin
         // angezeigt (Kamera-Aufnahme/Auswahl funktioniert unverändert) und der
         // eigentliche Supabase-Upload in die Warteschlange eingereiht. Die
         // Dropbox-Archivierung läuft ausschließlich für online aufgenommene Fotos
         // (siehe Kommentar im Offline-Modul der Datenschicht).
         if (!online || isPinPendingSync(pinId)) {
-          const dataUrl = await fileToDataUrl(file);
+          const dataUrl = await fileToDataUrl(compressedFile);
           const nowIso = new Date().toISOString();
           const localPhoto = {
             id: generateOfflineId(),
@@ -11435,7 +11530,7 @@ function App() {
                         id: generateOfflineId(),
                         pin_id: pinId,
                         action: "photo_added",
-                        detail: `Foto hochgeladen: „${file.name}" (offline erfasst, wird synchronisiert)`,
+                        detail: `Foto hochgeladen: „${compressedFile.name}" (offline erfasst, wird synchronisiert)`,
                         actor_email: currentActor?.email || null,
                         actor_name: currentActor?.name || null,
                         created_at: nowIso,
@@ -11450,8 +11545,8 @@ function App() {
               type: "upload_photo",
               pinId,
               dataUrl,
-              fileName: file.name,
-              mimeType: file.type,
+              fileName: compressedFile.name,
+              mimeType: compressedFile.type,
               actor: currentActor,
               // localPhotoId verknüpft diesen Warteschlangen-Eintrag mit dem lokal
               // angezeigten Foto — wird ein noch unsynchronisiertes Offline-Foto per
@@ -11463,8 +11558,8 @@ function App() {
           );
           continue;
         }
-        const photo = await uploadPinPhoto(pinId, file, currentActor);
-        const activity = await logPinActivity(pinId, "photo_added", `Foto hochgeladen: „${file.name}"`, currentActor);
+        const photo = await uploadPinPhoto(pinId, compressedFile, currentActor);
+        const activity = await logPinActivity(pinId, "photo_added", `Foto hochgeladen: „${compressedFile.name}"`, currentActor);
         setPins((prev) =>
           prev.map((p) =>
             p.id === pinId
@@ -11474,9 +11569,12 @@ function App() {
         );
         // Dropbox-Archivierung (Abschnitt 4) ist bewusst best effort: sie läuft NACH
         // dem primären, bereits erfolgreichen Supabase-Upload und darf diesen bei
-        // einem Fehlschlag weder rückgängig machen noch blockieren.
+        // einem Fehlschlag weder rückgängig machen noch blockieren. Nutzt bewusst
+        // dieselbe komprimierte Fassung wie der Supabase-Upload, nicht das Original —
+        // sonst würden in Supabase und Dropbox zwei unterschiedliche Qualitätsstufen
+        // desselben Fotos abgelegt.
         if (dropboxConnected && currentAppUser?.kuerzel) {
-          syncPhotoToDropbox(file, currentAppUser.kuerzel).catch((err) => {
+          syncPhotoToDropbox(compressedFile, currentAppUser.kuerzel).catch((err) => {
             console.error("Dropbox-Sync fehlgeschlagen:", err);
             setGlobalError(`Foto wurde gespeichert, die Dropbox-Archivierung ist aber fehlgeschlagen: ${err?.message || err}`);
           });
