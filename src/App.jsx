@@ -3917,13 +3917,23 @@ function getPdfSafeMaxCanvasDimPx() {
 // position als reinen Prozentsatz relativ zu dessen Breite/Höhe um. Das ist von
 // Natur aus unabhängig davon, WIE der aktuelle Zoom zustande kommt (Canvas-Auflösung,
 // CSS-Skalierung oder eine Mischung aus beidem) und funktioniert bereits heute exakt
-// so auch bei sehr hohen Zoomstufen (die App erlaubt ohnehin bis zu 2500%, siehe
-// FLOORPLAN_MAX_SCALE). Das eingefrorene Canvas wird stattdessen ganz normal über
+// so auch bei sehr hohen Zoomstufen — die UI selbst ist mittlerweile zusätzlich hart
+// auf 200% gedeckelt (FLOORPLAN_MAX_SCALE = 2.0, siehe dortiger Kommentar), diese
+// Aussage zur Transform-Unabhängigkeit von posFromEvent bleibt davon unberührt und gilt
+// unverändert für den gesamten erlaubten Zoombereich. Das eingefrorene Canvas wird stattdessen ganz normal über
 // dieselbe, bereits vorhandene Bühnen-Skalierung mit hochskaliert (CSS-Auflösung,
 // keine neue Canvas-Pixelallokation) — dadurch bleiben Punkt 2 (0 zusätzlicher
 // Speicher ab hier) UND Punkt 3 (Pins bleiben exakt verankert) beide gleichzeitig
 // erfüllt.
 const PDF_RASTER_RENDER_SCALE_CAP_MOBILE = 2.0; // entspricht RENDER_CAP aus der Anforderung
+// Hinweis seit dem UI-weiten Zoom-Stopp bei 200% (FLOORPLAN_MAX_SCALE = 2.0): scale
+// kann jetzt ohnehin nie mehr über 2.0 hinaus angefordert werden, wodurch dieser
+// mobile Cap in der Praxis kaum noch selbst greifen dürfte. Bewusst NICHT entfernt —
+// bleibt als zusätzliches Sicherheitsnetz direkt vor pdf.js aktiv (z. B. bei künftigen
+// Änderungen an FLOORPLAN_MAX_SCALE oder DPR-Werten > 1.0, die die kombinierte
+// safeScale trotz gedeckeltem scale wieder über 2.0 treiben könnten) und entspricht
+// damit unverändert "Render-Canceling ... bleiben zu 100% vollständig erhalten" aus
+// der aktuellen Anforderung.
 
 function getPdfRasterRenderScaleCap() {
   if (typeof window === "undefined") return Infinity;
@@ -7534,8 +7544,23 @@ function PinsAndNotesLayer({
 // ----------------------------------------------------------------------------------
 // STUFENLOSES ZOOM & PAN — Konfiguration für die interaktive Grundriss-Ansicht
 // ----------------------------------------------------------------------------------
+// Harter Zoom-Stopp bei exakt 200% (MAX_ZOOM = 2.0) bzw. 50% (MIN_ZOOM = 0.5), wie
+// angefordert. Bewusst NICHT als zusätzliche, separate MAX_ZOOM/MIN_ZOOM-Konstante
+// neben FLOORPLAN_MAX_SCALE/FLOORPLAN_MIN_SCALE eingeführt: ALLE drei Zoom-Einstiegspunkte
+// (Zoom-Buttons über zoomByFactor, Mausrad/Touchpad über handleWheelNative, Pinch-Geste
+// über handleViewportPointerMove) laufen bereits heute ausnahmslos über clampScale(...)
+// unten, die wiederum ausschließlich diese beiden Konstanten liest. Der Zoom-Stopp greift
+// dadurch mit einer einzigen Wertänderung an einer einzigen Stelle an allen drei Stellen
+// gleichzeitig und kann nie einzeln auseinanderlaufen — eine zusätzliche, in jedem
+// Handler separat wiederholte Math.min/Math.max-Kappung (wie im Auftrag skizziert) wäre
+// hier reine Duplizierung derselben Grenze und potenzielle künftige Fehlerquelle, falls
+// beide Kappungen einmal auseinanderdriften. FLOORPLAN_MIN_SCALE = 0.5 entsprach bereits
+// vor dieser Änderung dem geforderten MIN_ZOOM und musste nicht angepasst werden.
+// Zuvor erlaubte die App bis zu 2500% (FLOORPLAN_MAX_SCALE = 25.0); das ist mit diesem
+// harten 200%-Stopp jetzt nicht mehr möglich — auf Wunsch reversibel durch reines
+// Zurücksetzen dieses einen Werts.
 const FLOORPLAN_MIN_SCALE = 0.5;
-const FLOORPLAN_MAX_SCALE = 25.0;
+const FLOORPLAN_MAX_SCALE = 2.0;
 // Dämpfungsfaktor für den Mausrad-/Touchpad-Zoom (siehe handleWheelNative): pro
 // Wheel-Event wird der Zoomfaktor aus der tatsächlichen deltaY-Größe abgeleitet
 // (newScale = currentScale * (1 - deltaY * FLOORPLAN_WHEEL_DAMPING)) statt eines
@@ -8298,6 +8323,15 @@ function FloorPlanView({
           <LoadingBlock label="Pins werden geladen…" />
         ) : (
           <>
+            {/* touch-none (touch-action: none) unterbindet das native Pinch-to-Zoom/
+                Scrollen des Browsers auf diesem Element bereits UNBEDINGT, unabhängig
+                vom aktuellen Zoomstand — Safari/Chrome übernehmen dadurch nie selbst
+                das Zoomen der Seite, auch nicht beim Erreichen von MAX_ZOOM = 2.0.
+                Das deckt Punkt 2 der Zoom-Stopp-Anforderung bereits vollständig und
+                zuverlässiger ab als ein bedingtes preventDefault() erst am Cap (touch-
+                action ist dafür der vom Browser vorgesehene Mechanismus). Der eigentliche
+                Zoom-Stopp bei genau 200% erfolgt zentral in clampScale via
+                FLOORPLAN_MAX_SCALE, siehe Kommentar dort. */}
             <div
               ref={viewportRef}
               className="relative h-full w-full touch-none select-none overflow-hidden"
