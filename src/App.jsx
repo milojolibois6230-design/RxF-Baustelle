@@ -3568,12 +3568,25 @@ function loadPdfJs() {
 // spezifisch am Worker fehl (z. B. CSP-Blockade eines fremden Worker-Origins), wird
 // automatisch ein zweiter Versuch ohne dedizierten Worker unternommen (Hauptthread-
 // Rendering) — siehe Erläuterung oben.
+//
+// disableAutoFetch: true + disableStream: false aktivieren pdf.js' progressives
+// Nachladen über HTTP-Range-Requests (setzt voraus, dass der Server der PDF-URL
+// Range-Requests unterstützt — bei allen über Supabase Storage ausgelieferten
+// Grundrissen der Fall, siehe supabase_schema.sql/Bucket "floor-plans"): pdf.js holt
+// dadurch bei einem 5-10MB-Plan nicht mehr die komplette Datei auf einmal, sondern
+// zunächst nur den für die erste Seite tatsächlich benötigten Byte-Bereich, weitere
+// Seiten/Ressourcen erst bei Bedarf. disableAutoFetch verhindert dabei zusätzlich das
+// eifrige Vorabladen des GESAMTEN restlichen Dokuments im Hintergrund, das pdf.js mit
+// aktiviertem Streaming sonst von sich aus anstoßen würde. Ehrlicher Hinweis: diese
+// App zeigt ohnehin ausschließlich Seite 1 eines Plans an (siehe pdf.getPage(1) unten)
+// — der Effekt betrifft hier also vor allem den initialen Ladezeitpunkt bei großen,
+// mehrseitigen PDFs, nicht ein Nachladen weiterer Seiten zur Laufzeit.
 async function loadPdfDocument(pdfjsLib, url) {
   try {
-    return await pdfjsLib.getDocument(url).promise;
+    return await pdfjsLib.getDocument({ url, disableAutoFetch: true, disableStream: false }).promise;
   } catch (err) {
     console.warn("PDF-Laden über Web-Worker fehlgeschlagen, Fallback auf Hauptthread-Rendering (disableWorker):", err);
-    return await pdfjsLib.getDocument({ url, disableWorker: true }).promise;
+    return await pdfjsLib.getDocument({ url, disableWorker: true, disableAutoFetch: true, disableStream: false }).promise;
   }
 }
 
@@ -3592,13 +3605,36 @@ async function loadPdfDocument(pdfjsLib, url) {
 const PDF_SVG_MAX_OPERATORS = 40000; // Heuristik, keine belastbare Browser-Spezifikation — bei Bedarf an echten Baustellen-Plänen nachjustieren.
 const PDF_SVG_RENDER_TIMEOUT_MS = 6000;
 // "Sicherer" Render-Maßstab für die Raster-Fallback-Stufe: an devicePixelRatio
-// gekoppelt, aber hart bei 3.0 gedeckelt (auf ausdrücklichen Wunsch von zuvor 2.0
-// angehoben, Fallback-Wert ohne bekannten devicePixelRatio ebenfalls von 1.5 auf 2
-// angehoben) — Math.min(devicePixelRatio || 2, 3) entspricht damit exakt der
-// angeforderten Formel. Gilt weiterhin nur für die Raster-Fallback-Stufe, die
-// ohnehin nur für PDFs greift, bei denen bereits die "leichtere" Vektor-Stufe an
-// ihre Grenzen kam (siehe PDF_SVG_MAX_OPERATORS).
-const PDF_SAFE_RENDER_DPR_CAP = 3.0;
+// gekoppelt, aber hart gedeckelt — am Desktop weiterhin bei 3.0 (Fallback-Wert ohne
+// bekannten devicePixelRatio: 2), auf Mobilgeräten strenger bei 2.0 (siehe
+// getPdfSafeRenderDprCap/PDF_SAFE_RENDER_DPR_CAP_MOBILE unten). Gilt weiterhin nur
+// für die Raster-Fallback-Stufe, die ohnehin nur für PDFs greift, bei denen bereits
+// die "leichtere" Vektor-Stufe an ihre Grenzen kam (siehe PDF_SVG_MAX_OPERATORS).
+const PDF_SAFE_RENDER_DPR_CAP_DESKTOP = 3.0;
+// Auf Mobilgeräten (Bildschirmbreite < PDF_MOBILE_RENDER_BREAKPOINT_PX) wird die
+// Obergrenze deutlich strenger gezogen als am Desktop: der Canvas-Speicherbedarf
+// wächst mit dem QUADRAT des Skalierungsfaktors, ein Cap von 2.0 statt 3.0 senkt ihn
+// also um (1 - (2.0/3.0)^2) ≈ 56% — mehr als die geforderten "über 50%". 2.0 ist
+// bewusst das obere Ende der angeforderten Spanne von 1.5-2.0 gewählt, nicht das
+// untere: es bleibt damit noch klar über der nativen Gerätedichte typischer
+// Tablets/Smartphones (meist 2.0-3.0), sodass Baupläne auf dem Bildschirm weiterhin
+// scharf wirken, während gleichzeitig der Speicher-/Absturzschutz für genau die
+// Geräteklasse greift, auf der ein Tab-Absturz durch Speicherüberlauf am ehesten
+// eintritt (siehe PDF_SAFE_MAX_CANVAS_DIM_PX-Kommentar oben zu iPads/Tablets).
+const PDF_SAFE_RENDER_DPR_CAP_MOBILE = 2.0;
+const PDF_MOBILE_RENDER_BREAKPOINT_PX = 768;
+
+// Liefert die für das aktuelle Gerät geltende DPR-Obergrenze der Raster-Fallback-
+// Stufe. window.innerWidth statt eines einmalig beim Laden ermittelten Werts, damit
+// z. B. ein zur Laufzeit gedrehtes Tablet (Hoch-/Querformat) oder ein
+// Fenster-Resize am Desktop stets die zum aktuellen Layout passende Grenze
+// verwendet — wird ohnehin bei jedem Rendering-Aufruf neu ausgewertet, nie gecacht.
+function getPdfSafeRenderDprCap() {
+  if (typeof window === "undefined") return PDF_SAFE_RENDER_DPR_CAP_DESKTOP;
+  return window.innerWidth < PDF_MOBILE_RENDER_BREAKPOINT_PX
+    ? PDF_SAFE_RENDER_DPR_CAP_MOBILE
+    : PDF_SAFE_RENDER_DPR_CAP_DESKTOP;
+}
 // Harte Obergrenze für die tatsächliche Canvas-Pixelbreite/-höhe dieser Fallback-
 // Stufe — verhindert einen GPU-/RAM-Überlauf bei großformatigen Papiergrößen (A0/A1),
 // unabhängig von Gerätedichte. Auf ausdrücklichen Wunsch von 8192px auf 16384px
@@ -3697,7 +3733,7 @@ async function renderPdfPageToSvgElement(pdfjsLib, page, operatorList) {
 // Render-Durchläufe parallel um dasselbe Canvas konkurrieren zu lassen.
 async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTaskRef = null) {
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 2 : 2;
-  const safeScale = Math.min(dpr, PDF_SAFE_RENDER_DPR_CAP) * Math.max(1, extraScale);
+  const safeScale = Math.min(dpr, getPdfSafeRenderDprCap()) * Math.max(1, extraScale);
   let viewport = page.getViewport({ scale: safeScale });
   const largestDim = Math.max(viewport.width, viewport.height);
   if (largestDim > PDF_SAFE_MAX_CANVAS_DIM_PX) {
@@ -3730,6 +3766,20 @@ async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTask
   await renderTask.promise;
   if (renderTaskRef && renderTaskRef.current === renderTask) renderTaskRef.current = null;
   return canvas;
+}
+
+// Erkennt pdf.js' eigene RenderingCancelledException — geworfen, wenn ein
+// RenderTask.promise abgelehnt wird, WEIL derselbe Task zwischenzeitlich per
+// renderTask.cancel() abgebrochen wurde (siehe renderPdfPageToSafeCanvasElement:
+// jeder neue Zoom-/Seitenwechsel bricht einen noch laufenden vorherigen Task ab). Das
+// ist der ERWARTETE, normale Verlauf bei schnellem Nachzoomen, kein echter Fehler —
+// pdf.js benennt die Exception laut eigenem Quelltext (RenderingCancelledException,
+// util.js) über .name, nicht über den message-Text, deshalb wird hier gezielt .name
+// geprüft. Aufrufer nutzen das, um genau diesen Fall still zu behandeln (weder
+// console.error/-warn noch ein Fehler-UI), statt bei jedem raschen Zoom-Schritt
+// unnötige, irreführende Konsolenmeldungen zu erzeugen.
+function isRenderCancelledError(err) {
+  return err?.name === "RenderingCancelledException";
 }
 
 const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, ref) {
@@ -3800,7 +3850,14 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
         host.replaceChildren(renderedElement);
         if (!cancelled) setStatus("ready");
       } catch (err) {
-        console.error("PDF-Rendering vollständig fehlgeschlagen (Vektor UND Raster-Fallback), Rückfall auf <embed>:", err);
+        // Abgebrochene RenderTasks (siehe isRenderCancelledError) sind hier der normale
+        // Fall bei einem Komponenten-Unmount/URL-Wechsel WÄHREND das Raster-Fallback
+        // noch rendert (siehe Cleanup unten) — kein echter Rendering-Fehler, daher ohne
+        // console.error und ohne Fehler-UI (cancelled ist in diesem Fall ohnehin schon
+        // true, setStatus("error") würde also sowieso nicht mehr greifen).
+        if (!isRenderCancelledError(err)) {
+          console.error("PDF-Rendering vollständig fehlgeschlagen (Vektor UND Raster-Fallback), Rückfall auf <embed>:", err);
+        }
         if (!cancelled) setStatus("error");
       }
     })();
@@ -3842,7 +3899,15 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
         host.replaceChildren(canvas);
         lastRasterScaleRef.current = zoomScale;
       } catch (err) {
-        console.warn("Hochauflösendes Nachladen der PDF-Raster-Fallback-Stufe fehlgeschlagen, bisherige Auflösung bleibt sichtbar:", err);
+        // Genau der in isRenderCancelledError beschriebene Normalfall: ein noch
+        // schnelleres, weiteres Nachzoomen hat diesen Render-Task bereits wieder per
+        // renderTask.cancel() abgebrochen, bevor er fertig wurde (siehe
+        // renderPdfPageToSafeCanvasElement) — der jeweils NEUESTE Zoom-Schritt gewinnt
+        // ohnehin, dieser hier ist einfach überholt. Kein Konsolenfehler nötig, die
+        // bisherige Auflösung bleibt bis zum nächsten erfolgreichen Rendering sichtbar.
+        if (!isRenderCancelledError(err)) {
+          console.warn("Hochauflösendes Nachladen der PDF-Raster-Fallback-Stufe fehlgeschlagen, bisherige Auflösung bleibt sichtbar:", err);
+        }
       }
     }, PDF_RASTER_RERENDER_DEBOUNCE_MS);
 
