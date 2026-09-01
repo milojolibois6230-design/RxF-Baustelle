@@ -67,6 +67,8 @@ import {
   Star,
   LayoutGrid,
   List,
+  Archive,
+  ArchiveRestore,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -215,11 +217,12 @@ const PIN_ACTIVITY_META = {
 // PROJEKT-STATUS
 // ----------------------------------------------------------------------------------
 
-const PROJECT_STATUS_OPTIONS = ["Geplant", "In Bearbeitung", "Abgeschlossen"];
+const PROJECT_STATUS_OPTIONS = ["Geplant", "In Bearbeitung", "On Hold", "Abgeschlossen"];
 
 const PROJECT_STATUS_META = {
   Geplant: { text: "text-slate-600", bg: "bg-slate-100", dot: "bg-slate-400" },
   "In Bearbeitung": { text: "text-amber-700", bg: "bg-amber-50", dot: "bg-amber-500" },
+  "On Hold": { text: "text-violet-700", bg: "bg-violet-50", dot: "bg-violet-500" },
   Abgeschlossen: { text: "text-emerald-700", bg: "bg-emerald-50", dot: "bg-emerald-500" },
 };
 
@@ -1118,6 +1121,59 @@ async function verifyOfflineCredential(email, password) {
     console.error("Offline-Anmeldung konnte nicht geprüft werden:", err);
     return false;
   }
+}
+
+// "Angemeldet bleiben" auf diesem Gerät — für den Offline-Anmeldepfad. Der Online-
+// Pfad braucht dafür KEINE eigene Logik: Supabase persistiert eine echte Session
+// bereits von sich aus in localStorage und stellt sie beim App-Start automatisch
+// wieder her (siehe supabase.auth.getSession() in App()) — das funktioniert schon
+// heute, auch nach vollständigem Schließen des Browsers/der App. Diese Lücke
+// betrifft ausschließlich den Fall, dass sich jemand zuletzt OFFLINE angemeldet
+// hat: bislang musste dafür bei jedem Kaltstart erneut das Passwort eingegeben
+// werden, obwohl der PBKDF2-Fingerabdruck (siehe verifyOfflineCredential) bereits
+// vorlag.
+//
+// Bewusst NICHT als reines "isLoggedIn: true"-Flag umgesetzt: ein simples,
+// ungebundenes Flag ließe sich mit jedem Zugriff auf die Browser-Konsole
+// (localStorage.setItem(...)) fälschen und würde die gerade erst eingeführte
+// verpflichtende Login-Sperre (siehe LoginScreen) faktisch aushebeln — auch für ein
+// Gerät, das nie zuvor echte Zugangsdaten gesehen hat. Stattdessen merkt sich diese
+// Funktion nur, WESSEN Anmeldung erinnert werden darf (E-Mail-Adresse) und für wie
+// lange; die eigentliche Berechtigung bleibt an den bereits vorhandenen,
+// gehashten Fingerabdruck aus cacheOfflineCredential gebunden (siehe
+// restoreRememberedOfflineSession in App()) — ein Gerät, das nie erfolgreich
+// online angemeldet war, hat gar keinen Fingerabdruck und kommt dadurch so oder so
+// nicht hinein.
+const OFFLINE_REMEMBER_STORAGE_KEY = "baudoc_offline_remember_v1";
+const OFFLINE_REMEMBER_DAYS = 30;
+
+function rememberOfflineSession(email) {
+  writeJsonStorage(OFFLINE_REMEMBER_STORAGE_KEY, {
+    email: email.trim().toLowerCase(),
+    expiresAt: Date.now() + OFFLINE_REMEMBER_DAYS * 24 * 60 * 60 * 1000,
+  });
+}
+
+function forgetOfflineSession() {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.removeItem(OFFLINE_REMEMBER_STORAGE_KEY);
+  } catch (err) {
+    console.error(`Konnte "${OFFLINE_REMEMBER_STORAGE_KEY}" nicht aus localStorage entfernen:`, err);
+  }
+}
+
+// Liefert die E-Mail-Adresse einer noch gültigen, erinnerten Offline-Anmeldung
+// zurück — aber NUR, wenn zusätzlich weiterhin ein passender Zugangsdaten-
+// Fingerabdruck derselben Adresse in OFFLINE_AUTH_CACHE_KEY vorliegt (siehe
+// Erläuterung oben). Beide Bedingungen müssen erfüllt sein, sonst null.
+function getRememberedOfflineEmail() {
+  const remembered = readJsonStorage(OFFLINE_REMEMBER_STORAGE_KEY, null);
+  if (!remembered?.email || !remembered?.expiresAt) return null;
+  if (Date.now() > remembered.expiresAt) return null;
+  const cached = readJsonStorage(OFFLINE_AUTH_CACHE_KEY, null);
+  if (!cached || cached.email !== remembered.email) return null;
+  return remembered.email;
 }
 
 // Unterscheidet eine echte Verbindungsstörung (→ Offline-Fallback erlaubt) von einer
@@ -4046,6 +4102,7 @@ function LoginScreen({ onLogin, onRegister }) {
             <FieldLabel>E-Mail</FieldLabel>
             <input
               type="email"
+              name="username"
               autoComplete="username"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
@@ -4059,6 +4116,7 @@ function LoginScreen({ onLogin, onRegister }) {
             <div className="relative">
               <input
                 type={showPassword ? "text" : "password"}
+                name="password"
                 autoComplete={mode === "login" ? "current-password" : "new-password"}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -5501,14 +5559,34 @@ function ProjectCoverImage({ project, heroFloor, heroKind, pinPhotoUrl }) {
   );
 }
 
-function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, query, setQuery, onCreateProject, onEditProject, onDeleteProject }) {
+function ProjectOverview({
+  projects,
+  loading,
+  onOpenProject,
+  onToggleFavorite,
+  onArchiveProject,
+  query,
+  setQuery,
+  onCreateProject,
+  onEditProject,
+  onDeleteProject,
+}) {
   const [viewMode, setViewMode] = useState("grid"); // 'grid' | 'list'
   const [filterTab, setFilterTab] = useState("all"); // 'all' | 'favorites'
+  const [archiveView, setArchiveView] = useState("active"); // 'active' | 'archive'
   const [sortBy, setSortBy] = useState("default"); // 'default' | 'urgency' | 'name'
 
-  const favoriteCount = projects.filter((p) => p.is_favorite).length;
+  // Erste, grobe Weiche: aktive vs. archivierte/abgeschlossene Projekte (siehe
+  // "Projekt abschließen"/"Projekt wiederherstellen" in FloorOverview sowie
+  // handleToggleProjectArchive). Auf dem Standard-Bildschirm "Aktive Projekte"
+  // bleiben abgeschlossene Projekte konsequent ausgeblendet, damit die Übersicht
+  // nicht mit erledigten Baustellen zuwächst; im Archiv sieht man ausschließlich sie.
+  const archivedCount = projects.filter((p) => p.is_archived).length;
+  const scopedByArchive = projects.filter((p) => (archiveView === "archive" ? p.is_archived : !p.is_archived));
 
-  const searched = projects.filter(
+  const favoriteCount = scopedByArchive.filter((p) => p.is_favorite).length;
+
+  const searched = scopedByArchive.filter(
     (p) =>
       p.name.toLowerCase().includes(query.toLowerCase()) ||
       p.address.toLowerCase().includes(query.toLowerCase())
@@ -5526,6 +5604,8 @@ function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, q
   const emptyMessage =
     projects.length === 0
       ? "Noch keine Projekte vorhanden."
+      : archiveView === "archive" && archivedCount === 0
+      ? "Noch keine Projekte im Archiv — abgeschlossene Projekte landen hier automatisch."
       : filterTab === "favorites" && favoriteCount === 0
       ? "Noch keine Favoriten markiert — auf den Stern eines Projekts tippen, um es hier anzupinnen."
       : `Kein Projekt gefunden für „${query}“.`;
@@ -5558,6 +5638,38 @@ function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, q
           placeholder="Projekt nach Name oder Adresse suchen…"
           className="w-full rounded-xl border border-slate-200 bg-white py-3 pl-11 pr-4 text-sm text-slate-800 shadow-sm outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4"
         />
+      </div>
+
+      {/* Archiv-Filter: grobe Weiche zwischen aktiven und abgeschlossenen/archivierten
+          Projekten, bewusst als eigene Leiste oberhalb der übrigen Steuerung — die
+          Alle/Favoriten-Tabs darunter verfeinern jeweils nur innerhalb dieser Auswahl. */}
+      <div className="mb-3 inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-sm">
+        <button
+          onClick={() => setArchiveView("active")}
+          className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+            archiveView === "active" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+          }`}
+        >
+          Aktive Projekte
+        </button>
+        <button
+          onClick={() => setArchiveView("archive")}
+          className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+            archiveView === "archive" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+          }`}
+        >
+          <Archive size={12} />
+          Archiv
+          {archivedCount > 0 && (
+            <span
+              className={`inline-flex min-w-[1.1rem] items-center justify-center rounded-full px-1 text-[10px] font-bold ${
+                archiveView === "archive" ? "bg-white/25 text-white" : "bg-slate-200 text-slate-600"
+              }`}
+            >
+              {archivedCount}
+            </span>
+          )}
+        </button>
       </div>
 
       {/* Steuerungsleiste: Filter-Tabs links, Sortierung + Ansichts-Toggle rechts. */}
@@ -5671,15 +5783,32 @@ function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, q
                       <ProjectStatusBadge status={project.status} />
                     </td>
                     <td className="px-3 py-2.5 text-right">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onOpenProject(project.id);
-                        }}
-                        className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-[#FF2A00] hover:text-white"
-                      >
-                        Öffnen <ChevronRight size={12} />
-                      </button>
+                      <div className="inline-flex items-center gap-1.5">
+                        {/* Schnelle Reaktivierung direkt aus der Archiv-Liste heraus, ohne
+                            das Projekt erst öffnen zu müssen (siehe Anforderung "mit einem
+                            Klick sofort wieder reaktivieren"). */}
+                        {project.is_archived && onArchiveProject && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onArchiveProject(project);
+                            }}
+                            title="Projekt wiederherstellen"
+                            className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-100"
+                          >
+                            <ArchiveRestore size={12} /> Wiederherstellen
+                          </button>
+                        )}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenProject(project.id);
+                          }}
+                          className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-[#FF2A00] hover:text-white"
+                        >
+                          Öffnen <ChevronRight size={12} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -5751,7 +5880,21 @@ function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, q
                     </div>
                   </div>
                 </button>
-                <div className="flex items-center gap-2 border-t border-slate-100 px-4 py-2.5">
+                <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 px-4 py-2.5">
+                  {/* Schnelle Reaktivierung direkt auf der Kachel im Archiv-Filter, ohne das
+                      Projekt erst öffnen zu müssen (siehe Anforderung "mit einem Klick sofort
+                      wieder reaktivieren"). */}
+                  {project.is_archived && onArchiveProject && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onArchiveProject(project);
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-100"
+                    >
+                      <ArchiveRestore size={13} /> Wiederherstellen
+                    </button>
+                  )}
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -6383,6 +6526,7 @@ function FloorOverview({
   onOpenAddFloor,
   onEditProject,
   onDeleteProject,
+  onArchiveProject,
   onEditFloor,
   onDeleteFloor,
   onExportPdf,
@@ -6447,6 +6591,35 @@ function FloorOverview({
             >
               <Trash2 size={15} /> Löschen
             </button>
+            {/* Reversibler Abschluss-Status (siehe handleToggleProjectArchive): schaltet
+                zwischen "aktiv" und "abgeschlossen/archiviert" um, ohne dass das Projekt
+                dabei je gelöscht wird — daher bewusst zwischen "Löschen" und "PDF-Export"
+                platziert und optisch klar von der destruktiven Löschen-Aktion abgesetzt. */}
+            {onArchiveProject && (
+              <button
+                onClick={() => onArchiveProject(project)}
+                title={
+                  project.is_archived
+                    ? "Setzt den Status zurück auf „In Bearbeitung“ und blendet das Projekt wieder bei den aktiven Projekten ein."
+                    : "Setzt den Status auf „Abgeschlossen“ und verschiebt das Projekt ins Archiv — jederzeit wieder herstellbar."
+                }
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-semibold shadow-sm transition ${
+                  project.is_archived
+                    ? "border-emerald-200 bg-white text-emerald-600 hover:bg-emerald-50"
+                    : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                {project.is_archived ? (
+                  <>
+                    <ArchiveRestore size={15} /> Projekt wiederherstellen
+                  </>
+                ) : (
+                  <>
+                    <Archive size={15} /> Projekt abschließen
+                  </>
+                )}
+              </button>
+            )}
             {onExportPdf && (
               <button
                 onClick={() => onExportPdf(project)}
@@ -9239,6 +9412,22 @@ function App() {
     }
   }, [session]);
 
+  // "Angemeldet bleiben" für den Offline-Anmeldepfad (siehe rememberOfflineSession/
+  // getRememberedOfflineEmail oben): erst NACHDEM der erste Supabase-Session-Check
+  // abgeschlossen ist (authLoading === false), sonst würde diese Prüfung kurzzeitig
+  // fälschlich "offline" anzeigen, obwohl gleich darauf noch eine echte Online-
+  // Session eintrifft. Greift nur, wenn keine echte Session vorliegt — eine
+  // vorhandene Online-Session hat immer Vorrang und setzt authSource bereits oben
+  // auf "online".
+  useEffect(() => {
+    if (authLoading || session) return;
+    const rememberedEmail = getRememberedOfflineEmail();
+    if (rememberedEmail) {
+      setIsAuthenticated(true);
+      setAuthSource("offline");
+    }
+  }, [authLoading, session]);
+
   // Zentraler Guard für alle Schreibaktionen: Gäste (kein session) bekommen statt der
   // Aktion das Login-Modal angezeigt (Klick auf "Neues Projekt", "Bearbeiten",
   // "Löschen", Pin setzen/verschieben, Etage hinzufügen, …). Bewusst weiterhin an
@@ -9298,6 +9487,10 @@ function App() {
     if (offlineOk) {
       setIsAuthenticated(true);
       setAuthSource("offline");
+      // "Angemeldet bleiben" auf diesem Gerät (siehe rememberOfflineSession) — beim
+      // nächsten Kaltstart ohne Netz muss das Passwort dadurch nicht erneut
+      // eingegeben werden, siehe restoreRememberedOfflineSession weiter unten.
+      rememberOfflineSession(email);
       return;
     }
     throw new Error(
@@ -9315,6 +9508,12 @@ function App() {
     if (session) await handleSignOut();
     setIsAuthenticated(false);
     setAuthSource(null);
+    // Löscht auch die "Angemeldet bleiben"-Markierung des Offline-Anmeldepfads
+    // (siehe rememberOfflineSession/getRememberedOfflineEmail weiter oben) — ohne
+    // diesen Aufruf würde ein Nutzer, der offline angemeldet war, nach dem Klick auf
+    // "Abmelden" beim nächsten App-Start ohne Netzverbindung sofort wieder automatisch
+    // eingeloggt, obwohl er sich aktiv ausgeloggt hat.
+    forgetOfflineSession();
   };
 
   // -------------------------------------------------------------------------------
@@ -9910,6 +10109,35 @@ function App() {
       console.error("Favoriten-Status konnte nicht gespeichert werden:", err);
       setProjects((prev) => prev.map((p) => (p.id === project.id ? { ...p, is_favorite: !nextValue } : p)));
       setGlobalError("Favoriten-Status konnte nicht gespeichert werden. Bitte erneut versuchen.");
+    }
+  };
+
+  // Projekt abschließen/wiederherstellen (siehe "Projekt abschließen"-Button in
+  // FloorOverview und die Schnell-Reaktivierung direkt auf der Kachel im Archiv-Filter
+  // von ProjectOverview) — beide Oberflächen rufen denselben Handler, damit Status und
+  // is_archived nie auseinanderlaufen können. Reines Umschalten anhand des aktuellen
+  // project.is_archived: aktiv -> Abgeschlossen/archiviert, archiviert -> wieder
+  // "In Bearbeitung"/aktiv. Optimistisches Update mit Rollback wie beim Favoriten-Stern.
+  const handleToggleProjectArchive = async (project) => {
+    if (!requireAuth()) return;
+    const nextArchived = !project.is_archived;
+    const nextStatus = nextArchived ? "Abgeschlossen" : "In Bearbeitung";
+    const prevStatus = project.status;
+    setProjects((prev) =>
+      prev.map((p) => (p.id === project.id ? { ...p, is_archived: nextArchived, status: nextStatus } : p))
+    );
+    try {
+      await updateProject(project.id, { is_archived: nextArchived, status: nextStatus });
+    } catch (err) {
+      console.error("Archiv-Status konnte nicht gespeichert werden:", err);
+      setProjects((prev) =>
+        prev.map((p) => (p.id === project.id ? { ...p, is_archived: !nextArchived, status: prevStatus } : p))
+      );
+      setGlobalError(
+        nextArchived
+          ? "Projekt konnte nicht abgeschlossen werden. Bitte erneut versuchen."
+          : "Projekt konnte nicht wiederhergestellt werden. Bitte erneut versuchen."
+      );
     }
   };
 
@@ -10905,6 +11133,7 @@ function App() {
           onCreateProject={openCreateProject}
           onEditProject={openEditProject}
           onDeleteProject={handleDeleteProjectClick}
+          onArchiveProject={handleToggleProjectArchive}
         />
       )}
 
@@ -10919,6 +11148,7 @@ function App() {
           onOpenAddFloor={openFloorModal}
           onEditProject={openEditProject}
           onDeleteProject={handleDeleteProjectClick}
+          onArchiveProject={handleToggleProjectArchive}
           onEditFloor={openEditFloorModal}
           onDeleteFloor={handleDeleteFloorClick}
           onExportPdf={openPdfExportModal}
