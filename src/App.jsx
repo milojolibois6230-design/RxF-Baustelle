@@ -117,6 +117,43 @@ function formatDateShort(iso) {
   return d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "2-digit" });
 }
 
+// Google-Maps-Weiterleitung für die Adresse/den Standort eines Projekts. Eine einzige,
+// zentrale Stelle statt vier separat gebauter URLs (Projektformular, Listen-/Kachel-
+// ansicht, Projektdetail-Kopf) — verhindert, dass die vier Stellen bei einer künftigen
+// Änderung (z.B. Wechsel auf Apple Maps auf iOS) auseinanderlaufen. api=1 mit query
+// (statt der älteren /maps?q=-Form) ist der von Google dokumentierte, stabile Weg für
+// einen reinen Adress-Suchlink ohne eigenen API-Key; funktioniert unverändert als
+// Web-Link (neuer Tab) wie auch als Deep-Link, den mobile Browser/Betriebssysteme
+// automatisch an eine installierte Maps-App weiterreichen.
+function buildGoogleMapsUrl(address) {
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
+}
+
+// Klickbarer Adress-Text, der in einem neuen Tab (bzw. auf Mobilgeräten direkt in der
+// Maps-App) zur Google-Maps-Suche nach dieser Adresse führt. Rendert nichts, wenn keine
+// Adresse hinterlegt ist (project.address ist ein optionales Freitextfeld). stopPropagation
+// ist nötig, weil dieser Link an mehreren Stellen innerhalb eines übergeordneten,
+// ebenfalls klickbaren Zeilen-/Kartenelements sitzt (z.B. die Tabellenzeile in der
+// Listenansicht öffnet bei Klick das Projekt) — ein Klick auf die Adresse soll
+// ausschließlich Maps öffnen, nicht zusätzlich das Projekt.
+function AddressMapsLink({ address, className, iconSize = 12, children }) {
+  const trimmed = (address || "").trim();
+  if (!trimmed) return null;
+  return (
+    <a
+      href={buildGoogleMapsUrl(trimmed)}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(e) => e.stopPropagation()}
+      title="In Google Maps öffnen"
+      className={className || "inline-flex items-center gap-1 text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"}
+    >
+      <MapPin size={iconSize} className="shrink-0" />
+      {children || trimmed}
+    </a>
+  );
+}
+
 // ----------------------------------------------------------------------------------
 // GETEILTE STYLING-KONSTANTEN
 // ----------------------------------------------------------------------------------
@@ -5638,6 +5675,16 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
                 placeholder="Straße, PLZ, Ort"
                 className={TEXT_INPUT_CLASS}
               />
+              {/* Nutzt bewusst den LIVE-State "address", nicht project?.address — der Link
+                  soll sofort auch eine gerade erst eingetippte, noch nicht gespeicherte
+                  Adresse abbilden, statt erst nach dem Speichern zu erscheinen. */}
+              <AddressMapsLink
+                address={address}
+                iconSize={13}
+                className="mt-1.5 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"
+              >
+                In Google Maps öffnen
+              </AddressMapsLink>
             </div>
             <div className="sm:col-span-2">
               <FieldLabel>Projekt-Titelbild / Gebäudeansicht</FieldLabel>
@@ -6193,7 +6240,13 @@ function ProjectOverview({
                       <FavoriteStarButton active={!!project.is_favorite} onToggle={() => onToggleFavorite(project)} />
                     </td>
                     <td className="px-3 py-2.5 font-semibold text-slate-900">{project.name}</td>
-                    <td className="max-w-[220px] truncate px-3 py-2.5 text-slate-500">{project.address}</td>
+                    <td className="max-w-[220px] truncate px-3 py-2.5 text-slate-500">
+                      <AddressMapsLink
+                        address={project.address}
+                        iconSize={12}
+                        className="inline-flex max-w-full items-center gap-1 truncate align-bottom text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"
+                      />
+                    </td>
                     <td className="px-3 py-2.5 text-center">
                       {open > 0 ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-xs font-bold text-[#FF2A00]">
@@ -6323,6 +6376,20 @@ function ProjectOverview({
                       <ArchiveRestore size={13} /> Wiederherstellen
                     </button>
                   )}
+                  {/* project.address ist ein optionales Freitextfeld — AddressMapsLink
+                      rendert bei leerer Adresse selbst nichts, kein zusätzliches Guard
+                      hier nötig. Liegt bewusst als eigenständiger Link in dieser bereits
+                      stopPropagation-gesicherten Aktionsleiste UNTER dem Karten-Button
+                      (statt als Link direkt in project.address oben in der Kachel): ein
+                      <a> innerhalb des umschließenden <button onClick={() => onOpenProject(...)}>
+                      wäre ungültig verschachteltes interaktives HTML (a in button). */}
+                  <AddressMapsLink
+                    address={project.address}
+                    iconSize={13}
+                    className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-[#FF2A00]"
+                  >
+                    Route
+                  </AddressMapsLink>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -6986,7 +7053,11 @@ function FloorOverview({
               </span>
             )}
           </div>
-          <p className="text-sm text-slate-500">{project.address}</p>
+          <AddressMapsLink
+            address={project.address}
+            iconSize={14}
+            className="inline-flex items-center gap-1.5 text-sm text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"
+          />
           {project.project_leader && (
             <p className="mt-1 flex items-center gap-1.5 text-xs text-slate-500">
               <Briefcase size={13} className="text-slate-400" /> Projektleitung: {project.project_leader}
