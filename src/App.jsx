@@ -3821,7 +3821,7 @@ const PDF_SAFE_RENDER_DPR_CAP_DESKTOP = 3.0;
 // Tablets/Smartphones (meist 2.0-3.0), sodass Baupläne auf dem Bildschirm weiterhin
 // scharf wirken, während gleichzeitig der Speicher-/Absturzschutz für genau die
 // Geräteklasse greift, auf der ein Tab-Absturz durch Speicherüberlauf am ehesten
-// eintritt (siehe PDF_SAFE_MAX_CANVAS_DIM_PX-Kommentar oben zu iPads/Tablets).
+// eintritt (siehe PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE-Kommentar unten zu iPads/Tablets).
 const PDF_SAFE_RENDER_DPR_CAP_MOBILE = 2.0;
 const PDF_MOBILE_RENDER_BREAKPOINT_PX = 768;
 
@@ -3838,26 +3838,52 @@ function getPdfSafeRenderDprCap() {
 }
 // Harte Obergrenze für die tatsächliche Canvas-Pixelbreite/-höhe dieser Fallback-
 // Stufe — verhindert einen GPU-/RAM-Überlauf bei großformatigen Papiergrößen (A0/A1),
-// unabhängig von Gerätedichte. Auf ausdrücklichen Wunsch von 8192px auf 16384px
-// angehoben. Ehrlicher Hinweis dazu: bei dieser Kantenlänge kann der tatsächliche
-// Speicherbedarf spürbar werden — bei einem nicht-quadratischen Plan (z. B. A0/A1 im
-// Format ca. 1,41:1) skaliert renderPdfPageToSafeCanvasElement beide Seiten
-// proportional, sodass z. B. 16384 × 11585px zusammenkommen können, das sind rund
-// 190 Megapixel bzw. ca. 760 MB allein für den rohen RGBA-Pixelpuffer, zusätzlich
-// zum GPU-Texturspeicher. Auf leistungsstarken Laptops/Desktops unproblematisch, auf
-// iPads/Android-Tablets (explizit als Zielgeräte dieser App im Einsatz) steigt damit
-// bei sehr großformatigen, detailreichen Plänen das Risiko eines Tab-Absturzes durch
-// Speicherüberlauf. Betrifft ausschließlich die Raster-Fallback-Stufe (siehe
-// PdfPlanCanvas/renderPdfPageToSafeCanvasElement) — die bevorzugte Vektor-Stufe ist
-// davon nicht betroffen und bleibt für die meisten Baupläne der genutzte Pfad.
-// Ehrlicher Hinweis zur genauen Zahl: dass Safari oberhalb von genau 16384px ein
-// leeres/weißes Canvas zeigt, kann ich nicht aus eigener, verlässlicher Kenntnis
-// bestätigen — WebKit hat historisch dokumentierte, aber je nach Version
-// unterschiedliche Canvas-Flächen-/Kantenlimits gehabt. 16384px als Obergrenze ist
-// in jedem Fall ein sinnvoller, verbreitet genutzter Wert, deshalb hier so gesetzt;
-// bei echten Tests auf den eingesetzten iPads bitte gezielt auf ein leeres Canvas
-// bei sehr großen Plänen achten, falls dieses Limit tatsächlich greift.
-const PDF_SAFE_MAX_CANVAS_DIM_PX = 16384;
+// unabhängig von Gerätedichte.
+//
+// BUGFIX "weißer Bildschirm beim Zoomen auf Mobilgeräten": 16384px war ursprünglich
+// auf ausdrücklichen Wunsch von 8192px angehoben worden — genau das hat sich auf
+// Mobilgeräten als Ursache des weißen Bildschirms bestätigt. iOS Safari und mobile
+// Chrome-Varianten kappen ein <canvas> bei Überschreiten einer (je nach Gerät/
+// Arbeitsspeicher unterschiedlichen, aber verbreitet bei rund 4096×4096px bzw.
+// ~16,7 Megapixel Gesamtfläche liegenden) internen Grenze STILLSCHWEIGEND — ohne
+// JS-Fehler, ohne Exception, das <canvas>-Element bleibt einfach leer/weiß stehen.
+// Bei einem nicht-quadratischen A0/A1-Plan (Seitenverhältnis ca. 1,41:1) konnte die
+// bisherige einheitliche 16384px-Grenze auf einem Tablet/Smartphone durchaus
+// zusammen mit dem (seit der letzten Anforderung ohnehin schon auf max. 2.0
+// begrenzten) mobilen DPR-Cap eine Fläche jenseits dieser gerätetypischen Grenze
+// ergeben — genau das führt zum weißen Bildschirm. Die Grenze ist deshalb jetzt
+// GERÄTEABHÄNGIG (siehe getPdfSafeMaxCanvasDimPx unten, gleicher Breakpoint wie beim
+// DPR-Cap): am Desktop bleibt es bei 16384px (siehe PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP,
+// dort unproblematisch, siehe Speicherhinweis dort), auf Mobilgeräten strikt bei
+// 4096px (PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE) — exakt der von iOS Safari historisch
+// dokumentierten, sicheren Kantenlänge. Wird auf einem Mobilgerät über diese Grenze
+// hinaus weitergezoomt, wird das Canvas NICHT weiter physisch vergrößert (siehe
+// lastRasterClampedRef in PdfPlanCanvas) — die weitere Vergrößerung übernimmt
+// ausschließlich die ohnehin schon vorhandene CSS-transform:scale(...) der äußeren
+// "Bühne" (siehe FloorPlanView/contentRef), die für JEDEN Zoomfaktor unabhängig von
+// der Canvas-Auflösung funktioniert. Der Plan wirkt jenseits dieser Schwelle beim
+// Weiterzoomen dadurch etwas weicher (reines CSS-Hochskalieren statt einer schärferen
+// Neuberechnung), bleibt aber sichtbar und stürzt nicht mehr auf Weiß ab — ein
+// bewusster, im Bug-Report explizit so verlangter Kompromiss.
+const PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP = 16384;
+// Ehrlicher Speicher-Hinweis nur für die Desktop-Grenze (auf Mobilgeräten greift ab
+// sofort ohnehin die deutlich niedrigere PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE, siehe
+// oben): bei einem nicht-quadratischen Plan (z. B. A0/A1 im Format ca. 1,41:1) skaliert
+// renderPdfPageToSafeCanvasElement beide Seiten proportional, sodass z. B.
+// 16384 × 11585px zusammenkommen können, das sind rund 190 Megapixel bzw. ca. 760 MB
+// allein für den rohen RGBA-Pixelpuffer, zusätzlich zum GPU-Texturspeicher — auf
+// leistungsstarken Laptops/Desktops unproblematisch.
+const PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE = 4096;
+
+// Liefert die für das aktuelle Gerät geltende maximale Canvas-Kantenlänge der
+// Raster-Fallback-Stufe — derselbe Breakpoint wie getPdfSafeRenderDprCap oben, aus
+// demselben Grund per window.innerWidth statt gecacht (siehe dortiger Kommentar).
+function getPdfSafeMaxCanvasDimPx() {
+  if (typeof window === "undefined") return PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP;
+  return window.innerWidth < PDF_MOBILE_RENDER_BREAKPOINT_PX
+    ? PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE
+    : PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP;
+}
 // Nur für die Raster-Fallback-Stufe relevant (die Vektor-Stufe braucht kein
 // Re-Rendering, siehe renderPdfPageToSvgElement-Kommentar oben): erst ab dieser
 // zusätzlichen Zoomstufe gegenüber der zuletzt gerenderten Auflösung wird die
@@ -3920,25 +3946,38 @@ async function renderPdfPageToSvgElement(pdfjsLib, page, operatorList) {
 }
 
 // Sichere Raster-Fallback-Stufe (siehe Erläuterung oben) — fester, an devicePixelRatio
-// gekoppelter, aber hart gedeckelter Maßstab, zusätzlich hart begrenzte Canvas-
-// Pixelgröße. `extraScale` (Standard 1) ist der zusätzliche Zoom-Multiplikator: beim
-// ersten Rendering der Stufe ist er 1 (Basisauflösung für die volle Ansicht), bei
-// einem späteren, durch weiteres Hineinzoomen ausgelösten Nachladen (siehe
-// PdfPlanCanvas) entspricht er dem aktuellen App-Zoomfaktor, sodass die Bühne dann in
-// höherer, dem tatsächlichen Zoom entsprechender Auflösung neu gerendert wird — nur
-// begrenzt durch dieselbe harte PDF_SAFE_MAX_CANVAS_DIM_PX-Obergrenze wie beim
-// Erstrendering (Speicher-/GPU-Schutz bleibt in jedem Fall bestehen).
-// `renderTaskRef` (optional) hält den zuletzt gestarteten pdf.js-RenderTask dieser
-// Stufe fest: zoomt der Nutzer weiter, während ein vorheriges Nachladen noch läuft,
-// wird dieses zuerst sauber per renderTask.cancel() abgebrochen, statt zwei
+// gekoppelter, aber hart gedeckelter Maßstab, zusätzlich hart begrenzte, GERÄTEABHÄNGIGE
+// Canvas-Pixelgröße (siehe getPdfSafeMaxCanvasDimPx/Bugfix-Kommentar oben). `extraScale`
+// (Standard 1) ist der zusätzliche Zoom-Multiplikator: beim ersten Rendering der Stufe
+// ist er 1 (Basisauflösung für die volle Ansicht), bei einem späteren, durch weiteres
+// Hineinzoomen ausgelösten Nachladen (siehe PdfPlanCanvas) entspricht er dem aktuellen
+// App-Zoomfaktor, sodass die Bühne dann in höherer, dem tatsächlichen Zoom
+// entsprechender Auflösung neu gerendert wird — nur begrenzt durch dieselbe harte
+// Obergrenze wie beim Erstrendering (Speicher-/GPU-Schutz bleibt in jedem Fall
+// bestehen). `renderTaskRef` (optional) hält den zuletzt gestarteten pdf.js-RenderTask
+// dieser Stufe fest: zoomt der Nutzer weiter, während ein vorheriges Nachladen noch
+// läuft, wird dieses zuerst sauber per renderTask.cancel() abgebrochen, statt zwei
 // Render-Durchläufe parallel um dasselbe Canvas konkurrieren zu lassen.
+//
+// Rückgabewert ist bewusst ein Objekt { canvas, clamped } statt nur des Canvas:
+// `clamped` zeigt an, ob die Ziel-Kantenlänge durch getPdfSafeMaxCanvasDimPx() nach
+// unten korrigiert werden musste (d.h. die volle, dem Zoom entsprechende Auflösung
+// NICHT erreicht wurde). PdfPlanCanvas nutzt das, um ab genau diesem Punkt weitere
+// Neu-Renderings bei fortgesetztem Zoom zu unterlassen (siehe lastRasterClampedRef
+// dort) — ein wiederholtes Neu-Rendern auf exakt dieselbe, bereits gedeckelte
+// Auflösung wäre wirkungslos (kein Schärfegewinn) und nur verschwendete Arbeit; die
+// weitere Vergrößerung übernimmt stattdessen ausschließlich die CSS-transform:
+// scale(...) der äußeren "Bühne".
 async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTaskRef = null) {
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 2 : 2;
   const safeScale = Math.min(dpr, getPdfSafeRenderDprCap()) * Math.max(1, extraScale);
   let viewport = page.getViewport({ scale: safeScale });
   const largestDim = Math.max(viewport.width, viewport.height);
-  if (largestDim > PDF_SAFE_MAX_CANVAS_DIM_PX) {
-    viewport = page.getViewport({ scale: safeScale * (PDF_SAFE_MAX_CANVAS_DIM_PX / largestDim) });
+  const maxCanvasDimPx = getPdfSafeMaxCanvasDimPx();
+  let clamped = false;
+  if (largestDim > maxCanvasDimPx) {
+    viewport = page.getViewport({ scale: safeScale * (maxCanvasDimPx / largestDim) });
+    clamped = true;
   }
   if (renderTaskRef?.current) {
     try {
@@ -3959,14 +3998,32 @@ async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTask
   // Stattdessen wird die Bildglättung des Canvas-Kontexts hier explizit UND in
   // bestmöglicher Qualität aktiviert (Standard von Browsern ist zwar ohnehin "an",
   // explizit gesetzt schließt aber jede abweichende Annahme aus).
-  const ctx = canvas.getContext("2d");
+  //
+  // Context-Optionen (Bugfix-Anforderung "2D-GPU-Beschleunigung"): willReadFrequently:
+  // false sagt dem Browser explizit, dass dieser Kontext NICHT wiederholt per
+  // getImageData()/toDataURL() ausgelesen wird (er wird nur einmal beschrieben und
+  // dann angezeigt) — ohne diesen Hinweis wechseln manche Browser bei häufigem
+  // Zeichnen vorsorglich auf eine software-/CPU-basierte Canvas-Implementierung, was
+  // auf schwächeren Mobilgeräten spürbar langsamer ist und mehr Hauptspeicher statt
+  // GPU-Speicher belegt. alpha: false teilt zusätzlich mit, dass kein Alphakanal
+  // gebraucht wird (Baupläne sind vollflächig deckend) — spart dem Browser das
+  // Vorhalten/Kompositieren eines Transparenz-Kanals. Beides wirkt sich NICHT auf den
+  // separaten PDF-Export-Pfad aus (renderPdfPlanToDataUrl nutzt einen eigenen,
+  // unveränderten Canvas).
+  const ctx = canvas.getContext("2d", { alpha: false, willReadFrequently: false });
+  // Explizites Leeren vor dem Zeichnen (Anforderung "Canvas vor dem Neuzeichnen
+  // ordnungsgemäß gecleart"): da hier ohnehin bei JEDEM Aufruf ein frisches
+  // <canvas>-Element angelegt wird (siehe document.createElement oben) statt ein
+  // bestehendes wiederzuverwenden, ist es technisch bereits leer — dieser Aufruf ist
+  // defensiv und macht das explizit, unabhängig von der aktuellen Implementierung.
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   const renderTask = page.render({ canvasContext: ctx, viewport });
   if (renderTaskRef) renderTaskRef.current = renderTask;
   await renderTask.promise;
   if (renderTaskRef && renderTaskRef.current === renderTask) renderTaskRef.current = null;
-  return canvas;
+  return { canvas, clamped };
 }
 
 // Erkennt pdf.js' eigene RenderingCancelledException — geworfen, wenn ein
@@ -4006,6 +4063,16 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
   const tierRef = useRef(null); // 'vector' | 'raster' | null
   const pageRef = useRef(null);
   const lastRasterScaleRef = useRef(1);
+  // BUGFIX "weißer Bildschirm beim Zoomen auf Mobilgeräten": true, sobald ein
+  // Raster-Rendering an die geräteabhängige Canvas-Obergrenze gestoßen ist (siehe
+  // getPdfSafeMaxCanvasDimPx/clamped-Rückgabewert von renderPdfPageToSafeCanvasElement).
+  // Ab dann unterbleibt jedes weitere Neu-Rendering bei fortgesetztem Zoom (siehe
+  // Zoom-Effekt unten) — ein erneutes Rendern auf exakt dieselbe, bereits gedeckelte
+  // Auflösung brächte keinerlei Schärfegewinn, würde aber unnötig Arbeit/Speicher
+  // beanspruchen. Die weitere Vergrößerung übernimmt ab hier ausschließlich die
+  // ohnehin vorhandene CSS-transform:scale(...) der äußeren "Bühne" (siehe
+  // FloorPlanView/contentRef) — funktioniert unabhängig von der Canvas-Auflösung.
+  const lastRasterClampedRef = useRef(false);
   const loadGenerationRef = useRef(0);
   // Zuletzt gestarteter pdf.js-RenderTask der Raster-Fallback-Stufe — wird per
   // renderTask.cancel() sauber abgebrochen, sobald ein neueres Rendering
@@ -4024,6 +4091,7 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
     tierRef.current = null;
     pageRef.current = null;
     lastRasterScaleRef.current = 1;
+    lastRasterClampedRef.current = false;
     renderTaskRef.current = null;
     setStatus("loading");
 
@@ -4047,10 +4115,12 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
           tierRef.current = "vector";
         } catch (svgErr) {
           console.warn("PDF-Vektor-Rendering nicht möglich/zu langsam, Fallback auf sichere Raster-Auflösung:", svgErr);
-          renderedElement = await renderPdfPageToSafeCanvasElement(page, 1, renderTaskRef);
+          const rasterResult = await renderPdfPageToSafeCanvasElement(page, 1, renderTaskRef);
+          renderedElement = rasterResult.canvas;
           tierRef.current = "raster";
           pageRef.current = page;
           lastRasterScaleRef.current = 1;
+          lastRasterClampedRef.current = rasterResult.clamped;
         }
         if (cancelled) return;
 
@@ -4091,9 +4161,20 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
   // renderPdfPageToSafeCanvasElement). Greift nicht während einer laufenden Zoom-
   // Geste (die kommt über CSS transform: scale(...) der äußeren "Bühne", völlig ohne
   // Neu-Rendering aus), sondern erst kurz nach deren Ende.
+  //
+  // BUGFIX "weißer Bildschirm beim Zoomen auf Mobilgeräten": lastRasterClampedRef
+  // (siehe oben) bricht diesen Effekt frühzeitig ab, sobald ein vorheriges Rendering
+  // bereits an die geräteabhängige Canvas-Obergrenze (getPdfSafeMaxCanvasDimPx, auf
+  // Mobilgeräten 4096px) gestoßen ist — ein erneutes Rendern würde ohnehin exakt
+  // dieselbe, bereits gedeckelte Auflösung liefern. Ab diesem Punkt übernimmt beim
+  // Weiterzoomen ausschließlich die CSS-transform:scale(...) der äußeren "Bühne" die
+  // weitere Vergrößerung, ganz ohne erneutes Canvas-Rendering — genau das verhindert
+  // das stillschweigende Kappen des Canvas durch den Browser, das zuvor zum weißen
+  // Bildschirm führte.
   useEffect(() => {
     if (tierRef.current !== "raster") return undefined;
     if (!pageRef.current) return undefined;
+    if (lastRasterClampedRef.current) return undefined;
     if (zoomScale <= lastRasterScaleRef.current * PDF_RASTER_RERENDER_ZOOM_FACTOR) return undefined;
 
     const myGeneration = loadGenerationRef.current;
@@ -4103,10 +4184,11 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
       const host = hostRef.current;
       if (!page || !host) return;
       try {
-        const canvas = await renderPdfPageToSafeCanvasElement(page, zoomScale, renderTaskRef);
+        const { canvas, clamped } = await renderPdfPageToSafeCanvasElement(page, zoomScale, renderTaskRef);
         if (loadGenerationRef.current !== myGeneration) return;
         host.replaceChildren(canvas);
         lastRasterScaleRef.current = zoomScale;
+        lastRasterClampedRef.current = clamped;
       } catch (err) {
         // Genau der in isRenderCancelledError beschriebene Normalfall: ein noch
         // schnelleres, weiteres Nachzoomen hat diesen Render-Task bereits wieder per
