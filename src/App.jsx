@@ -90,6 +90,7 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const FLOOR_PLANS_BUCKET = "floor-plans";
 const PIN_PHOTOS_BUCKET = "pin-photos";
+const PROJECT_COVERS_BUCKET = "project-covers";
 
 // Einheitliche Datum/Uhrzeit-Formatierung — u.a. für die Bearbeitungshistorie
 // (Abschnitt 3) im Pin-Modal und im PDF-Export.
@@ -515,6 +516,21 @@ function getProjectPlaceholderImage(project) {
   return PROJECT_PLACEHOLDER_IMAGES[hashStringToIndex(project?.id, PROJECT_PLACEHOLDER_IMAGES.length)];
 }
 
+// Ermittelt das älteste vorhandene Foto aus den Mängel-Pins eines Projekts (über
+// alle Etagen/Grundrisskizzen/Pins hinweg) — dient als zweite Priorität für das
+// Kachel-Titelbild in ProjectOverview, wenn kein explizites project.cover_image_url
+// gesetzt ist (siehe ProjectCoverImage/ProjectFormModal). "Ältestes Foto" statt
+// "beliebiges erstes" ist deterministisch und stabil: dieselbe Kachel zeigt nicht
+// bei jedem Neuladen ein anderes Foto, nur weil die Server-Reihenfolge variiert.
+function resolveProjectPinPhoto(project) {
+  const photos = (project?.floors || [])
+    .flatMap((f) => f.pins || [])
+    .flatMap((p) => p.pin_photos || [])
+    .filter((ph) => ph?.photo_url);
+  if (photos.length === 0) return null;
+  return [...photos].sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0))[0].photo_url;
+}
+
 // ----------------------------------------------------------------------------------
 // SUPABASE DATA LAYER
 // Alle Netzwerkzugriffe sind hier gebündelt: reine async Funktionen, die entweder
@@ -524,15 +540,22 @@ function getProjectPlaceholderImage(project) {
 // supabase_schema_v2_auth_and_projects.sql.
 // ----------------------------------------------------------------------------------
 
-// Projekte inkl. einer "leichten" Etagen-/Pin-Zusammenfassung (nur id + status) laden.
-// Das reicht aus, um in der Projektübersicht Vorschaubild, Etagenzahl und offene
-// Pins darzustellen, ohne pro Karte einen eigenen Request abzusetzen. priority ist seit
-// dem Dringlichkeits-Indikator/der "Nach Dringlichkeit"-Sortierung in ProjectOverview
-// (siehe countUrgentPins) mit dabei — id/status allein reichten dafür nicht mehr.
+// Projekte inkl. einer "leichten" Etagen-/Pin-Zusammenfassung laden. Das reicht aus,
+// um in der Projektübersicht Vorschaubild, Etagenzahl und offene Pins darzustellen,
+// ohne pro Karte einen eigenen Request abzusetzen. priority ist seit dem
+// Dringlichkeits-Indikator/der "Nach Dringlichkeit"-Sortierung in ProjectOverview
+// (siehe countUrgentPins) mit dabei. pin_photos(photo_url, created_at) ist seit dem
+// automatischen Kachel-Titelbild (siehe resolveProjectPinPhoto) zusätzlich mit
+// dabei — bewusst NUR die URL-Zeichenkette und den Zeitstempel je Foto, nicht die
+// Bilddaten selbst (die liegen ohnehin nur in Supabase Storage, nie in der
+// Datenbank), das hält den Mehrverbrauch dieser ohnehin auf jedem App-Start
+// geladenen Übersichtsabfrage überschaubar. cover_image_url kommt automatisch über
+// das führende "*" auf projects mit, sobald die Spalte existiert (siehe
+// supabase_schema_v12_project_cover_images.sql).
 async function fetchProjectsWithSummary() {
   const { data, error } = await supabase
     .from("projects")
-    .select("*, floors(id, name, image_url, file_type, pins(id, status, priority))")
+    .select("*, floors(id, name, image_url, file_type, pins(id, status, priority, pin_photos(photo_url, created_at)))")
     .order("created_at", { ascending: false });
   if (error) throw error;
   return data ?? [];
@@ -653,6 +676,26 @@ async function uploadFloorPlan(projectId, file) {
 
   const { data: publicUrlData } = supabase.storage.from(FLOOR_PLANS_BUCKET).getPublicUrl(path);
   return { publicUrl: publicUrlData.publicUrl, fileType: info.kind };
+}
+
+// Lädt ein Projekt-Titelbild (Gebäudeansicht für die Kachel in der Projektübersicht,
+// siehe ProjectFormModal/ProjectCoverImage) in den eigenen Bucket "project-covers"
+// hoch — bewusst ein eigener Bucket statt Wiederverwendung von "floor-plans", damit
+// echte Grundrisse und reine Gebäudefotos storage-seitig getrennt bleiben. Nimmt
+// ausschließlich Bildformate an (kein PDF/DWG/DXF wie bei Grundrissen), da es sich
+// um ein Foto, nicht um eine technische Zeichnung handelt.
+async function uploadProjectCoverImage(projectId, file) {
+  if (!file.type.startsWith("image/")) {
+    throw new Error("Bitte nur ein Bildformat (PNG, JPG oder WebP) als Titelbild hochladen.");
+  }
+  const path = `${projectId}/${crypto.randomUUID()}_${sanitizeFileName(file.name)}`;
+  const { error: uploadError } = await supabase.storage
+    .from(PROJECT_COVERS_BUCKET)
+    .upload(path, file, { cacheControl: "3600", upsert: false });
+  if (uploadError) throw uploadError;
+
+  const { data: publicUrlData } = supabase.storage.from(PROJECT_COVERS_BUCKET).getPublicUrl(path);
+  return publicUrlData.publicUrl;
 }
 
 // Ein Geschoss ist ab sofort ein reiner Namens-Container ohne eigenen Grundriss
@@ -4964,6 +5007,17 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
   // die Auswahl bewusst leer — der Hinweistext unten erklärt, was das für den Nutzer
   // bedeutet, statt es stillschweigend so zu belassen.
   const [selectedTrades, setSelectedTrades] = useState(() => resolveProjectTradeIds(project) ?? []);
+  // Projekt-Titelbild (Gebäudeansicht für die Kachel, siehe ProjectCoverImage):
+  // coverImageFile ist die neu ausgewählte, noch nicht hochgeladene Datei (null,
+  // solange nichts Neues gewählt wurde); coverImagePreview ist, was aktuell im
+  // Modal zu sehen ist — entweder das bestehende project.cover_image_url, eine
+  // lokale Objekt-URL der neu gewählten Datei, oder null; coverImageRemoved hält
+  // fest, ob ein vorhandenes Titelbild ausdrücklich entfernt wurde (siehe
+  // handleSubmit — dann wird cover_image_url explizit auf null gesetzt).
+  const [coverImageFile, setCoverImageFile] = useState(null);
+  const [coverImagePreview, setCoverImagePreview] = useState(project?.cover_image_url || null);
+  const [coverImageRemoved, setCoverImageRemoved] = useState(false);
+  const coverImageInputRef = useRef(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
@@ -4979,10 +5033,32 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
     setSiteContactName(project?.site_contact_name || "");
     setSiteContactPhone(project?.site_contact_phone || "");
     setSiteAmenitiesInfo(project?.site_amenities_info || "");
+    setCoverImageFile(null);
+    setCoverImagePreview(project?.cover_image_url || null);
+    setCoverImageRemoved(false);
   }, [project]);
 
   const handleToggleTrade = (tradeId) => {
     setSelectedTrades((prev) => (prev.includes(tradeId) ? prev.filter((id) => id !== tradeId) : [...prev, tradeId]));
+  };
+
+  const handleCoverImagePick = (file) => {
+    if (!file || submitting) return;
+    if (!file.type.startsWith("image/")) {
+      setError("Bitte nur ein Bildformat (PNG, JPG oder WebP) als Titelbild hochladen.");
+      return;
+    }
+    setError("");
+    setCoverImageFile(file);
+    setCoverImagePreview(URL.createObjectURL(file));
+    setCoverImageRemoved(false);
+  };
+
+  const handleCoverImageRemove = () => {
+    if (submitting) return;
+    setCoverImageFile(null);
+    setCoverImagePreview(null);
+    setCoverImageRemoved(true);
   };
 
   const handleSubmit = async () => {
@@ -4993,7 +5069,7 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
     setError("");
     setSubmitting(true);
     try {
-      await onSave({
+      const fields = {
         name: name.trim(),
         project_number: projectNumber.trim(),
         address: address.trim(),
@@ -5005,7 +5081,18 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
         site_contact_name: siteContactName.trim(),
         site_contact_phone: siteContactPhone.trim(),
         site_amenities_info: siteAmenitiesInfo.trim(),
-      });
+      };
+      // _coverImageFile ist kein echtes Projektfeld, sondern ein Marker für den
+      // Aufrufer (App/handleSaveProject): dort wird die Datei erst NACH dem
+      // Anlegen/Speichern des Projekts zu Supabase Storage hochgeladen (beim
+      // Neuanlegen existiert die für den Storage-Pfad benötigte Projekt-ID vorher
+      // noch nicht) und cover_image_url anschließend separat gesetzt.
+      if (coverImageFile) {
+        fields._coverImageFile = coverImageFile;
+      } else if (coverImageRemoved) {
+        fields.cover_image_url = null;
+      }
+      await onSave(fields);
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
       console.error("Projekt konnte nicht gespeichert werden:", err);
@@ -5065,6 +5152,56 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
                 placeholder="Straße, PLZ, Ort"
                 className={TEXT_INPUT_CLASS}
               />
+            </div>
+            <div className="sm:col-span-2">
+              <FieldLabel>Projekt-Titelbild / Gebäudeansicht</FieldLabel>
+              <input
+                ref={coverImageInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                className="hidden"
+                disabled={submitting}
+                onChange={(e) => handleCoverImagePick(e.target.files?.[0])}
+              />
+              {coverImagePreview ? (
+                <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 p-2.5">
+                  <img src={coverImagePreview} alt="Titelbild-Vorschau" className="h-16 w-24 rounded-lg object-cover shadow-sm" />
+                  <div className="flex-1 text-xs text-slate-500">
+                    {coverImageFile ? "Neu ausgewählt — wird beim Speichern hochgeladen." : "Aktuelles Titelbild dieser Kachel."}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => coverImageInputRef.current?.click()}
+                    disabled={submitting}
+                    className="rounded-md px-2 py-1.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    Ändern
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleCoverImageRemove}
+                    disabled={submitting}
+                    className="rounded-md px-2 py-1.5 text-xs font-semibold text-rose-500 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    Entfernen
+                  </button>
+                </div>
+              ) : (
+                <div
+                  onClick={() => !submitting && coverImageInputRef.current?.click()}
+                  className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-center transition hover:border-[#FF2A00] hover:bg-red-50/50 ${
+                    submitting ? "cursor-not-allowed opacity-60" : ""
+                  }`}
+                >
+                  <ImagePlus size={24} className="text-slate-400" />
+                  <p className="mt-1.5 text-xs font-medium text-slate-500">
+                    Optional — eigenes Foto der Fassade/Baustelle für die Kachel in der Projektübersicht
+                  </p>
+                </div>
+              )}
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                Ohne eigenes Titelbild zeigt die Kachel automatisch das erste Mängel-Pin-Foto, sonst ein Platzhalterbild.
+              </p>
             </div>
             <div>
               <FieldLabel>Projekt-Status</FieldLabel>
@@ -5279,15 +5416,36 @@ function UrgentPinsBadge({ count, compact = false }) {
 }
 
 // Bildfläche der Projekt-Kachel (Grid-Ansicht, siehe ProjectOverview): eigenes
-// Grundriss-/Vorschaubild, falls vorhanden (heroFloor, unverändert gegenüber bisher),
-// sonst ein deterministisches, kuratiertes Platzhalterfoto (siehe
-// getProjectPlaceholderImage). Eigene Komponente statt Inline-JSX in der .map()-
-// Schleife, weil der Bild-Fallback (Platzhalterfoto lädt nicht) einen eigenen
-// useState-Hook braucht — Hooks dürfen nicht innerhalb einer Schleife aufgerufen
-// werden.
-function ProjectCoverImage({ project, heroFloor, heroKind }) {
+// Grundriss-/Vorschaubild, jetzt nach fester Prioritätsreihenfolge: 1) explizit
+// hochgeladenes Projekt-Titelbild (project.cover_image_url, siehe
+// ProjectFormModal), 2) das älteste vorhandene Mängel-Pin-Foto des Projekts
+// (resolveProjectPinPhoto), 3) das bestehende Grundriss-Vorschaubild (heroFloor,
+// unverändert gegenüber bisher), erst wenn all das fehlt: das deterministische,
+// kuratierte Platzhalterfoto (siehe getProjectPlaceholderImage). Eigene Komponente
+// statt Inline-JSX in der .map()-Schleife, weil der Bild-Fallback (Platzhalterfoto
+// lädt nicht) einen eigenen useState-Hook braucht — Hooks dürfen nicht innerhalb
+// einer Schleife aufgerufen werden.
+function ProjectCoverImage({ project, heroFloor, heroKind, pinPhotoUrl }) {
   const [placeholderFailed, setPlaceholderFailed] = useState(false);
 
+  if (project?.cover_image_url) {
+    return (
+      <img
+        src={project.cover_image_url}
+        alt=""
+        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+      />
+    );
+  }
+  if (pinPhotoUrl) {
+    return (
+      <img
+        src={pinPhotoUrl}
+        alt=""
+        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+      />
+    );
+  }
   if (heroKind === "cad") {
     return (
       <div
@@ -5540,6 +5698,8 @@ function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, q
             // die Kartenvorschau ohne vorhandenes Bild auf ein generisches Symbol zurück.
             const heroFloor = project.floors?.find((f) => f.image_url);
             const heroKind = heroFloor ? resolveFloorKind(heroFloor) : null;
+            const pinPhotoUrl = project.cover_image_url ? null : resolveProjectPinPhoto(project);
+            const hasRealCoverPhoto = !!project.cover_image_url || !!pinPhotoUrl || !!heroFloor;
             return (
               <div
                 key={project.id}
@@ -5556,12 +5716,12 @@ function ProjectOverview({ projects, loading, onOpenProject, onToggleFavorite, q
                 />
                 <button onClick={() => onOpenProject(project.id)} className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[#FF2A00]/30">
                   <div className="relative h-40 w-full overflow-hidden rounded-t-xl bg-slate-900">
-                    <ProjectCoverImage project={project} heroFloor={heroFloor} heroKind={heroKind} />
+                    <ProjectCoverImage project={project} heroFloor={heroFloor} heroKind={heroKind} pinPhotoUrl={pinPhotoUrl} />
                     <div className="absolute inset-0 bg-gradient-to-t from-slate-900/90 via-slate-900/10 to-transparent" />
                     <span className="absolute bottom-2 left-3 text-xs font-semibold uppercase tracking-wider text-white/90">
                       {project.status}
                     </span>
-                    {!heroFloor && (
+                    {!hasRealCoverPhoto && (
                       <span className="absolute bottom-2 right-3 rounded-full bg-slate-900/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-white/80 backdrop-blur-sm">
                         Platzhalterbild
                       </span>
@@ -9754,16 +9914,46 @@ function App() {
   };
 
   const handleSaveProject = async (fields) => {
+    // _coverImageFile ist kein echtes Projektfeld (siehe ProjectFormModal), sondern
+    // die neu ausgewählte Titelbild-Datei, noch nicht hochgeladen — beim Anlegen
+    // existiert die für den Storage-Pfad benötigte Projekt-ID erst NACH dem Insert,
+    // deshalb läuft der eigentliche Upload immer erst hier, nie im Modal selbst.
+    const { _coverImageFile: coverImageFile, ...projectFields } = fields;
     if (projectModalState.mode === "create") {
-      const created = await createProject(fields);
-      setProjects((prev) => [{ ...created, floors: [] }, ...prev]);
+      const created = await createProject(projectFields);
+      let finalProject = created;
+      if (coverImageFile) {
+        // Ein fehlgeschlagener Titelbild-Upload darf das bereits erfolgreich
+        // angelegte Projekt nicht verwerfen — das Projekt bleibt bestehen, nur das
+        // Titelbild fehlt dann, mit klarer Rückmeldung über das globale Fehler-Banner
+        // statt eines Fehlers im (dann schon geschlossenen) Anlage-Dialog.
+        try {
+          const publicUrl = await uploadProjectCoverImage(created.id, coverImageFile);
+          finalProject = await updateProject(created.id, { cover_image_url: publicUrl });
+        } catch (err) {
+          console.error("Projekt-Titelbild konnte nicht hochgeladen werden:", err);
+          setGlobalError("Projekt wurde angelegt, das Titelbild konnte aber nicht hochgeladen werden. Bitte im Bearbeiten-Dialog erneut versuchen.");
+        }
+      }
+      setProjects((prev) => [{ ...finalProject, floors: [] }, ...prev]);
     } else {
-      const updated = await updateProject(projectModalState.project.id, fields);
+      let updatePayload = projectFields;
+      if (coverImageFile) {
+        try {
+          const publicUrl = await uploadProjectCoverImage(projectModalState.project.id, coverImageFile);
+          updatePayload = { ...updatePayload, cover_image_url: publicUrl };
+        } catch (err) {
+          console.error("Projekt-Titelbild konnte nicht hochgeladen werden:", err);
+          setGlobalError("Die übrigen Änderungen werden gespeichert, das neue Titelbild konnte aber nicht hochgeladen werden. Bitte erneut versuchen.");
+        }
+      }
+      const updated = await updateProject(projectModalState.project.id, updatePayload);
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? { ...p, ...updated } : p)));
     }
     setProjectModalState(null);
-    // Fehler werden NICHT hier gefangen: ProjectFormModal wartet auf dieses Promise
-    // und zeigt einen Fehlertext direkt im Modal, falls Insert/Update scheitern.
+    // Fehler werden (bis auf den separat abgefangenen Titelbild-Upload oben) NICHT
+    // hier gefangen: ProjectFormModal wartet auf dieses Promise und zeigt einen
+    // Fehlertext direkt im Modal, falls Insert/Update scheitern.
   };
 
   const confirmDeleteProject = async () => {
