@@ -3686,7 +3686,13 @@ async function deleteUser(userId) {
 //      ersten Mal erfolgreich anmeldet, verknüpft currentAppUser (siehe App()) das
 //      Profil automatisch über die E-Mail-Adresse, ohne weiteres Zutun.
 // ----------------------------------------------------------------------------------
-// DIREKTER EINLADUNGS-LINK — Fallback bei SMTP-Timeouts (HTTP 504)
+// DIREKTER EINLADUNGS-LINK — jetzt der PRIMÄRE Weg (Anforderung: kein blockierender,
+// SMTP-abhängiger Mailversand mehr im Regelfall; HTTP-504-Timeouts sollen ganz
+// umgangen werden, nicht nur abgefangen werden). supabase.auth.admin.generateLink()
+// selbst löst KEINEN Mailversand aus (anders als resetPasswordForEmail) — es gibt den
+// fertigen Link als Wert zurück, ohne jede SMTP-Abhängigkeit. Genau deshalb ist dieser
+// Weg strukturell immun gegen SMTP-Timeouts, nicht nur nachträglich dagegen
+// abgesichert.
 // ----------------------------------------------------------------------------------
 // supabase.auth.admin.generateLink() ist wie supabase.auth.admin.inviteUserByEmail()
 // weiter oben eine Admin-API und benötigt zwingend den Service-Role-Key — der darf
@@ -3697,45 +3703,59 @@ async function deleteUser(userId) {
 // angemeldeter Administrator sie aufrufen darf — siehe
 // supabase/functions/generate-invite-link/index.ts (liegt dieser Antwort bei) sowie
 // die Einordnung für die Begründung und die einmalige Deploy-Anleitung
-// (`supabase functions deploy generate-invite-link`). Ohne deployte Funktion wirft
-// dieser Aufruf einen Fehler — das Einladungssystem bleibt dann exakt so nutzbar wie
-// zuvor (normaler E-Mail-Versand über resetPasswordForEmail), nur der Link-Fallback
-// fehlt dann.
+// (`supabase functions deploy generate-invite-link`). Ist die Funktion noch nicht
+// deployt oder aus einem anderen Grund nicht erreichbar, fängt
+// sendInviteLinkPrimary unten das ab und weicht auf den bisherigen, E-Mail-basierten
+// Weg aus — Zero-Regression zur vorigen Anforderung, das Einladungssystem bleibt in
+// jedem Fall nutzbar.
 async function requestDirectInviteLink(email) {
-  const { data, error } = await supabase.functions.invoke("generate-invite-link", {
-    body: { email },
-  });
+  const { data, error } = await withTimeout(
+    supabase.functions.invoke("generate-invite-link", { body: { email } }),
+    10000,
+    "Direkte Link-Erzeugung"
+  );
   if (error) throw error;
   if (!data?.link) throw new Error("Es wurde kein Einladungslink zurückgegeben.");
   return data.link;
 }
 
-// Versendet die eigentliche Einladungs-/Erinnerungs-E-Mail über Supabases
-// eingebauten "Passwort zurücksetzen"-Versand (SMTP-abhängig — siehe
-// inviteUserToApp/resendUserInvite unten) mit einem Zeitlimit ab. Schlägt der
-// Versand fehl (Zeitlimit erreicht ODER ein von Supabase gemeldeter SMTP-/504-
-// artiger Fehler), wird NICHT stillschweigend aufgegeben, sondern automatisch der
-// oben beschriebene direkte, kopierbare Link erzeugt — der Administrator kann die
-// Einladung dann manuell weitergeben (z.B. per Chat), auch wenn der serverseitige
-// Mail-Versand gerade nicht funktioniert.
-async function sendInviteEmailOrFallbackLink(normalizedEmail) {
+// Sekundärer, E-Mail-basierter Weg über Supabases eingebauten "Passwort
+// zurücksetzen"-Versand (SMTP-abhängig) — kommt nur noch zum Einsatz, wenn die
+// direkte Link-Erzeugung oben fehlschlägt (siehe sendInviteLinkPrimary). Mit
+// Zeitlimit abgesichert, damit ein hängender SMTP-Server die Einladung nicht
+// unbegrenzt blockiert.
+async function sendInviteEmailFallback(normalizedEmail) {
+  const { error } = await withTimeout(
+    inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
+      redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
+    }),
+    12000,
+    "Einladungs-Mailversand"
+  );
+  if (error) throw error;
+  return { directLink: null };
+}
+
+// Primärer Einladungsweg: erzeugt direkt einen kopierbaren Link, OHNE jeden
+// Mailversand und damit ohne jede SMTP-/504-Abhängigkeit im Regelfall. Schlägt die
+// direkte Erzeugung fehl (z.B. Edge Function noch nicht deployt, Netzwerkfehler),
+// wird das mit try/catch abgefangen — die Einladung schlägt dadurch NICHT fehl,
+// sondern weicht auf den bisherigen E-Mail-Versand aus. Scheitern auch beide Wege,
+// wird erst dann ein Fehler nach oben gereicht (siehe InviteUserModal).
+async function sendInviteLinkPrimary(normalizedEmail) {
   try {
-    const { error } = await withTimeout(
-      inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
-        redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
-      }),
-      12000,
-      "Einladungs-Mailversand"
-    );
-    if (error) throw error;
-    return { directLink: null };
-  } catch (err) {
-    console.warn(
-      "Einladungs-Mailversand fehlgeschlagen (Zeitlimit/SMTP-Fehler), erzeuge stattdessen einen direkten Link:",
-      err
-    );
     const directLink = await requestDirectInviteLink(normalizedEmail);
     return { directLink };
+  } catch (err) {
+    console.warn("Direkte Link-Erzeugung nicht möglich, weiche auf E-Mail-Versand aus:", err);
+    try {
+      return await sendInviteEmailFallback(normalizedEmail);
+    } catch (fallbackErr) {
+      console.error("Weder direkte Link-Erzeugung noch E-Mail-Versand waren möglich:", fallbackErr);
+      throw new Error(
+        "Weder ein direkter Einladungslink noch der E-Mail-Versand waren gerade möglich. Bitte später erneut versuchen."
+      );
+    }
   }
 }
 
@@ -3750,12 +3770,12 @@ async function inviteUserToApp({ email, name, kuerzel, role, projectIds, actor }
   // "User already registered" ist hier KEIN Fehlerfall, sondern der erwartete Weg für
   // eine Einladung an eine E-Mail-Adresse, für die bereits ein Auth-Konto existiert
   // (z.B. erneuter Einladungsversand nach abgelaufenem Link) — in dem Fall wird kein
-  // zweites Konto angelegt, es geht direkt mit dem Mail-/Link-Versand weiter.
+  // zweites Konto angelegt, es geht direkt mit der Link-/Mail-Erzeugung weiter.
   if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
     throw signUpError;
   }
 
-  const { directLink } = await sendInviteEmailOrFallbackLink(normalizedEmail);
+  const { directLink } = await sendInviteLinkPrimary(normalizedEmail);
 
   const payload = {
     name: name?.trim() || normalizedEmail,
@@ -3776,7 +3796,7 @@ async function inviteUserToApp({ email, name, kuerzel, role, projectIds, actor }
 
 // "Einladung erneut senden" für ein bereits bestehendes app_users-Profil mit
 // invite_status "eingeladen" (siehe UsersAdminModal) — wiederholt ausschließlich den
-// signUp()/Mail-bzw.-Link-Versand aus inviteUserToApp oben, OHNE ein neues
+// signUp()/Link-bzw.-Mail-Versand aus inviteUserToApp oben, OHNE ein neues
 // app_users-Profil anzulegen (das existiert ja bereits).
 async function resendUserInvite(email) {
   const normalizedEmail = email.trim().toLowerCase();
@@ -3787,7 +3807,7 @@ async function resendUserInvite(email) {
   if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
     throw signUpError;
   }
-  return await sendInviteEmailOrFallbackLink(normalizedEmail);
+  return await sendInviteLinkPrimary(normalizedEmail);
 }
 
 // ----------------------------------------------------------------------------------
@@ -5940,10 +5960,11 @@ function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
   const [projectIds, setProjectIds] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
-  // Gesetzt, sobald der E-Mail-Versand fehlgeschlagen ist (Zeitlimit/SMTP-Fehler,
-  // siehe sendInviteEmailOrFallbackLink) und stattdessen ein direkter Link erzeugt
-  // wurde (Abschnitt 1) — in diesem Fall bleibt das Modal offen und zeigt den Link
-  // mit Kopieren-Button an, statt sich wie im E-Mail-Erfolgsfall sofort zu schließen.
+  // Gesetzt, sobald die direkte Link-Erzeugung erfolgreich war (Regelfall, siehe
+  // sendInviteLinkPrimary) — in diesem Fall bleibt das Modal offen und zeigt den
+  // Link mit Kopieren-Button an, statt sich sofort zu schließen. Bleibt null, wenn
+  // stattdessen (Ausnahmefall) auf den E-Mail-Versand ausgewichen wurde — dann
+  // schließt sich das Modal wie gewohnt von selbst.
   const [directLink, setDirectLink] = useState(null);
   const [copied, setCopied] = useState(false);
 
@@ -6004,12 +6025,11 @@ function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
 
         {directLink ? (
           <div className={MODAL_BODY_SCROLL}>
-            <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-800">
-              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+            <div className="flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-xs leading-relaxed text-emerald-800">
+              <Check size={14} className="mt-0.5 shrink-0" />
               <span>
-                Die Einladungs-E-Mail konnte gerade nicht versendet werden (Zeitlimit/SMTP nicht erreichbar). Das
-                Benutzerprofil wurde trotzdem angelegt — bitte den folgenden Link stattdessen manuell an{" "}
-                <strong>{email.trim() || "die eingeladene Person"}</strong> weitergeben.
+                Einladungslink erzeugt, ohne Wartezeit auf einen E-Mail-Versand. Bitte weiterleiten an{" "}
+                <strong>{email.trim() || "die eingeladene Person"}</strong> — z.B. per Chat, Teams oder E-Mail.
               </span>
             </div>
             <div>
@@ -6030,9 +6050,10 @@ function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
         ) : (
           <div className={MODAL_BODY_SCROLL}>
             <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs leading-relaxed text-slate-500">
-              Es wird ein Konto für diese E-Mail-Adresse angelegt und ein Link zum Festlegen eines eigenen Passworts per
-              E-Mail versendet. Rolle und Projektzuordnung gelten sofort ab der ersten Anmeldung. Ist der Mail-Versand
-              gerade nicht erreichbar, wird automatisch stattdessen ein direkter, kopierbarer Link erzeugt.
+              Es wird ein Konto für diese E-Mail-Adresse angelegt und direkt ein kopierbarer Einladungslink erzeugt —
+              ohne blockierenden E-Mail-Versand, also unabhängig von SMTP-Timeouts. Rolle und Projektzuordnung gelten
+              sofort ab der ersten Anmeldung. Nur falls die direkte Erzeugung ausnahmsweise nicht möglich ist, wird
+              ersatzweise eine Einladungs-E-Mail verschickt.
             </p>
             <div>
               <FieldLabel>Name</FieldLabel>
@@ -6135,8 +6156,8 @@ function UsersAdminModal({
   const [formState, setFormState] = useState(null); // { mode, user }
   const [inviteOpen, setInviteOpen] = useState(false);
   const [resendingId, setResendingId] = useState(null);
-  // Direkter Einladungslink pro Benutzer-ID, falls der Erinnerungsversand per Mail
-  // fehlgeschlagen ist (siehe sendInviteEmailOrFallbackLink) — wird inline unter der
+  // Direkter Einladungslink pro Benutzer-ID, den "Erneut senden" liefert (siehe
+  // sendInviteLinkPrimary — Regelfall, kein Fehlerzustand) — wird inline unter der
   // jeweiligen Benutzerzeile angezeigt, siehe unten.
   const [directLinkByUser, setDirectLinkByUser] = useState({});
   const [copiedUserId, setCopiedUserId] = useState(null);
@@ -6251,16 +6272,16 @@ function UsersAdminModal({
                   mehrere aufeinanderfolgende Erinnerungen an verschiedene Personen
                   gleichzeitig sichtbar bleiben können. */}
               {directLinkByUser[u.id] && (
-                <div className="mt-2 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2">
+                <div className="mt-2 flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-2">
                   <input
                     readOnly
                     value={directLinkByUser[u.id]}
                     onFocus={(e) => e.target.select()}
-                    className="flex-1 truncate border-none bg-transparent p-0 font-mono text-[11px] text-amber-800 outline-none"
+                    className="flex-1 truncate border-none bg-transparent p-0 font-mono text-[11px] text-emerald-800 outline-none"
                   />
                   <button
                     onClick={() => handleCopyUserLink(u.id, directLinkByUser[u.id])}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-md bg-amber-600 px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-amber-700"
+                    className="inline-flex shrink-0 items-center gap-1 rounded-md bg-emerald-600 px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-emerald-700"
                   >
                     {copiedUserId === u.id ? <Check size={12} /> : <Copy size={12} />} {copiedUserId === u.id ? "Kopiert" : "Kopieren"}
                   </button>
@@ -12359,9 +12380,9 @@ function App() {
   // handleInviteUser — InviteUserModal fängt den Fehler selbst ab und zeigt ihn
   // inline im Formular an (identisches Muster wie handleCreateUser/UserFormModal).
   // Gibt { directLink } an InviteUserModal zurück (siehe dort) — ist directLink
-  // gesetzt, konnte die Einladungs-E-Mail nicht versendet werden (Zeitlimit/SMTP-
-  // Fehler, siehe sendInviteEmailOrFallbackLink) und das Modal zeigt stattdessen den
-  // direkten Link mit Kopieren-Button, statt sich sofort zu schließen.
+  // gesetzt, wurde der Einladungslink direkt erzeugt (Regelfall, siehe
+  // sendInviteLinkPrimary) und das Modal zeigt ihn mit Kopieren-Button an, statt
+  // sich sofort zu schließen.
   const handleInviteUser = async (fields) => {
     const { profile, directLink } = await inviteUserToApp({
       name: fields.name,
