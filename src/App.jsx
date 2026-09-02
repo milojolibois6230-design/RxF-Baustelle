@@ -72,6 +72,7 @@ import {
   Copy,
   ClipboardCheck,
   LayoutList,
+  GripVertical,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -705,6 +706,13 @@ async function fetchFloorsWithPinSummary(projectId) {
     .from("floors")
     .select("*, pins(id, status), floor_plans(id)")
     .eq("project_id", projectId)
+    // sort_order ist die manuell per Drag & Drop veränderbare Reihenfolge (siehe
+    // reorderFloors unten sowie supabase_schema_v14_floor_sort_order.sql).
+    // nullsFirst: false + created_at als zweites Sortierkriterium fängt den
+    // Übergangszustand unmittelbar nach einem Deployment ohne bereits ausgeführte
+    // Migration ab (sort_order dann noch null) — sortiert in dem Fall unverändert
+    // wie zuvor nach Anlagezeitpunkt, statt mit nicht deterministischer Reihenfolge.
+    .order("sort_order", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: true });
   if (error) throw error;
   return data ?? [];
@@ -796,8 +804,15 @@ async function uploadProjectCoverImage(projectId, file) {
 // Ein Geschoss ist ab sofort ein reiner Namens-Container ohne eigenen Grundriss
 // (siehe supabase_schema_v7_floor_plans_sketch_level.sql) — der Grundriss/die
 // Grundrisse gehören zur separaten, darunterliegenden Ebene (floor_plans).
-async function createFloor(projectId, name) {
-  const { data, error } = await supabase.from("floors").insert({ project_id: projectId, name }).select().single();
+// sortOrder wird vom Aufrufer (siehe handleAddFloor in App) als aktuelle Anzahl
+// bestehender Geschosse übergeben — ein neues Geschoss wird dadurch immer ans Ende
+// der Reihenfolge angehängt, exakt wie bei handleCreateTrade/sort_order für Gewerke.
+async function createFloor(projectId, name, sortOrder) {
+  const { data, error } = await supabase
+    .from("floors")
+    .insert({ project_id: projectId, name, sort_order: sortOrder })
+    .select()
+    .single();
   if (error) throw error;
   return data;
 }
@@ -816,6 +831,19 @@ async function updateFloor(floorId, name) {
 async function deleteFloor(floor) {
   const { error } = await supabase.from("floors").delete().eq("id", floor.id);
   if (error) throw error;
+}
+
+// Persistiert eine per Drag & Drop geänderte Geschoss-Reihenfolge: orderedFloors
+// (Objekte mit mindestens .id, bereits in der gewünschten Zielreihenfolge) bekommen
+// ihr sort_order stur 0..n-1 neu zugewiesen — exakt dasselbe, bereits bewährte Muster
+// wie reorderTrades weiter oben (verhindert Lücken/Kollisionen gegenüber einem reinen
+// "zwischen zwei Nachbarn einschieben"-Ansatz mit Nachkommastellen).
+async function reorderFloors(orderedFloors) {
+  const results = await Promise.all(
+    orderedFloors.map((f, idx) => supabase.from("floors").update({ sort_order: idx }).eq("id", f.id))
+  );
+  const failed = results.find((r) => r.error);
+  if (failed?.error) throw failed.error;
 }
 
 // Grundrisskizzen (Ebene 3) — ein Geschoss kann beliebig viele davon enthalten.
@@ -7200,6 +7228,7 @@ function FloorOverview({
   onArchiveProject,
   onEditFloor,
   onDeleteFloor,
+  onReorderFloors,
   onExportPdf,
   readOnly = false,
 }) {
@@ -7208,6 +7237,76 @@ function FloorOverview({
   const projectTradeIds = resolveProjectTradeIds(project);
   const projectTrades =
     projectTradeIds === null ? trades.filter((t) => t.active) : trades.filter((t) => projectTradeIds.includes(t.id));
+
+  // ---------------------------------------------------------------------------------
+  // DRAG & DROP REORDERING DER GESCHOSSE (Grip-Handle je Kachel)
+  // ---------------------------------------------------------------------------------
+  // Bewusst über Pointer Events statt native HTML5-Drag&Drop-Handler (draggable/
+  // dragstart/dragover/drop) umgesetzt — HTML5-DnD feuert auf Touch-Geräten ohne
+  // Zusatzaufwand keine zuverlässigen Events, in dieser auf Tablet/Handy-Nutzung auf
+  // der Baustelle ausgelegten App wäre das eine Regression. Pointer Events sind
+  // bereits das etablierte Muster dieser Codebasis für genau diesen Zweck (siehe
+  // Pin-Verschieben/Pan/Pinch-Zoom in FloorPlanView) und funktionieren für Maus,
+  // Touch und Stift identisch. Bewusst KEIN künstlicher "Long Press"-Timer: der
+  // Grip ist ein eigenständiges, kleines Element außerhalb des "Geschoss öffnen"-
+  // Buttons (siehe Markup unten) — jede Berührung DES GRIPS bedeutet eindeutig
+  // "jetzt ziehen", eine Verzögerung zur Unterscheidung von einem normalen Tap ist
+  // dadurch anders als bei einem grip-losen Long-Press-Ansatz gar nicht nötig.
+  const [orderedFloors, setOrderedFloors] = useState(floors);
+  const [draggingFloorId, setDraggingFloorId] = useState(null);
+  const floorCardRefs = useRef({});
+
+  // Übernimmt eine von außen (Server-Antwort, Offline-Cache, Pin-Zusammenfassung)
+  // aktualisierte floors-Prop — AUSSER während eine Drag-Geste gerade aktiv ist,
+  // sonst würde z.B. ein zwischenzeitliches Nachladen die laufende Bewegung mitten
+  // im Ziehen sichtbar zurückspringen lassen.
+  useEffect(() => {
+    if (!draggingFloorId) setOrderedFloors(floors);
+  }, [floors, draggingFloorId]);
+
+  const handleGripPointerDown = (floorId, e) => {
+    if (readOnly || !onReorderFloors) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDraggingFloorId(floorId);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  // Bestimmt per Mittelpunkt-Vergleich der bereits gerenderten Kachel-Rects, über
+  // welcher ANDEREN Kachel sich der Pointer gerade befindet, und tauscht die gezogene
+  // Kachel live an diese Position — klassisches "Sortable List"-Verhalten, der Nutzer
+  // sieht die neue Reihenfolge schon während des Ziehens, nicht erst nach dem Loslassen.
+  const handleGripPointerMove = (e) => {
+    if (!draggingFloorId) return;
+    const draggedIndex = orderedFloors.findIndex((f) => f.id === draggingFloorId);
+    if (draggedIndex === -1) return;
+    const overTarget = orderedFloors.find((f) => {
+      if (f.id === draggingFloorId) return false;
+      const el = floorCardRefs.current[f.id];
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      return e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+    });
+    if (!overTarget) return;
+    const targetIndex = orderedFloors.findIndex((f) => f.id === overTarget.id);
+    if (targetIndex === draggedIndex) return;
+    setOrderedFloors((prev) => {
+      const next = [...prev];
+      const [moved] = next.splice(draggedIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const handleGripPointerUp = () => {
+    if (!draggingFloorId) return;
+    setDraggingFloorId(null);
+    // Nur tatsächlich persistieren, wenn sich die Reihenfolge gegenüber der zuletzt
+    // von außen erhaltenen floors-Prop wirklich geändert hat — ein Antippen des Grips
+    // ohne nennenswerte Bewegung soll keinen unnötigen Schreibvorgang auslösen.
+    const changed = orderedFloors.length !== floors.length || orderedFloors.some((f, idx) => f.id !== floors[idx]?.id);
+    if (changed && onReorderFloors) onReorderFloors(orderedFloors);
+  };
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
@@ -7319,7 +7418,7 @@ function FloorOverview({
         <LoadingBlock label="Etagen werden geladen…" />
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-          {floors.map((floor) => {
+          {orderedFloors.map((floor) => {
             const floorPins = floor.pins || [];
             const open = floorPins.filter((p) => p.status === "offen").length;
             const inProgress = floorPins.filter((p) => p.status === "bearbeitung").length;
@@ -7328,8 +7427,31 @@ function FloorOverview({
             return (
               <div
                 key={floor.id}
-                className="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md"
+                ref={(el) => {
+                  floorCardRefs.current[floor.id] = el;
+                }}
+                className={`group relative flex flex-col overflow-hidden rounded-xl border bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md ${
+                  draggingFloorId === floor.id ? "z-20 border-[#FF2A00] opacity-70 shadow-lg ring-2 ring-[#FF2A00]/40" : "border-slate-200"
+                }`}
               >
+                {/* Grip-Handle: eigenständiges Element AUSSERHALB des "Geschoss öffnen"-
+                    Buttons unten (ein <button> im <button> wäre ungültig verschachteltes
+                    interaktives HTML, siehe dieselbe Problematik bei AddressMapsLink in
+                    der Projektkachel) — jede Berührung startet unmittelbar das Ziehen. */}
+                {!readOnly && onReorderFloors && (
+                  <button
+                    type="button"
+                    aria-label="Reihenfolge der Geschosse ändern"
+                    title="Gedrückt halten und ziehen, um die Reihenfolge zu ändern"
+                    onPointerDown={(e) => handleGripPointerDown(floor.id, e)}
+                    onPointerMove={handleGripPointerMove}
+                    onPointerUp={handleGripPointerUp}
+                    onPointerCancel={handleGripPointerUp}
+                    className="absolute left-2 top-2 z-10 flex h-6 w-6 touch-none cursor-grab items-center justify-center rounded-md bg-slate-900/40 text-white backdrop-blur-sm transition hover:bg-slate-900/60 active:cursor-grabbing"
+                  >
+                    <GripVertical size={14} />
+                  </button>
+                )}
                 <button
                   onClick={() => onOpenFloor(floor.id)}
                   className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[#FF2A00]/30"
@@ -10801,6 +10923,13 @@ function App() {
           // Warteschlange einfach vorher durch — unschädlich, das Ergebnis ist ohnehin
           // "gelöscht".
           await deletePin({ id: targetPinId, pin_photos: item.photos || [] });
+        } else if (item.type === "reorder_floors") {
+          // floorIds sind bereits echte, serverseitige Etagen-IDs — anders als bei
+          // Pins ist das Anlegen einer Etage NICHT offline-fähig (siehe handleAddFloor,
+          // kein !online-Zweig dort), ein rein offline angelegtes, noch unsynchronisiertes
+          // Geschoss kann also gar nicht Teil einer umsortierten Reihenfolge sein. Eine
+          // idMap-Auflösung wie bei targetPinId ist hier deshalb nicht nötig.
+          await reorderFloors(item.floorIds.map((id) => ({ id })));
         }
         processedAny = true;
         const remaining = readSyncQueue().filter((q) => q.id !== item.id);
@@ -11030,7 +11159,10 @@ function App() {
   // Datei-Upload mehr auf dieser Ebene, siehe stattdessen handleAddFloorPlanSketch.
   const handleAddFloor = async (name) => {
     if (!selectedProjectId) return;
-    const newFloor = await createFloor(selectedProjectId, name);
+    // Neues Geschoss wird ans Ende der aktuellen Reihenfolge angehängt (sort_order =
+    // bisherige Anzahl Geschosse) — exakt dasselbe Muster wie handleCreateTrade weiter
+    // unten für Gewerke.
+    const newFloor = await createFloor(selectedProjectId, name, floors.length);
     setFloors((prev) => [...prev, { ...newFloor, pins: [], floor_plans: [] }]);
     setProjects((prev) =>
       prev.map((p) =>
@@ -11042,6 +11174,32 @@ function App() {
     setFloorModalOpen(false);
     // Fehler werden NICHT hier gefangen: NewFloorModal wartet auf dieses Promise
     // und zeigt einen Fehlertext direkt im Modal, falls der Insert scheitert.
+  };
+
+  // Drag & Drop Reordering (siehe Grip-Handle in FloorOverview): orderedFloors liegt
+  // bereits in der neuen Zielreihenfolge vor (Reihenfolge, nicht sort_order-Werte —
+  // die werden hier bzw. in reorderFloors/flushSyncQueue final vergeben). Optimistisch
+  // sofort in React State UND im Offline-JSON-Cache übernommen (Punkt 15-Architektur,
+  // siehe cacheFloorsOffline) — die neue Reihenfolge bleibt dadurch auch nach einem
+  // Reload sofort sichtbar, unabhängig vom Ausgang der Server-Synchronisation.
+  const handleReorderFloors = async (orderedFloors) => {
+    setFloors(orderedFloors);
+    if (selectedProjectId) cacheFloorsOffline(selectedProjectId, orderedFloors);
+    const floorIds = orderedFloors.map((f) => f.id);
+    if (!online) {
+      setSyncQueue(enqueueSyncItem({ type: "reorder_floors", projectId: selectedProjectId, floorIds, actor: currentActor }));
+      return;
+    }
+    try {
+      await reorderFloors(orderedFloors);
+    } catch (err) {
+      // Der Online-Status kann kurzzeitig veralten (siehe requireOnline-Kommentare an
+      // anderer Stelle) — statt eines harten, folgenlosen Fehlers wird derselbe
+      // Offline-Sync-Pfad genutzt: die neue Reihenfolge bleibt lokal sichtbar (State ist
+      // oben bereits gesetzt) und wird beim nächsten erfolgreichen Sync-Lauf nachgezogen.
+      console.error("Reihenfolge der Etagen konnte nicht direkt gespeichert werden, wird nachsynchronisiert:", err);
+      setSyncQueue(enqueueSyncItem({ type: "reorder_floors", projectId: selectedProjectId, floorIds, actor: currentActor }));
+    }
   };
 
   const openEditFloorModal = (floor) => {
@@ -12029,6 +12187,7 @@ function App() {
           onArchiveProject={handleToggleProjectArchive}
           onEditFloor={openEditFloorModal}
           onDeleteFloor={handleDeleteFloorClick}
+          onReorderFloors={handleReorderFloors}
           onExportPdf={openPdfExportModal}
           readOnly={!session}
         />
