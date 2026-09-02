@@ -71,7 +71,6 @@ import {
   ArchiveRestore,
   Copy,
   ClipboardCheck,
-  LayoutList,
   GripVertical,
   Mail,
   KeyRound,
@@ -79,6 +78,9 @@ import {
   UserX,
   MailPlus,
   Settings,
+  HelpCircle,
+  Table,
+  Move,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -240,58 +242,6 @@ const PRIORITY = {
   mittel: { label: "Mittel", text: "text-amber-700", bg: "bg-amber-100", bar: "bg-amber-500" },
   hoch: { label: "Hoch", text: "text-red-700", bg: "bg-red-100", bar: "bg-red-600" },
 };
-
-// Vorlagen-Katalog für die Schnellerfassung wiederkehrender Baustellen-Standardmängel
-// (siehe Vorlagen-Chips in PinModal, nur bei neu angelegten Pins sichtbar). tradeName
-// wird beim Anwenden einer Vorlage per Namensvergleich gegen die tatsächlich in DIESEM
-// Projekt hinterlegten Gewerke aufgelöst (siehe resolveTradeIdByName) — das Gewerke-
-// Sortiment ist je Projekt frei konfigurierbar (siehe TradesAdminModal), ein fest
-// verdrahtetes trade_id ist daher nicht möglich. Ist das betreffende Gewerk in diesem
-// Projekt nicht angelegt oder deaktiviert, bleibt beim Anwenden nur das Gewerk-Feld
-// leer, Titel/Priorität/Beschreibung werden trotzdem übernommen. Die Beschreibungs-
-// Standardtexte waren in der Anforderung nicht wörtlich vorgegeben ("Standardtext")
-// und sind daher eigene, fachlich übliche Formulierungen für die jeweilige Mangelart.
-const QUICK_DEFECT_TEMPLATES = [
-  {
-    title: "Bohrloch nicht verspachtelt",
-    tradeName: "Trockenbau",
-    priority: "mittel",
-    description: "Bohrloch in der Gipskartonfläche ist nicht verspachtelt und muss nachgearbeitet werden.",
-  },
-  {
-    title: "Schutzkappe an Bewehrung fehlt",
-    tradeName: "Rohbau",
-    priority: "hoch",
-    description: "Bewehrungsanschluss ohne Schutzkappe — Verletzungsgefahr, umgehend nachrüsten.",
-  },
-  {
-    title: "Restfeuchte im Estrich zu hoch",
-    tradeName: "Bodenbelag",
-    priority: "hoch",
-    description: "CM-Messung erforderlich, Belegreife vor Verlegung des Bodenbelags nachweisen.",
-  },
-  {
-    title: "Beschädigung an Putz/Kante",
-    tradeName: "Maler/Putz",
-    priority: "niedrig",
-    description: "Putzfläche bzw. Kante beschädigt, optische Nacharbeit erforderlich.",
-  },
-  {
-    title: "Fehlende Beschriftung im Verteiler",
-    tradeName: "Elektro",
-    priority: "mittel",
-    description: "Stromkreise im Verteiler sind nicht beschriftet.",
-  },
-];
-
-// Case-insensitive Namensauflösung einer Vorlagen-Gewerkebezeichnung gegen die aktiven
-// Gewerke des aktuell geöffneten Projekts. Liefert "" (kein Treffer), wenn im Projekt
-// kein gleichnamiges aktives Gewerk existiert — das select-Feld im Modal versteht "" bereits
-// heute als "Kein Gewerk zugeordnet" (siehe draft.trade_id in PinModal).
-function resolveTradeIdByName(trades, name) {
-  const match = (trades || []).find((t) => t.active && t.name.trim().toLowerCase() === name.trim().toLowerCase());
-  return match ? match.id : "";
-}
 
 // Menschenlesbare Feld-Bezeichnungen für die Bearbeitungshistorie (Abschnitt 3) —
 // welche Felder beim Speichern eines Pins geändert wurden, wird darüber zu einem
@@ -2141,6 +2091,33 @@ async function renderPdfPlanToDataUrl(url, scale = 3.75) {
   return { dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height };
 }
 
+// GRUNDRISS-GARANTIE (Anforderung PDF-Export): der Grundriss soll unabhängig von
+// seiner Dateigröße IMMER lesbar im Export erscheinen. loadImageAsDataUrl/
+// renderPdfPlanToDataUrl können bei einem einzelnen, vorübergehenden Netzwerk-Hänger
+// (z. B. auf einer schwachen Baustellen-Verbindung) fehlschlagen, obwohl die Datei an
+// sich verfügbar ist — ein einziger sofortiger erneuter Versuch nach kurzer Pause
+// behebt genau diesen häufigsten Fall, ohne den Export spürbar zu verzögern. Bleiben
+// beide Versuche erfolglos (z. B. Datei wirklich nicht erreichbar), wirft die Funktion
+// weiterhin ganz normal — die aufrufende Stelle zeigt dann wie bisher den textuellen
+// Fallback (siehe generateProjectReportPdf/generateFloorPinsTablePdf/
+// generateSinglePinPdf), ein hundertprozentiges Gelingen kann bei einem echten
+// Netzwerk- oder Dateiproblem naturgemäß niemand garantieren.
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadFloorPlanImageWithRetry(planUrl, planKind) {
+  const load = () =>
+    planKind === "pdf" ? renderPdfPlanToDataUrl(planUrl) : loadImageAsDataUrl(planUrl);
+  try {
+    return await load();
+  } catch (err) {
+    console.warn("Grundriss konnte nicht geladen werden, erneuter Versuch:", err);
+    await delay(600);
+    return await load();
+  }
+}
+
 // ---- PDF-Dateigrößen-Optimierung (Downscaling & Komprimierung) --------------------
 // Kamerafotos von Baustellen-Smartphones (oft 8–48 Megapixel) und hochauflösend
 // gescannte/gerenderte Grundrisse werden von loadImageAsDataUrl/renderPdfPlanToDataUrl
@@ -2153,9 +2130,13 @@ async function renderPdfPlanToDataUrl(url, scale = 3.75) {
 const PDF_PHOTO_MAX_WIDTH = 800;
 const PDF_PHOTO_MAX_HEIGHT = 600;
 const PDF_PHOTO_JPEG_QUALITY = 0.65;
-const PDF_PLAN_MAX_WIDTH = 1800;
-const PDF_PLAN_MAX_HEIGHT = 1800;
-const PDF_PLAN_JPEG_QUALITY = 0.72;
+// GRUNDRISS-GARANTIE: 2200×2200 bei Qualität 0.78 (statt zuvor 1800×1800 / 0.72) —
+// spürbar schärfer bei größeren/detailreicheren Grundrissen (z. B. beschriftete
+// Achsraster, feine Bemaßung), ohne die Zielgröße des Gesamtberichts (siehe Kommentar
+// oben) nennenswert zu sprengen. Siehe auch loadFloorPlanImageWithRetry unten.
+const PDF_PLAN_MAX_WIDTH = 2200;
+const PDF_PLAN_MAX_HEIGHT = 2200;
+const PDF_PLAN_JPEG_QUALITY = 0.78;
 
 // Skaliert & komprimiert ein bereits geladenes Bild (Data-URL, siehe
 // loadImageAsDataUrl/renderPdfPlanToDataUrl) über ein Offscreen-Canvas auf maximal
@@ -2556,14 +2537,17 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     const planKind = resolveFloorKind(p);
     let imgRect = null;
     try {
-      let imgData = null;
-      if (planKind === "pdf") imgData = await renderPdfPlanToDataUrl(p.image_url);
       // SVG-Grundrisse werden hier wie Raster-Bilder behandelt: loadImageAsDataUrl
       // lädt sie unverändert über Image().naturalWidth/-Height (Browser rastern SVGs
       // beim Dekodieren automatisch anhand ihres viewBox/width/height) — das native
       // Vektor-Rendering (siehe SvgPlanCanvas) gilt ausschließlich für die interaktive
       // Planansicht, PDF-Seiten sind selbst bereits eine feste, gedruckte Auflösung.
-      else if (planKind === "image" || planKind === "svg") imgData = await loadImageAsDataUrl(p.image_url);
+      // loadFloorPlanImageWithRetry (siehe dort) versucht bei einem Ladefehler einmal
+      // erneut, bevor auf den Text-Fallback unten ausgewichen wird (GRUNDRISS-GARANTIE).
+      let imgData = null;
+      if (planKind === "pdf" || planKind === "image" || planKind === "svg") {
+        imgData = await loadFloorPlanImageWithRetry(p.image_url, planKind);
+      }
       if (imgData) {
         // Vor dem Einbetten auf PDF-taugliche Auflösung herunterskalieren & als JPEG
         // komprimieren (siehe compressImageDataUrl) — entscheidend für die Dateigröße.
@@ -2671,6 +2655,40 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     const descLines = doc.splitTextToSize(pin.description || "–", contentWidth);
     doc.text(descLines, margin, dy);
     dy += descLines.length * 5 + 4;
+
+    // Aufgaben/Checkliste — bislang in KEINEM PDF-Export enthalten (Anforderung:
+    // "allen To-do-Aufgaben/Checklisten" im Gesamtexport). Erledigte Einträge in
+    // Graustufe statt Tintenfarbe, offene Einträge als leeres Kästchen — dieselbe
+    // Formsprache wie im Einzel-Pin-Export (siehe generateSinglePinPdf).
+    const todos = pin.pin_todos || [];
+    if (todos.length > 0) {
+      bold();
+      doc.text(`Aufgaben (${todos.filter((t) => t.completed).length}/${todos.length} erledigt):`, margin, dy);
+      dy += 6;
+      normal();
+      doc.setFontSize(9);
+      todos.forEach((todo) => {
+        const lines = doc.splitTextToSize(todo.text || "", contentWidth - 7);
+        if (dy + lines.length * 4.6 > pageHeight - margin) {
+          doc.addPage();
+          dy = margin;
+        }
+        doc.setDrawColor(148, 163, 184);
+        if (todo.completed) {
+          doc.setFillColor(16, 185, 129);
+          doc.roundedRect(margin, dy - 3, 3.2, 3.2, 0.6, 0.6, "F");
+          doc.setTextColor(100, 116, 139);
+        } else {
+          doc.roundedRect(margin, dy - 3, 3.2, 3.2, 0.6, 0.6, "S");
+          doc.setTextColor(0, 0, 0);
+        }
+        doc.text(lines, margin + 6.5, dy, { maxWidth: contentWidth - 6.5 });
+        doc.setTextColor(0, 0, 0);
+        dy += lines.length * 4.6 + 1.5;
+      });
+      doc.setFontSize(10);
+      dy += 3;
+    }
 
     // Fotos im Raster (3 Spalten), seitenübergreifend falls nötig
     const photos = pin.pin_photos || [];
@@ -2909,9 +2927,12 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
     if (plan?.image_url) {
       try {
         const planKind = resolveFloorKind(plan);
+        // loadFloorPlanImageWithRetry: ein automatischer erneuter Versuch bei einem
+        // Ladefehler, siehe Kommentar dort (GRUNDRISS-GARANTIE).
         let imgData = null;
-        if (planKind === "pdf") imgData = await renderPdfPlanToDataUrl(plan.image_url);
-        else if (planKind === "image" || planKind === "svg") imgData = await loadImageAsDataUrl(plan.image_url);
+        if (planKind === "pdf" || planKind === "image" || planKind === "svg") {
+          imgData = await loadFloorPlanImageWithRetry(plan.image_url, planKind);
+        }
         if (imgData) {
           // Vor dem Einbetten auf PDF-taugliche Auflösung herunterskalieren & als JPEG
           // komprimieren (siehe compressImageDataUrl) — entscheidend für die Dateigröße.
@@ -3267,7 +3288,7 @@ const SINGLE_PIN_PLAN_CROP_RATIO = 0.26;
 const SINGLE_PIN_MINIMAP_MAX_DIM = 500;
 const SINGLE_PIN_MINIMAP_QUALITY = 0.6;
 
-async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, trades, generatedBy }) {
+async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, trades, generatedBy, allPins = [] }) {
   const jsPDF = await loadJsPdf();
   const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "portrait", compress: true });
   const pageWidth = doc.internal.pageSize.getWidth();
@@ -3363,14 +3384,19 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
   if (plan?.image_url) {
     try {
       const planKind = resolveFloorKind(plan);
-      let imgData = null;
-      if (planKind === "pdf") imgData = await renderPdfPlanToDataUrl(plan.image_url);
-      else if (planKind === "image" || planKind === "svg") imgData = await loadImageAsDataUrl(plan.image_url);
+      // loadFloorPlanImageWithRetry: ein automatischer erneuter Versuch bei einem
+      // Ladefehler, siehe Kommentar dort (GRUNDRISS-GARANTIE).
+      const imgData = await loadFloorPlanImageWithRetry(plan.image_url, planKind);
       if (!imgData) throw new Error("Kein Bildmaterial für diese Grundrissskizze verfügbar.");
 
       // 1. Gesamt-Übersichtsplan (Minimap) — kompletter Grundriss stark verkleinert,
       // mit deutlich hervorgehobenem Pin-Marker (weißer Ring als Kontrast-Halo, damit
-      // der Punkt auch auf einem detailreichen Plan sofort auffindbar ist).
+      // der Punkt auch auf einem detailreichen Plan sofort auffindbar ist). Zusätzlich
+      // (Anforderung "kompletter Übersichtsgrundriss mit allen Pins zur Kontext-
+      // Orientierung"): alle ÜBRIGEN Pins dieser Grundrissskizze als kleine, schlichte
+      // Punkte in ihrer Statusfarbe — ohne Nummer/Ring, um die Minimap nicht zu
+      // überladen; der hier exportierte Pin bleibt durch den weißen Kontrast-Halo klar
+      // als DER eine hervorgehobene Marker erkennbar.
       const minimapData = await compressImageDataUrl(imgData.dataUrl, SINGLE_PIN_MINIMAP_MAX_DIM, SINGLE_PIN_MINIMAP_MAX_DIM, SINGLE_PIN_MINIMAP_QUALITY);
       const minimapRatio = Math.min(rightW / minimapData.width, minimapBoxH / minimapData.height);
       const minimapW = minimapData.width * minimapRatio;
@@ -3378,6 +3404,15 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
       const minimapImgX = rightX + (rightW - minimapW) / 2;
       const minimapImgY = columnsStartY + (minimapBoxH - minimapH) / 2;
       doc.addImage(minimapData.dataUrl, "JPEG", minimapImgX, minimapImgY, minimapW, minimapH);
+      (allPins || [])
+        .filter((p) => p.id !== pin.id)
+        .forEach((p) => {
+          const otherRgb = PDF_STATUS_RGB[p.status] || PDF_STATUS_RGB.offen;
+          const ox = minimapImgX + ((p.x ?? 50) / 100) * minimapW;
+          const oy = minimapImgY + ((p.y ?? 50) / 100) * minimapH;
+          doc.setFillColor(...otherRgb);
+          doc.circle(ox, oy, 1.1, "F");
+        });
       const minimapMarkerX = minimapImgX + ((pin.x ?? 50) / 100) * minimapW;
       const minimapMarkerY = minimapImgY + ((pin.y ?? 50) / 100) * minimapH;
       doc.setFillColor(255, 255, 255);
@@ -3477,68 +3512,112 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
     commentY += 4.6;
   }
 
-  // ---- Mängelfoto — direkt unter dem Kommentar in der linken Spalte (Anforderung:
-  // Stammdaten + Foto zusammen linksbündig). Läuft ggf. auf die vom Kommentar bereits
-  // begonnene Fortsetzungsseite mit, statt eine eigene neue Seite zu erzwingen — nur
-  // wenn selbst auf einer frischen Seite kein Platz mehr wäre, wird zusätzlich
-  // umbrochen (bei einem normal langen Kommentar in der Praxis nie der Fall). ----
-  const photos = pin.pin_photos || [];
-  const photoBoxH = Math.min(58, leftW * 0.5);
-  if (commentY + 6 + photoBoxH > activePageHeight - margin && commentY > margin) {
-    doc.addPage("a4", "portrait");
-    activePageWidth = doc.internal.pageSize.getWidth();
-    activePageHeight = doc.internal.pageSize.getHeight();
-    commentY = margin;
-    pagedBroke = true;
+  // ---- Ab hier volle Seitenbreite (nicht mehr zweispaltig): Aufgaben/Checkliste und
+  // ALLE Fotos, vollständig — die Anforderung an den Einzel-Pin-Export verlangt
+  // ausdrücklich "alle vollständigen Detaildaten (Fotos, To-dos, Beschreibungen)",
+  // nicht mehr nur ein einzelnes Vorschaufoto wie zuvor. sectionY startet unterhalb
+  // BEIDER Kopfspalten (Kommentar links, Minimap+Detail-Zoom rechts) — rightColumnBottom
+  // fließt nur ein, solange der Kommentar keinen Seitenumbruch ausgelöst hat (siehe
+  // pagedBroke), sonst bezieht es sich auf eine bereits verlassene Seite 1. ----
+  let sectionY = (pagedBroke ? commentY : Math.max(commentY, rightColumnBottom)) + 6;
+  const ensureSpace = (neededH) => {
+    if (sectionY + neededH > activePageHeight - margin) {
+      doc.addPage("a4", "portrait");
+      activePageWidth = doc.internal.pageSize.getWidth();
+      activePageHeight = doc.internal.pageSize.getHeight();
+      sectionY = margin;
+      pagedBroke = true;
+    }
+  };
+
+  // ---- Aufgaben / Checkliste — vollständig, wie im Pin-Modal geführt (offen/erledigt
+  // je eigenes Kästchen-Symbol, erledigte Einträge blass/durchgestrichen-ähnlich in
+  // Grauton statt Tintenfarbe, analog zur Lesbarkeit im Modal). ----
+  const todos = pin.pin_todos || [];
+  if (todos.length > 0) {
+    ensureSpace(10);
+    doc.setFontSize(7.5);
+    bold();
+    mutedColor();
+    doc.text(`AUFGABEN / CHECKLISTE (${todos.filter((t) => t.completed).length}/${todos.length} erledigt)`, margin, sectionY);
+    inkColor();
+    sectionY += 5;
+    normal();
+    doc.setFontSize(9.5);
+    todos.forEach((todo) => {
+      const lines = doc.splitTextToSize(todo.text || "", contentWidth - 7);
+      ensureSpace(lines.length * 4.6 + 1.5);
+      doc.setDrawColor(148, 163, 184);
+      if (todo.completed) {
+        doc.setFillColor(16, 185, 129);
+        doc.roundedRect(margin, sectionY - 3, 3.2, 3.2, 0.6, 0.6, "F");
+      } else {
+        doc.roundedRect(margin, sectionY - 3, 3.2, 3.2, 0.6, 0.6, "S");
+      }
+      if (todo.completed) mutedColor();
+      else inkColor();
+      doc.text(lines, margin + 6.5, sectionY, { maxWidth: contentWidth - 6.5 });
+      inkColor();
+      sectionY += lines.length * 4.6 + 1.5;
+    });
+    sectionY += 3;
   }
-  const photoBoxY = commentY + 6;
-  doc.setDrawColor(226, 232, 240);
-  doc.setFillColor(248, 250, 252);
-  doc.roundedRect(margin, photoBoxY, leftW, photoBoxH, 2, 2, "FD");
-  let photoColumnBottom = photoBoxY + photoBoxH;
+
+  // ---- Fotos — vollständig, im selben 3-Spalten-Raster wie der Gesamtexport (siehe
+  // generateProjectReportPdf) statt bisher nur eines einzelnen Vorschaubilds. ----
+  const photos = pin.pin_photos || [];
+  ensureSpace(10);
+  doc.setFontSize(7.5);
+  bold();
+  mutedColor();
+  doc.text(photos.length > 0 ? `FOTOS (${photos.length})` : "FOTOS", margin, sectionY);
+  inkColor();
+  sectionY += 5;
+  normal();
   if (photos.length > 0) {
-    try {
-      const rawImgData = await loadImageAsDataUrl(photos[0].photo_url);
-      const imgData = await compressImageDataUrl(rawImgData.dataUrl, PDF_PHOTO_MAX_WIDTH, PDF_PHOTO_MAX_HEIGHT, PDF_PHOTO_JPEG_QUALITY);
-      const ratio = Math.min(leftW / imgData.width, photoBoxH / imgData.height);
-      const w = imgData.width * ratio;
-      const h = imgData.height * ratio;
-      doc.addImage(imgData.dataUrl, "JPEG", margin + (leftW - w) / 2, photoBoxY + (photoBoxH - h) / 2, w, h);
-    } catch (err) {
-      console.error("Foto konnte nicht in den Einzel-PDF-Export geladen werden:", err);
-      doc.setFontSize(8.5);
-      mutedColor();
-      doc.text("Foto konnte nicht geladen werden.", margin + leftW / 2, photoBoxY + photoBoxH / 2, { align: "center" });
-      inkColor();
+    const cols = 3;
+    const gap = 4;
+    const cellW = (contentWidth - gap * (cols - 1)) / cols;
+    const cellH = cellW * 0.75;
+    let col = 0;
+    for (const photo of photos) {
+      if (col === 0) ensureSpace(cellH);
+      try {
+        const rawImgData = await loadImageAsDataUrl(photo.photo_url);
+        const imgData = await compressImageDataUrl(rawImgData.dataUrl, PDF_PHOTO_MAX_WIDTH, PDF_PHOTO_MAX_HEIGHT, PDF_PHOTO_JPEG_QUALITY);
+        const px = margin + col * (cellW + gap);
+        const ratio = Math.min(cellW / imgData.width, cellH / imgData.height);
+        const w = imgData.width * ratio;
+        const h = imgData.height * ratio;
+        doc.addImage(imgData.dataUrl, "JPEG", px + (cellW - w) / 2, sectionY + (cellH - h) / 2, w, h);
+      } catch (err) {
+        console.error("Foto konnte nicht in den Einzel-PDF-Export geladen werden:", err);
+      }
+      col += 1;
+      if (col >= cols) {
+        col = 0;
+        sectionY += cellH + gap;
+      }
     }
-    if (photos.length > 1) {
-      doc.setFontSize(7.5);
-      mutedColor();
-      doc.text(`+ ${photos.length - 1} weitere(s) Foto(s) im Pin bzw. Geschoss-Export.`, margin, photoColumnBottom + 4, { maxWidth: leftW });
-      inkColor();
-      photoColumnBottom += 7;
-    }
+    if (col !== 0) sectionY += cellH + gap;
   } else {
     doc.setFontSize(8.5);
     mutedColor();
-    doc.text("Kein Bild vorhanden.", margin + leftW / 2, photoBoxY + photoBoxH / 2, { align: "center" });
+    doc.text("Kein Foto vorhanden.", margin, sectionY);
     inkColor();
+    sectionY += 6;
   }
 
   // ---- Fußzeile — sitzt im Normalfall fest nahe am unteren Seitenrand; rutscht nur
-  // nach unten mit, falls der Inhalt (i.d.R. nur bei sehr langem Kommentar) diese
-  // Position bereits überschritten hat. rightColumnBottom fließt NUR ein, solange kein
-  // Seitenumbruch stattfand — sonst bezieht es sich auf Seite 1, die aktuelle Seite
-  // aber ist bereits eine andere (siehe pagedBroke oben). ----
-  const contentBottom = pagedBroke ? photoColumnBottom : Math.max(photoColumnBottom, rightColumnBottom);
-  const footerLineY = Math.max(contentBottom + 4, activePageHeight - 16);
+  // nach unten mit, falls der Inhalt bereits über diese Position hinausgewachsen ist. ----
+  const footerLineY = Math.max(sectionY + 4, activePageHeight - 16);
   if (footerLineY < activePageHeight - 6) {
     doc.setDrawColor(226, 232, 240);
     doc.line(margin, footerLineY, activePageWidth - margin, footerLineY);
     doc.setFontSize(7.5);
     mutedColor();
     doc.text(
-      `Einzel-Export erstellt am ${formatDateTime(new Date().toISOString())} von ${generatedBy || "–"} — vollständiger Verlauf, alle Fotos und weitere Mängel dieser Grundrissskizze im Geschoss-Export.`,
+      `Einzel-Export erstellt am ${formatDateTime(new Date().toISOString())} von ${generatedBy || "–"} — vollständiger Bearbeitungsverlauf und weitere Mängel dieser Grundrissskizze im Gesamt-/Geschoss-Export.`,
       margin,
       footerLineY + 4,
       { maxWidth: activePageWidth - margin * 2 }
@@ -8654,6 +8733,18 @@ function ViewCone({ angle, colorClass }) {
   );
 }
 
+// Long-Press-Schwelle für die gesamte Grundriss-Interaktion: ein neuer Pin/eine neue
+// Notiz entsteht nur noch, wenn der Grundriss (Hintergrund) mindestens LONG_PRESS_MS
+// gedrückt gehalten wird (siehe handleViewportPointerDown/-Move/-Up in FloorPlanView);
+// ein bestehender Pin/eine Notiz lässt sich ebenfalls erst nach demselben Long Press
+// AUF dem jeweiligen Marker verschieben (siehe PinMarker/PlanNoteMarker unten). Ein
+// kurzer Tap/Klick dient dadurch ausschließlich dem Zoomen/Verschieben der Ansicht
+// bzw. — bei einem kurzen Tap direkt auf einen Marker — dem Öffnen von dessen
+// Detailansicht. 500ms ist der auf Mobilgeräten übliche Richtwert für "Long Press"
+// (z. B. iOS Kontextmenüs) — lang genug, um ein versehentliches Auslösen beim
+// Scrollen/Zoomen zuverlässig zu vermeiden, kurz genug, um nicht träge zu wirken.
+const LONG_PRESS_MS = 500;
+
 function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, viewScale = 1 }) {
   const s = STATUS[pin.status];
   // Gegen-Skalierung: die sichtbare Pin-Größe bleibt unabhängig vom Zoomfaktor der
@@ -8663,22 +8754,65 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
   // sich die -50%/-100%-Verschiebung des Buttons weiterhin auf dessen unskalierte,
   // layoutwirksame Originalgröße und bleibt so bei jedem Zoomlevel exakt und stabil.
   const counterScale = 1 / (viewScale || 1);
+  // Lokaler Long-Press-Zustand für DIESEN einen Marker (jeder PinMarker verwaltet
+  // seinen eigenen Timer unabhängig von allen anderen Pins). pressFiredRef merkt sich
+  // über pointerdown -> pointerup -> click hinweg, ob der Long Press bereits ausgelöst
+  // hat (siehe onClick unten) — verhindert, dass nach einem erfolgreichen Long-Press-
+  // Drag-Start zusätzlich noch das Detail-Modal aufgeht.
+  const pressTimerRef = useRef(null);
+  const pressStartRef = useRef({ x: 0, y: 0 });
+  const pressFiredRef = useRef(false);
+  const clearPressTimer = () => {
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
   return (
     <button
       onPointerDown={(e) => {
-        if (!draggable) return;
+        // IMMER abfangen (auch ohne Schreibrecht) — sonst würde der Pointer beim
+        // Loslassen zusätzlich als Hintergrund-Tap gewertet und könnte (siehe
+        // handleViewportPointerUp) einen zweiten, ungewollten Pin exakt an dieser
+        // Stelle anlegen. Nur das eigentliche Long-Press-zum-Verschieben ist an
+        // draggable (= angemeldet) gebunden.
         e.stopPropagation();
-        onDragStart(e);
+        if (!draggable) return;
+        pressFiredRef.current = false;
+        pressStartRef.current = { x: e.clientX, y: e.clientY };
+        clearPressTimer();
+        pressTimerRef.current = setTimeout(() => {
+          pressTimerRef.current = null;
+          pressFiredRef.current = true;
+          onDragStart(e);
+        }, LONG_PRESS_MS);
       }}
+      onPointerMove={(e) => {
+        if (!pressTimerRef.current) return;
+        const dx = e.clientX - pressStartRef.current.x;
+        const dy = e.clientY - pressStartRef.current.y;
+        // Nennenswerte Bewegung VOR Ablauf des Long Press: kein Verschieben-Wunsch,
+        // sondern eher ein Wisch-/Scrollversuch — Timer verwerfen, kein Drag-Start.
+        if (Math.hypot(dx, dy) > FLOORPLAN_PAN_CLICK_THRESHOLD) clearPressTimer();
+      }}
+      onPointerUp={clearPressTimer}
+      onPointerLeave={clearPressTimer}
       onClick={(e) => {
         e.stopPropagation();
+        if (pressFiredRef.current) {
+          // Long Press hat bereits einen Drag-Start ausgelöst (siehe oben) — das
+          // nachfolgende Klick-Ereignis öffnet in diesem Fall NICHT zusätzlich das
+          // Detail-Modal, auch wenn der Pin am Ende gar nicht bewegt wurde.
+          pressFiredRef.current = false;
+          return;
+        }
         onClick(pin);
       }}
       style={{ left: `${pin.x}%`, top: `${pin.y}%`, touchAction: draggable ? "none" : undefined }}
       className={`absolute z-10 -translate-x-1/2 -translate-y-full focus:outline-none ${
-        draggable ? "cursor-grab active:cursor-grabbing" : ""
+        draggable ? "cursor-pointer active:cursor-grabbing" : ""
       } ${isDragging ? "opacity-70" : ""}`}
-      title={`${pin.title} (${pin.angle ?? 0}°)${draggable ? " — ziehen zum Verschieben" : ""}`}
+      title={`${pin.title} (${pin.angle ?? 0}°)${draggable ? " — gedrückt halten zum Verschieben" : ""}`}
     >
       <span
         className="relative flex flex-col items-center drop-shadow-md"
@@ -8731,22 +8865,52 @@ function PlanNoteMarker({ note, draggable, isDragging, onClick, onDragStart, vie
   // Gegen-Skalierung analog zu PinMarker — die Notiz bleibt bei jedem Zoomfaktor
   // gleich groß lesbar, ihre Position (left/top in %) bleibt exakt am Plan verankert.
   const counterScale = 1 / (viewScale || 1);
+  // Long-Press-zum-Verschieben — exakt dasselbe Muster wie PinMarker oben (siehe
+  // dortige Kommentare), nur für Notizen statt Mängel-Pins.
+  const pressTimerRef = useRef(null);
+  const pressStartRef = useRef({ x: 0, y: 0 });
+  const pressFiredRef = useRef(false);
+  const clearPressTimer = () => {
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
   return (
     <button
       onPointerDown={(e) => {
-        if (!draggable) return;
         e.stopPropagation();
-        onDragStart(e);
+        if (!draggable) return;
+        pressFiredRef.current = false;
+        pressStartRef.current = { x: e.clientX, y: e.clientY };
+        clearPressTimer();
+        pressTimerRef.current = setTimeout(() => {
+          pressTimerRef.current = null;
+          pressFiredRef.current = true;
+          onDragStart(e);
+        }, LONG_PRESS_MS);
       }}
+      onPointerMove={(e) => {
+        if (!pressTimerRef.current) return;
+        const dx = e.clientX - pressStartRef.current.x;
+        const dy = e.clientY - pressStartRef.current.y;
+        if (Math.hypot(dx, dy) > FLOORPLAN_PAN_CLICK_THRESHOLD) clearPressTimer();
+      }}
+      onPointerUp={clearPressTimer}
+      onPointerLeave={clearPressTimer}
       onClick={(e) => {
         e.stopPropagation();
+        if (pressFiredRef.current) {
+          pressFiredRef.current = false;
+          return;
+        }
         onClick(note);
       }}
       style={{ left: `${note.x}%`, top: `${note.y}%`, touchAction: draggable ? "none" : undefined }}
       className={`absolute z-[8] -translate-x-1/2 -translate-y-1/2 focus:outline-none ${
-        draggable ? "cursor-grab active:cursor-grabbing" : ""
+        draggable ? "cursor-pointer active:cursor-grabbing" : ""
       } ${isDragging ? "opacity-70" : ""}`}
-      title={`${note.text}${draggable ? " — ziehen zum Verschieben" : ""}`}
+      title={`${note.text}${draggable ? " — gedrückt halten zum Verschieben" : ""}`}
     >
       <span
         className={`flex max-w-[38vw] items-center gap-1.5 rounded-lg border-2 px-2.5 py-1.5 shadow-md sm:max-w-[220px] ${c.bg} ${c.border} ${c.text}`}
@@ -8780,15 +8944,17 @@ function PinsAndNotesLayer({
   startNoteDrag,
   noteDragMovedRef,
   onNoteClick,
-  isEditMode = false,
 }) {
-  // Drag-&-Drop ist zusätzlich zur Anmeldung (session) an den Bearbeitungs-Modus
-  // gekoppelt (siehe isEditMode-Kommentar in FloorPlanView) — ist isEditMode aus,
-  // ist canDrag false und PinMarker/PlanNoteMarker brechen jeden Drag-Start bereits
-  // in ihrem eigenen onPointerDown-Handler ab (kein stopPropagation, das Event
-  // bubblet ungehindert zum Viewport hoch), Tippen/Klicken zum Öffnen bleibt davon
-  // unberührt, weil onClick unabhängig vom draggable-Zustand ausgelöst wird.
-  const canDrag = !!session && isEditMode;
+  // Verschieben ist ausschließlich an die Anmeldung (session) gekoppelt — WANN ein
+  // Drag tatsächlich beginnt, entscheiden PinMarker/PlanNoteMarker seit der
+  // Long-Press-Umstellung selbst (siehe LONG_PRESS_MS-Kommentar oben): ein kurzer
+  // Klick/Tap öffnet weiterhin sofort die Detailansicht, ein Long Press auf dem
+  // jeweiligen Marker startet das Verschieben. Der frühere separate "Pins
+  // verschieben"/"Positionen fixiert"-Umschalter (isEditMode) entfällt dadurch —
+  // dieselbe Schutzwirkung (kein versehentliches Verschieben beim Zoomen/Scrollen)
+  // übernimmt jetzt die Long-Press-Schwelle selbst, ohne einen zusätzlichen manuellen
+  // Modus-Wechsel zu verlangen.
+  const canDrag = !!session;
   return (
     <>
       {visiblePins.map((pin) => (
@@ -8908,20 +9074,9 @@ function FloorPlanView({
   const dragMovedRef = useRef(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
 
-  // Bearbeitungs-Modus (Edit Mode): standardmäßig AUS ("Positionen fixiert"), damit
-  // Pins/Notizen auf Mobilgeräten beim Zoomen/Verschieben mit zwei Fingern nicht
-  // versehentlich gegriffen werden — landet eine der beiden Pinch-Zoom-Berührungen
-  // exakt auf einem Pin, würde PinMarker/PlanNoteMarker sie sonst per stopPropagation()
-  // abfangen und in ein Pin-Verschieben statt in die Zoom-Geste des Viewports übersetzen
-  // (siehe handleViewportPointerDown/Move weiter unten). Erst ein bewusstes Umschalten
-  // auf "Pins verschieben" gibt das Drag-&-Drop wieder frei (siehe draggable-Prop in
-  // PinsAndNotesLayer). Tippen/Klicken zum Öffnen der Detailkarte bleibt in JEDEM
-  // Zustand uneingeschränkt möglich, weil der onClick-Handler unabhängig von draggable
-  // ausgelöst wird — nur der onPointerDown-basierte Drag-Start ist an isEditMode
-  // gekoppelt. Wird beim Wechsel der Grundrissskizze zurückgesetzt (siehe Effekt bei
-  // Zoom/Pan-Reset), damit man nie versehentlich im freigeschalteten Zustand auf einen
-  // anderen Plan wechselt.
-  const [isEditMode, setIsEditMode] = useState(false);
+  // Kompaktes Hilfe-Modal (siehe FloorPlanHelpModal) — ersetzt den früheren langen
+  // Fließtext-Hinweis über dem Grundriss durch einen einzigen Button neben dem Titel.
+  const [helpModalOpen, setHelpModalOpen] = useState(false);
 
   // Skizzen-Notizen (Plan Annotations) — eigener, vom Mängel-Pin-Modus getrennter
   // "Werkzeug"-Zustand: solange noteMode aktiv ist, legt ein Tap auf den Plan eine
@@ -8975,15 +9130,18 @@ function FloorPlanView({
   const panPointersRef = useRef(new Map());
   const panGestureRef = useRef(null); // { startX, startY, startTranslate, moved }
   const pinchGestureRef = useRef(null); // { startDistance, startScale, startTranslate }
+  // Long-Press-Timer für die Pin-/Notiz-Erstellung auf freier Fläche (siehe
+  // handleViewportPointerDown/-Move/-Up unten) sowie der zugehörige, kurz aufblitzende
+  // Fortschritts-Indikator an der Druckposition (viewport-lokale Pixel, NICHT die
+  // skalierte/verschobene Plan-"Bühne" — daher unabhängig von scale/translate).
+  const longPressTimerRef = useRef(null);
+  const [longPressPoint, setLongPressPoint] = useState(null);
 
   // Beim Wechsel der Grundrissskizze Zoom/Pan zurücksetzen, damit jede Skizze wieder
-  // in der ursprünglichen 100%-Ansicht startet. isEditMode wird bewusst mit
-  // zurückgesetzt (immer "Positionen fixiert" beim Öffnen einer Skizze) — sicherer
-  // Standardzustand statt eines versehentlich "mitgenommenen" freigeschalteten Modus.
+  // in der ursprünglichen 100%-Ansicht startet.
   useEffect(() => {
     setScale(1);
     setTranslate({ x: 0, y: 0 });
-    setIsEditMode(false);
   }, [plan?.id]);
 
   // Math.max(..., 0.0001) verhindert rein defensiv eine Division durch 0 in
@@ -9229,15 +9387,25 @@ function FloorPlanView({
   // Zentrale Pointer-Verwaltung des Viewports: unterscheidet strikt zwischen (a)
   // dem Verschieben eines bestehenden Pins (draggingPinId gesetzt — hat immer
   // Vorrang), (b) Ein- oder Zwei-Finger-Pan/Pinch-Zoom der Ansicht und (c) einem
-  // kurzen Tap/Klick zum Setzen eines neuen Pins. Ein neuer Pin wird ausschließlich
-  // dann gesetzt, wenn sich der Pointer beim Loslassen um nicht mehr als
-  // FLOORPLAN_PAN_CLICK_THRESHOLD Pixel bewegt hat — bei jeder größeren Verschiebung
-  // (Pan) wird bewusst KEIN Pin erstellt.
+  // Long Press auf freier Fläche zum Setzen eines neuen Pins/einer neuen Notiz. Ein
+  // kurzer Tap/Klick auf den Hintergrund löst seit der Long-Press-Umstellung
+  // ausdrücklich NICHTS mehr aus (dient ausschließlich dem Zoomen/Verschieben der
+  // Ansicht) — die eigentliche Erstellung erfolgt ausschließlich über
+  // longPressTimerRef unten, sobald der Grundriss mindestens LONG_PRESS_MS
+  // ohne nennenswerte Bewegung gedrückt gehalten wurde.
   // -----------------------------------------------------------------------------
 
+  const clearLongPressTimer = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+    setLongPressPoint(null);
+  };
+
   const handleViewportPointerDown = (e) => {
-    // PinMarker/PlanNoteMarker rufen bei eigenem Pointerdown stopPropagation() auf —
-    // hier kommen also ausschließlich Pointer an, die den Grundriss selbst
+    // PinMarker/PlanNoteMarker rufen bei eigenem Pointerdown IMMER stopPropagation()
+    // auf — hier kommen also ausschließlich Pointer an, die den Grundriss selbst
     // (Hintergrund) treffen.
     if (busyCreating) return;
     panPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -9250,6 +9418,29 @@ function FloorPlanView({
         moved: false,
       };
       setIsPanningActive(true);
+      // Long-Press-Timer für Pin-/Notiz-Erstellung starten — nur bei genau einem
+      // aktiven Finger/Zeiger. Feuert der Timer, OHNE dass der Pointer zwischenzeitlich
+      // losgelassen, über die Toleranzschwelle bewegt oder durch einen zweiten Finger
+      // (Pinch) unterbrochen wurde, gilt der Long Press als abgeschlossen und legt
+      // sofort einen neuen Pin bzw. (im Notiz-Modus) eine neue Notiz an. Ein
+      // Loslassen VOR Ablauf des Timers (siehe handleViewportPointerUp) bricht ihn
+      // ersatzlos ab — ein kurzer Tap tut dann bewusst nichts.
+      const viewportEl = viewportRef.current;
+      if (viewportEl) {
+        const rect = viewportEl.getBoundingClientRect();
+        setLongPressPoint({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+      }
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = setTimeout(() => {
+        longPressTimerRef.current = null;
+        setLongPressPoint(null);
+        const gesture = panGestureRef.current;
+        if (!gesture || gesture.moved || panPointersRef.current.size !== 1 || busyCreating) return;
+        const pos = posFromEvent(e);
+        if (!pos) return;
+        if (noteMode) onAddNote(pos.x, pos.y);
+        else onPlanClick(pos.x, pos.y);
+      }, LONG_PRESS_MS);
     } else if (panPointersRef.current.size === 2) {
       const points = Array.from(panPointersRef.current.values());
       pinchGestureRef.current = {
@@ -9257,7 +9448,8 @@ function FloorPlanView({
         startScale: scale,
         startTranslate: { ...translate },
       };
-      if (panGestureRef.current) panGestureRef.current.moved = true; // Pinch zählt nie als Tap
+      if (panGestureRef.current) panGestureRef.current.moved = true; // Pinch zählt nie als Tap/Long Press
+      clearLongPressTimer();
     }
   };
 
@@ -9282,6 +9474,7 @@ function FloorPlanView({
     panPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (panPointersRef.current.size >= 2 && pinchGestureRef.current) {
+      clearLongPressTimer();
       const points = Array.from(panPointersRef.current.values()).slice(0, 2);
       const newDistance = distanceBetween(points[0], points[1]) || 1;
       const mid = midpointOf(points[0], points[1]);
@@ -9304,6 +9497,9 @@ function FloorPlanView({
     const dy = e.clientY - gesture.startY;
     if (!gesture.moved && Math.hypot(dx, dy) > FLOORPLAN_PAN_CLICK_THRESHOLD) {
       gesture.moved = true;
+      // Nennenswerte Bewegung vor Ablauf des Long Press: eindeutig ein Pan-/Scroll-
+      // Versuch, kein Long Press — Timer verwerfen, keine Pin-/Notiz-Erstellung.
+      clearLongPressTimer();
     }
     if (gesture.moved) {
       // Reines Verschieben ohne Zoomänderung — Ziel- und "aktuell gerenderte" Skalierung
@@ -9322,7 +9518,6 @@ function FloorPlanView({
       return;
     }
 
-    const wasBackgroundPointer = panPointersRef.current.has(e.pointerId);
     panPointersRef.current.delete(e.pointerId);
 
     if (panPointersRef.current.size < 2) {
@@ -9331,18 +9526,11 @@ function FloorPlanView({
 
     if (panPointersRef.current.size === 0) {
       setIsPanningActive(false);
-      const gesture = panGestureRef.current;
       panGestureRef.current = null;
-      if (wasBackgroundPointer && gesture && !gesture.moved && !busyCreating) {
-        // Kurzer Tap/Klick ohne nennenswerte Bewegung (≤ 5px): je nach aktivem
-        // Werkzeug entweder eine neue Notiz (Notiz-Modus) oder einen neuen Pin an
-        // der exakten Position setzen.
-        const pos = posFromEvent(e);
-        if (pos) {
-          if (noteMode) onAddNote(pos.x, pos.y);
-          else onPlanClick(pos.x, pos.y);
-        }
-      }
+      // Ein Loslassen VOR Ablauf des Long-Press-Timers (siehe handleViewportPointerDown)
+      // verwirft ihn ersatzlos — ein kurzer Tap/Klick auf freier Fläche setzt bewusst
+      // KEINEN Pin mehr (dient nur noch dem Zoomen/Verschieben der Ansicht).
+      clearLongPressTimer();
     }
   };
 
@@ -9383,6 +9571,17 @@ function FloorPlanView({
   if (activeFilterTradeNames.length > 0) filterSummaryParts.push(`Gewerk ${activeFilterTradeNames.join(", ")}`);
   if (searchQuery.trim()) filterSummaryParts.push(`Suche "${searchQuery.trim()}"`);
   const filterSummary = filterSummaryParts.length > 0 ? filterSummaryParts.join(" · ") : null;
+  // Gewerke-Nachschlage für die kompakte Pin-Liste unter dem Grundriss (siehe unten) —
+  // bewusst ALLE Gewerke (nicht nur activeTrades), damit ein Pin mit einem inzwischen
+  // deaktivierten Gewerk in der Liste trotzdem den ursprünglichen Namen zeigt statt
+  // "Kein Gewerk".
+  const tradesById = new Map((trades || []).map((t) => [t.id, t]));
+  // Kompakte Pin-Liste unter dem Grundriss: dieselbe Teilmenge wie auf dem Plan
+  // markiert (visiblePins, respektiert also die Filter-/Suchleiste direkt darüber),
+  // aber in fester Nummern-Reihenfolge sortiert statt in Roh-Ladereihenfolge.
+  const sortedListPins = [...visiblePins].sort(
+    (a, b) => (pinNumberById.get(a.id) || 0) - (pinNumberById.get(b.id) || 0)
+  );
 
   // Die drei Status-Zähler zeigen bewusst die Gesamtzahlen ALLER Pins dieser
   // Skizze (unabhängig von der Filter-/Suchleiste) — die gefilterte Trefferzahl
@@ -9414,24 +9613,21 @@ function FloorPlanView({
             <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{plan.name}</h1>
             {isCad && <CadBadge ext={fileExt} />}
             {isSvg && <VectorPlanBadge />}
+            {/* Ersetzt den früheren langen Fließtext-Hinweis über dem Grundriss (siehe
+                FloorPlanHelpModal weiter unten) — direkt neben dem Titel der
+                Grundrissskizze, wie angefordert. */}
+            <button
+              type="button"
+              onClick={() => setHelpModalOpen(true)}
+              title="Bedienungshinweise anzeigen"
+              className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-500 shadow-sm transition hover:border-[#FF2A00] hover:text-[#FF2A00]"
+            >
+              <HelpCircle size={13} /> Hilfe
+            </button>
           </div>
-          <p className="text-sm text-slate-500">
-            {creatingPin
-              ? "Pin wird angelegt…"
-              : creatingNote
-              ? "Notiz wird platziert…"
-              : noteMode
-              ? `Notiz-Modus aktiv: Auf den Plan tippen, um eine Notiz zu platzieren.${
-                  isEditMode ? " Bestehende Notizen lassen sich per Ziehen verschieben." : " Positionen sind fixiert — zum Verschieben bestehender Notizen \"Pins verschieben\" aktivieren."
-                }`
-              : session
-              ? `Auf den Grundriss tippen, um einen neuen Pin zu setzen.${
-                  isEditMode
-                    ? " Bestehende Pins lassen sich per Ziehen verschieben."
-                    : " Positionen sind fixiert — zum Verschieben bestehender Pins \"Pins verschieben\" aktivieren, praktisch beim Zoomen mit zwei Fingern auf dem Handy."
-                } Mit dem Mausrad, per Zwei-Finger-Geste oder über die Zoom-Buttons lässt sich der Plan stufenlos vergrößern und verschieben.`
-              : "Nur Ansicht — zum Setzen oder Verschieben von Pins bitte anmelden. Zoomen und Verschieben des Grundrisses ist auch ohne Anmeldung möglich."}
-          </p>
+          {(creatingPin || creatingNote) && (
+            <p className="text-sm text-slate-500">{creatingPin ? "Pin wird angelegt…" : "Notiz wird platziert…"}</p>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
           <span className="inline-flex items-center gap-1.5 rounded-full bg-red-50 px-2.5 py-1 text-red-700 ring-1 ring-inset ring-red-200">
@@ -9446,26 +9642,8 @@ function FloorPlanView({
           {session && (
             <button
               type="button"
-              onClick={() => setIsEditMode((v) => !v)}
-              title={
-                isEditMode
-                  ? "Pins/Notizen sind entsperrt — per Ziehen verschiebbar. Klicken, um wieder zu fixieren."
-                  : "Pins/Notizen sind fixiert — Zoomen/Verschieben mit zwei Fingern kann sie nicht versehentlich verschieben. Klicken, um das Verschieben freizugeben."
-              }
-              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-semibold shadow-sm transition ${
-                isEditMode
-                  ? "bg-[#FF2A00] text-white hover:bg-[#E02400]"
-                  : "border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-              }`}
-            >
-              {isEditMode ? "✏️ Pins verschieben" : "🔒 Positionen fixiert"}
-            </button>
-          )}
-          {session && (
-            <button
-              type="button"
               onClick={() => setNoteMode((v) => !v)}
-              title="Notiz-Modus: nächster Klick auf den Plan platziert eine Notiz statt eines Pins"
+              title="Notiz-Modus: nächster Long Press auf den Plan platziert eine Notiz statt eines Pins"
               className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-semibold shadow-sm transition ${
                 noteMode ? "bg-amber-500 text-white hover:bg-amber-600" : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
               }`}
@@ -9671,7 +9849,6 @@ function FloorPlanView({
                       startNoteDrag={startNoteDrag}
                       noteDragMovedRef={noteDragMovedRef}
                       onNoteClick={onNoteClick}
-                      isEditMode={isEditMode}
                     />
                   </>
                 )}
@@ -9701,7 +9878,6 @@ function FloorPlanView({
                       startNoteDrag={startNoteDrag}
                       noteDragMovedRef={noteDragMovedRef}
                       onNoteClick={onNoteClick}
-                      isEditMode={isEditMode}
                     />
                   </PlanSvgStage>
                 )}
@@ -9731,11 +9907,26 @@ function FloorPlanView({
                       startNoteDrag={startNoteDrag}
                       noteDragMovedRef={noteDragMovedRef}
                       onNoteClick={onNoteClick}
-                      isEditMode={isEditMode}
                     />
                   </>
                 )}
               </div>
+
+              {/* Long-Press-Fortschrittsanzeige (siehe handleViewportPointerDown/
+                  LONG_PRESS_MS): kurzer, sich ausbreitender Ring an der Druckposition,
+                  solange der Long Press zum Anlegen eines neuen Pins/einer neuen Notiz
+                  läuft — bewusst außerhalb von contentRef platziert (viewport-lokale
+                  Pixelkoordinaten, unbeeinflusst von der Zoom-/Pan-Transformation der
+                  Plan-"Bühne"). Farbe folgt dem aktiven Werkzeug (Notiz-Modus = Amber,
+                  sonst Markenrot, wie MapPin/StickyNote an anderer Stelle). */}
+              {longPressPoint && (
+                <div
+                  className={`pointer-events-none absolute z-30 h-11 w-11 -translate-x-1/2 -translate-y-1/2 animate-ping rounded-full border-2 ${
+                    noteMode ? "border-amber-400" : "border-[#FF2A00]"
+                  }`}
+                  style={{ left: longPressPoint.x, top: longPressPoint.y }}
+                />
+              )}
             </div>
 
             {/* Zoom-Steuerung: Mausrad, Pinch-Geste (Touch) und diese Buttons sind
@@ -9777,6 +9968,145 @@ function FloorPlanView({
             </div>
           </>
         )}
+      </div>
+
+      {/* Kompakte Pin-Liste unter dem Grundriss (Anforderung: Pin-Nummer, Titel/Gewerk,
+          Status, Anzahl To-dos — bewusst OHNE Fotos). Zeigt dieselbe, ggf. gefilterte
+          Teilmenge wie die Marker auf dem Plan direkt darüber (visiblePins) und bleibt
+          damit konsistent mit der Filter-/Suchleiste; Klick auf eine Zeile öffnet
+          denselben Pin wie ein Klick auf den Marker. Innerhalb einer eigenen,
+          scrollbaren Box (max-h-72) begrenzt, damit die Seite bei sehr vielen Pins
+          nicht unbegrenzt in die Länge wächst. */}
+      <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+        <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5">
+          <span className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">
+            <Table size={13} className="text-slate-400" /> Pins auf dieser Skizze
+          </span>
+          <span className="text-xs font-medium text-slate-400">
+            {hasActivePinFilters ? `${visiblePins.length} von ${pins.length}` : pins.length}
+          </span>
+        </div>
+        {sortedListPins.length === 0 ? (
+          <p className="px-4 py-6 text-center text-sm text-slate-400">
+            {pins.length === 0 ? "Noch keine Pins auf dieser Skizze." : "Kein Pin entspricht der aktuellen Filterung."}
+          </p>
+        ) : (
+          <div className="max-h-72 divide-y divide-slate-100 overflow-y-auto">
+            {sortedListPins.map((pin) => {
+              const s = STATUS[pin.status];
+              const todos = pin.pin_todos || [];
+              const todosDone = todos.filter((t) => t.completed).length;
+              return (
+                <button
+                  key={pin.id}
+                  type="button"
+                  onClick={() => onPinClick(pin)}
+                  className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition hover:bg-slate-50"
+                >
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-100 text-[11px] font-bold text-slate-500">
+                    {pinNumberById.get(pin.id)}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-semibold text-slate-800">{pin.title}</span>
+                    <span className="block truncate text-xs text-slate-400">
+                      {tradesById.get(pin.trade_id)?.name || "Kein Gewerk"}
+                    </span>
+                  </span>
+                  <span
+                    className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${s.bg} ${s.text}`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${s.dot}`} /> {s.label}
+                  </span>
+                  <span className="w-16 shrink-0 text-right text-[11px] font-medium text-slate-400">
+                    {todos.length > 0 ? `${todosDone}/${todos.length} To-do` : "–"}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {helpModalOpen && (
+        <FloorPlanHelpModal session={session} noteMode={noteMode} onClose={() => setHelpModalOpen(false)} />
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// GRUNDRISS-HILFE — kompaktes Modal, ersetzt den früheren Fließtext-Hinweis über dem
+// Grundriss (siehe "Hilfe"-Button in FloorPlanView) durch eine explizit aufrufbare,
+// übersichtliche Bedienungsanleitung für die Long-Press-Gesten.
+// ----------------------------------------------------------------------------------
+function FloorPlanHelpModal({ session, noteMode, onClose }) {
+  const items = [
+    {
+      icon: MapPin,
+      title: "Grundriss gedrückt halten",
+      text: "= neuen Mängel-Pin setzen (bzw. im Notiz-Modus eine neue Notiz platzieren).",
+    },
+    {
+      icon: Move,
+      title: "Pin oder Notiz gedrückt halten",
+      text: "= Verschieben aktivieren — anschließend an die gewünschte Stelle ziehen.",
+    },
+    {
+      icon: Crosshair,
+      title: "Kurzer Klick/Tipp auf einen Pin",
+      text: "= Details öffnen und bearbeiten (Fotos, Aufgaben, Status, Verlauf).",
+    },
+    {
+      icon: Navigation,
+      title: "Kurzer Klick/Tipp auf freie Fläche",
+      text: "= nichts weiter — dient ausschließlich dem Zoomen/Verschieben der Ansicht, legt keinen Pin an.",
+    },
+    {
+      icon: ZoomIn,
+      title: "Mausrad, Zwei-Finger-Geste oder Zoom-Buttons",
+      text: "= Grundriss stufenlos vergrößern/verkleinern (max. 200 %, min. 50 %).",
+    },
+  ];
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-[70]`}>
+      <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-2xl sm:rounded-2xl">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <HelpCircle size={18} className="text-[#FF2A00]" />
+            <h3 className="text-base font-bold text-slate-900">Bedienung der Grundrissskizze</h3>
+          </div>
+          <button onClick={onClose} className={MODAL_CLOSE_BTN}>
+            <X size={20} />
+          </button>
+        </div>
+        <ul className="space-y-3">
+          {items.map((item) => (
+            <li key={item.title} className="flex items-start gap-3">
+              <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-50 text-[#FF2A00]">
+                <item.icon size={14} />
+              </span>
+              <p className="text-sm leading-snug text-slate-600">
+                <span className="font-semibold text-slate-900">{item.title}</span> {item.text}
+              </p>
+            </li>
+          ))}
+        </ul>
+        {noteMode && (
+          <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
+            Notiz-Modus ist gerade aktiv: ein Long Press auf dem Plan platziert aktuell eine Notiz statt eines Mängel-Pins.
+          </p>
+        )}
+        {!session && (
+          <p className="mt-4 rounded-lg bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500 ring-1 ring-inset ring-slate-200">
+            Nur Ansicht — zum Setzen oder Verschieben von Pins bitte anmelden. Zoomen und Verschieben des Grundrisses ist auch ohne Anmeldung möglich.
+          </p>
+        )}
+        <button
+          onClick={onClose}
+          className="mt-5 w-full rounded-lg bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-200"
+        >
+          Verstanden
+        </button>
       </div>
     </div>
   );
@@ -10482,6 +10812,11 @@ function PinModal({
   const [lightboxSrc, setLightboxSrc] = useState(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Sicherheitsabfrage vor dem endgültigen Löschen eines Pins (siehe handleDeleteClick
+  // unten) — vorher gab es einen "Löschen"-Button ohne jede Bestätigung, ein
+  // versehentlicher Klick hätte den Pin samt aller Fotos/To-dos/Verlauf sofort und
+  // unwiderruflich entfernt.
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [uploadingPhotos, setUploadingPhotos] = useState(false);
   const [todoBusy, setTodoBusy] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
@@ -10492,23 +10827,6 @@ function PinModal({
   const update = (field, value) => {
     if (readOnly) return;
     setDraft((d) => ({ ...d, [field]: value }));
-  };
-
-  // Vorlagen-Katalog (siehe QUICK_DEFECT_TEMPLATES/resolveTradeIdByName oben): befüllt
-  // Titel/Gewerk/Priorität/Beschreibung in EINEM setDraft-Aufruf, damit die vier Felder
-  // atomar zusammen wechseln statt über vier einzelne update()-Aufrufe. Nur bei neu
-  // angelegten Pins sichtbar (siehe isNew-Guard unten im Markup) — bei einem bereits
-  // gespeicherten Pin würde eine Vorlage bestehende, ggf. schon dokumentierte Angaben
-  // stillschweigend überschreiben.
-  const applyTemplate = (tpl) => {
-    if (readOnly || !isNew) return;
-    setDraft((d) => ({
-      ...d,
-      title: tpl.title,
-      description: tpl.description,
-      priority: tpl.priority,
-      trade_id: resolveTradeIdByName(trades, tpl.tradeName),
-    }));
   };
 
   // "Mangel duplizieren" (siehe onDuplicate/handleDuplicatePin in App): übernimmt die
@@ -10564,13 +10882,23 @@ function PinModal({
     }
   };
 
-  const handleDeleteClick = async () => {
+  // Öffnet nur noch die Sicherheitsabfrage (siehe deleteConfirmOpen oben) — die
+  // eigentliche, unwiderrufliche Löschung passiert erst in handleConfirmDelete unten,
+  // nach expliziter Bestätigung im ConfirmDialog.
+  const handleDeleteClick = () => {
     if (readOnly) return;
+    setDeleteConfirmOpen(true);
+  };
+
+  const handleConfirmDelete = async () => {
     setDeleting(true);
     try {
       await onDelete();
+      // Bei Erfolg schließt der Aufrufer (App) bereits das gesamte Pin-Modal — ein
+      // separates Schließen von deleteConfirmOpen ist dann nicht mehr nötig.
     } catch {
       setDeleting(false);
+      setDeleteConfirmOpen(false);
     }
   };
 
@@ -10584,7 +10912,11 @@ function PinModal({
     setExportPdfError("");
     setExportingPdf(true);
     try {
-      await generateSinglePinPdf({ project, floor, plan, pin, exportNumber: pinNumber, trades, generatedBy });
+      // allPins (alle Pins DIESER Grundrissskizze, siehe pins-Prop) versorgt die
+      // Übersichts-Minimap im Einzel-Export mit den übrigen Pins zur
+      // Kontext-Orientierung (siehe Kommentar in generateSinglePinPdf) — nicht nur den
+      // gerade exportierten.
+      await generateSinglePinPdf({ project, floor, plan, pin, exportNumber: pinNumber, trades, generatedBy, allPins: pins });
     } catch (err) {
       console.error("Einzel-PDF-Export fehlgeschlagen:", err);
       setExportPdfError("Export fehlgeschlagen.");
@@ -10671,34 +11003,6 @@ function PinModal({
 
         {/* Body */}
         <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
-          {/* Vorlagen-Katalog (Quick Templates) — ausschließlich bei neu angelegten Pins,
-              bewusst ganz oben im Modal, noch vor Status/Priorität: die Vorlage bestimmt
-              typischerweise als Erstes, worum es überhaupt geht, alle anderen Felder
-              darunter füllen sich danach von selbst bzw. lassen sich im Anschluss noch
-              gezielt anpassen. */}
-          {isNew && !readOnly && (
-            <div>
-              <FieldLabel>
-                <span className="inline-flex items-center gap-1.5">
-                  <LayoutList size={12} /> Vorlage für wiederkehrenden Mangel (optional)
-                </span>
-              </FieldLabel>
-              <div className="flex flex-wrap gap-1.5">
-                {QUICK_DEFECT_TEMPLATES.map((tpl) => (
-                  <button
-                    key={tpl.title}
-                    type="button"
-                    onClick={() => applyTemplate(tpl)}
-                    title={`Gewerk: ${tpl.tradeName} · Priorität: ${PRIORITY[tpl.priority]?.label || tpl.priority}`}
-                    className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:border-[#FF2A00] hover:bg-red-50 hover:text-[#FF2A00]"
-                  >
-                    {tpl.title}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
           {/* Status & Priority */}
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -11033,6 +11337,20 @@ function PinModal({
             await onSaveMarkup(markupPhoto, dataUrl);
             setMarkupPhoto(null);
           }}
+        />
+      )}
+
+      {/* Sicherheitsabfrage vor dem endgültigen Löschen (siehe handleDeleteClick/
+          handleConfirmDelete oben) — entfernt den Pin samt aller Fotos, To-dos und der
+          Bearbeitungshistorie unwiderruflich, daher erst nach expliziter Bestätigung. */}
+      {deleteConfirmOpen && (
+        <ConfirmDialog
+          title="Pin löschen"
+          message={`„${pin.title || "Ohne Titel"}" wird endgültig gelöscht — inklusive aller Fotos, Aufgaben und der Bearbeitungshistorie. Das kann nicht rückgängig gemacht werden.`}
+          confirmLabel="Endgültig löschen"
+          busy={deleting}
+          onCancel={() => setDeleteConfirmOpen(false)}
+          onConfirm={handleConfirmDelete}
         />
       )}
     </div>
