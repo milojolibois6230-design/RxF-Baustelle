@@ -3685,6 +3685,60 @@ async function deleteUser(userId) {
 //      supabase_schema_v15_admin_invite_system.sql) — sobald sich die Person zum
 //      ersten Mal erfolgreich anmeldet, verknüpft currentAppUser (siehe App()) das
 //      Profil automatisch über die E-Mail-Adresse, ohne weiteres Zutun.
+// ----------------------------------------------------------------------------------
+// DIREKTER EINLADUNGS-LINK — Fallback bei SMTP-Timeouts (HTTP 504)
+// ----------------------------------------------------------------------------------
+// supabase.auth.admin.generateLink() ist wie supabase.auth.admin.inviteUserByEmail()
+// weiter oben eine Admin-API und benötigt zwingend den Service-Role-Key — der darf
+// aus genau demselben Grund niemals im Browser-Bundle landen (siehe Kommentar an
+// inviteUserToApp unten). Der einzige sichere Weg, diese Funktion dennoch von der
+// App aus nutzbar zu machen, ist eine serverseitige Supabase Edge Function, die den
+// Service-Role-Key ausschließlich serverseitig hält und selbst prüft, dass nur ein
+// angemeldeter Administrator sie aufrufen darf — siehe
+// supabase/functions/generate-invite-link/index.ts (liegt dieser Antwort bei) sowie
+// die Einordnung für die Begründung und die einmalige Deploy-Anleitung
+// (`supabase functions deploy generate-invite-link`). Ohne deployte Funktion wirft
+// dieser Aufruf einen Fehler — das Einladungssystem bleibt dann exakt so nutzbar wie
+// zuvor (normaler E-Mail-Versand über resetPasswordForEmail), nur der Link-Fallback
+// fehlt dann.
+async function requestDirectInviteLink(email) {
+  const { data, error } = await supabase.functions.invoke("generate-invite-link", {
+    body: { email },
+  });
+  if (error) throw error;
+  if (!data?.link) throw new Error("Es wurde kein Einladungslink zurückgegeben.");
+  return data.link;
+}
+
+// Versendet die eigentliche Einladungs-/Erinnerungs-E-Mail über Supabases
+// eingebauten "Passwort zurücksetzen"-Versand (SMTP-abhängig — siehe
+// inviteUserToApp/resendUserInvite unten) mit einem Zeitlimit ab. Schlägt der
+// Versand fehl (Zeitlimit erreicht ODER ein von Supabase gemeldeter SMTP-/504-
+// artiger Fehler), wird NICHT stillschweigend aufgegeben, sondern automatisch der
+// oben beschriebene direkte, kopierbare Link erzeugt — der Administrator kann die
+// Einladung dann manuell weitergeben (z.B. per Chat), auch wenn der serverseitige
+// Mail-Versand gerade nicht funktioniert.
+async function sendInviteEmailOrFallbackLink(normalizedEmail) {
+  try {
+    const { error } = await withTimeout(
+      inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
+        redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
+      }),
+      12000,
+      "Einladungs-Mailversand"
+    );
+    if (error) throw error;
+    return { directLink: null };
+  } catch (err) {
+    console.warn(
+      "Einladungs-Mailversand fehlgeschlagen (Zeitlimit/SMTP-Fehler), erzeuge stattdessen einen direkten Link:",
+      err
+    );
+    const directLink = await requestDirectInviteLink(normalizedEmail);
+    return { directLink };
+  }
+}
+
 async function inviteUserToApp({ email, name, kuerzel, role, projectIds, actor }) {
   const normalizedEmail = email.trim().toLowerCase();
   const throwawayPassword = `${crypto.randomUUID()}${crypto.randomUUID()}`;
@@ -3696,15 +3750,12 @@ async function inviteUserToApp({ email, name, kuerzel, role, projectIds, actor }
   // "User already registered" ist hier KEIN Fehlerfall, sondern der erwartete Weg für
   // eine Einladung an eine E-Mail-Adresse, für die bereits ein Auth-Konto existiert
   // (z.B. erneuter Einladungsversand nach abgelaufenem Link) — in dem Fall wird kein
-  // zweites Konto angelegt, es geht direkt mit dem Reset-Mail-Versand weiter.
+  // zweites Konto angelegt, es geht direkt mit dem Mail-/Link-Versand weiter.
   if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
     throw signUpError;
   }
 
-  const { error: resetError } = await inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
-    redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
-  });
-  if (resetError) throw resetError;
+  const { directLink } = await sendInviteEmailOrFallbackLink(normalizedEmail);
 
   const payload = {
     name: name?.trim() || normalizedEmail,
@@ -3720,12 +3771,12 @@ async function inviteUserToApp({ email, name, kuerzel, role, projectIds, actor }
   };
   const { data, error } = await supabase.from("app_users").insert(payload).select().single();
   if (error) throw error;
-  return data;
+  return { profile: data, directLink };
 }
 
 // "Einladung erneut senden" für ein bereits bestehendes app_users-Profil mit
 // invite_status "eingeladen" (siehe UsersAdminModal) — wiederholt ausschließlich den
-// signUp()/resetPasswordForEmail()-Versand aus inviteUserToApp oben, OHNE ein neues
+// signUp()/Mail-bzw.-Link-Versand aus inviteUserToApp oben, OHNE ein neues
 // app_users-Profil anzulegen (das existiert ja bereits).
 async function resendUserInvite(email) {
   const normalizedEmail = email.trim().toLowerCase();
@@ -3736,10 +3787,7 @@ async function resendUserInvite(email) {
   if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
     throw signUpError;
   }
-  const { error: resetError } = await inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
-    redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
-  });
-  if (resetError) throw resetError;
+  return await sendInviteEmailOrFallbackLink(normalizedEmail);
 }
 
 // ----------------------------------------------------------------------------------
@@ -5892,6 +5940,12 @@ function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
   const [projectIds, setProjectIds] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  // Gesetzt, sobald der E-Mail-Versand fehlgeschlagen ist (Zeitlimit/SMTP-Fehler,
+  // siehe sendInviteEmailOrFallbackLink) und stattdessen ein direkter Link erzeugt
+  // wurde (Abschnitt 1) — in diesem Fall bleibt das Modal offen und zeigt den Link
+  // mit Kopieren-Button an, statt sich wie im E-Mail-Erfolgsfall sofort zu schließen.
+  const [directLink, setDirectLink] = useState(null);
+  const [copied, setCopied] = useState(false);
 
   const toggleProject = (projectId) => {
     setProjectIds((prev) => (prev.includes(projectId) ? prev.filter((id) => id !== projectId) : [...prev, projectId]));
@@ -5910,13 +5964,28 @@ function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
     setError("");
     setSubmitting(true);
     try {
-      await onInvite({ name: name.trim(), email: normalizedEmail, role, projectIds });
-      // Bei Erfolg schließt der Aufrufer (UsersAdminModal) das Formular selbst.
+      const result = await onInvite({ name: name.trim(), email: normalizedEmail, role, projectIds });
+      if (result?.directLink) {
+        setDirectLink(result.directLink);
+      } else {
+        onClose();
+      }
     } catch (err) {
       console.error("Einladung konnte nicht versendet werden:", err);
       setError(err?.message || "Die Einladung konnte nicht versendet werden. Bitte erneut versuchen.");
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleCopyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(directLink);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2500);
+    } catch (err) {
+      console.error("Link konnte nicht in die Zwischenablage kopiert werden:", err);
+      setError("Der Link konnte nicht automatisch kopiert werden — bitte manuell markieren und kopieren.");
     }
   };
 
@@ -5926,86 +5995,122 @@ function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
         <div className={MODAL_HEADER_ROW}>
           <div>
             <p className={MODAL_EYEBROW}>Einladungssystem</p>
-            <h2 className="text-lg font-bold text-slate-900">Benutzer einladen</h2>
+            <h2 className="text-lg font-bold text-slate-900">{directLink ? "Direkter Einladungslink" : "Benutzer einladen"}</h2>
           </div>
           <button onClick={onClose} disabled={submitting} className={MODAL_CLOSE_BTN_DISABLED}>
             <X size={20} />
           </button>
         </div>
 
-        <div className={MODAL_BODY_SCROLL}>
-          <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs leading-relaxed text-slate-500">
-            Es wird ein Konto für diese E-Mail-Adresse angelegt und ein Link zum Festlegen eines eigenen Passworts per
-            E-Mail versendet. Rolle und Projektzuordnung gelten sofort ab der ersten Anmeldung.
-          </p>
-          <div>
-            <FieldLabel>Name</FieldLabel>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              disabled={submitting}
-              placeholder="Vor- und Nachname"
-              className={TEXT_INPUT_CLASS}
-            />
-          </div>
-          <div>
-            <FieldLabel>E-Mail-Adresse</FieldLabel>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={submitting}
-              placeholder="name@firma.de"
-              className={TEXT_INPUT_CLASS}
-            />
-          </div>
-          <div>
-            <FieldLabel>Rolle</FieldLabel>
-            <select
-              value={role}
-              onChange={(e) => setRole(e.target.value)}
-              disabled={submitting}
-              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
-            >
-              {USER_ROLES.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </select>
-            <p className="mt-1 text-[11px] text-slate-400">{ROLE_META[role]?.description}</p>
-          </div>
-          <div>
-            <FieldLabel>Projektzuordnung</FieldLabel>
-            <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2">
-              {projects.map((p) => (
-                <label
-                  key={p.id}
-                  className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
-                >
-                  <input
-                    type="checkbox"
-                    checked={projectIds.includes(p.id)}
-                    onChange={() => toggleProject(p.id)}
-                    disabled={submitting}
-                    className="h-3.5 w-3.5 accent-[#FF2A00]"
-                  />
-                  {p.name}
-                </label>
-              ))}
-              {projects.length === 0 && <p className="px-2 py-1.5 text-xs text-slate-400">Noch keine Projekte vorhanden.</p>}
+        {directLink ? (
+          <div className={MODAL_BODY_SCROLL}>
+            <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-800">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <span>
+                Die Einladungs-E-Mail konnte gerade nicht versendet werden (Zeitlimit/SMTP nicht erreichbar). Das
+                Benutzerprofil wurde trotzdem angelegt — bitte den folgenden Link stattdessen manuell an{" "}
+                <strong>{email.trim() || "die eingeladene Person"}</strong> weitergeben.
+              </span>
             </div>
+            <div>
+              <FieldLabel>Einladungslink</FieldLabel>
+              <div className="flex items-center gap-2">
+                <input readOnly value={directLink} onFocus={(e) => e.target.select()} className={`${TEXT_INPUT_CLASS} font-mono text-xs`} />
+                <button
+                  onClick={handleCopyLink}
+                  title="In Zwischenablage kopieren"
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-slate-900"
+                >
+                  {copied ? <Check size={14} /> : <Copy size={14} />} {copied ? "Kopiert" : "Kopieren"}
+                </button>
+              </div>
+            </div>
+            {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
           </div>
-          {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
-        </div>
+        ) : (
+          <div className={MODAL_BODY_SCROLL}>
+            <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs leading-relaxed text-slate-500">
+              Es wird ein Konto für diese E-Mail-Adresse angelegt und ein Link zum Festlegen eines eigenen Passworts per
+              E-Mail versendet. Rolle und Projektzuordnung gelten sofort ab der ersten Anmeldung. Ist der Mail-Versand
+              gerade nicht erreichbar, wird automatisch stattdessen ein direkter, kopierbarer Link erzeugt.
+            </p>
+            <div>
+              <FieldLabel>Name</FieldLabel>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={submitting}
+                placeholder="Vor- und Nachname"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+            <div>
+              <FieldLabel>E-Mail-Adresse</FieldLabel>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={submitting}
+                placeholder="name@firma.de"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+            <div>
+              <FieldLabel>Rolle</FieldLabel>
+              <select
+                value={role}
+                onChange={(e) => setRole(e.target.value)}
+                disabled={submitting}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+              >
+                {USER_ROLES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[11px] text-slate-400">{ROLE_META[role]?.description}</p>
+            </div>
+            <div>
+              <FieldLabel>Projektzuordnung</FieldLabel>
+              <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2">
+                {projects.map((p) => (
+                  <label
+                    key={p.id}
+                    className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={projectIds.includes(p.id)}
+                      onChange={() => toggleProject(p.id)}
+                      disabled={submitting}
+                      className="h-3.5 w-3.5 accent-[#FF2A00]"
+                    />
+                    {p.name}
+                  </label>
+                ))}
+                {projects.length === 0 && <p className="px-2 py-1.5 text-xs text-slate-400">Noch keine Projekte vorhanden.</p>}
+              </div>
+            </div>
+            {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
+          </div>
+        )}
 
         <div className={MODAL_FOOTER_ROW}>
-          <button onClick={onClose} disabled={submitting} className={BTN_SECONDARY}>
-            Abbrechen
-          </button>
-          <button onClick={handleSubmit} disabled={submitting} className={BTN_PRIMARY}>
-            {submitting ? <Loader2 size={16} className="animate-spin" /> : <MailPlus size={16} />} Einladung senden
-          </button>
+          {directLink ? (
+            <button onClick={onClose} className={BTN_PRIMARY}>
+              <Check size={16} /> Fertig
+            </button>
+          ) : (
+            <>
+              <button onClick={onClose} disabled={submitting} className={BTN_SECONDARY}>
+                Abbrechen
+              </button>
+              <button onClick={handleSubmit} disabled={submitting} className={BTN_PRIMARY}>
+                {submitting ? <Loader2 size={16} className="animate-spin" /> : <MailPlus size={16} />} Einladung senden
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -6030,15 +6135,33 @@ function UsersAdminModal({
   const [formState, setFormState] = useState(null); // { mode, user }
   const [inviteOpen, setInviteOpen] = useState(false);
   const [resendingId, setResendingId] = useState(null);
+  // Direkter Einladungslink pro Benutzer-ID, falls der Erinnerungsversand per Mail
+  // fehlgeschlagen ist (siehe sendInviteEmailOrFallbackLink) — wird inline unter der
+  // jeweiligen Benutzerzeile angezeigt, siehe unten.
+  const [directLinkByUser, setDirectLinkByUser] = useState({});
+  const [copiedUserId, setCopiedUserId] = useState(null);
   const [deleteConfirmUser, setDeleteConfirmUser] = useState(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
 
   const handleResend = async (u) => {
     setResendingId(u.id);
     try {
-      await onResendInvite(u);
+      const result = await onResendInvite(u);
+      if (result?.directLink) {
+        setDirectLinkByUser((prev) => ({ ...prev, [u.id]: result.directLink }));
+      }
     } finally {
       setResendingId(null);
+    }
+  };
+
+  const handleCopyUserLink = async (userId, link) => {
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedUserId(userId);
+      setTimeout(() => setCopiedUserId(null), 2500);
+    } catch (err) {
+      console.error("Link konnte nicht in die Zwischenablage kopiert werden:", err);
     }
   };
 
@@ -6077,49 +6200,72 @@ function UsersAdminModal({
 
         <div className="flex-1 space-y-2 overflow-y-auto px-5 py-4">
           {users.map((u) => (
-            <div key={u.id} className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 px-3 py-2.5">
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-semibold text-slate-900">{u.name}</span>
-                  {u.kuerzel && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">{u.kuerzel}</span>}
-                  {u.invite_status === "eingeladen" && (
-                    <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
-                      <MailPlus size={10} /> Einladung ausstehend
-                    </span>
-                  )}
+            <div key={u.id} className="rounded-lg border border-slate-200 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-slate-900">{u.name}</span>
+                    {u.kuerzel && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">{u.kuerzel}</span>}
+                    {u.invite_status === "eingeladen" && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
+                        <MailPlus size={10} /> Einladung ausstehend
+                      </span>
+                    )}
+                  </div>
+                  <p className="truncate text-xs text-slate-500">{u.email}</p>
+                  <p className="mt-0.5 text-[11px] text-slate-400">
+                    {(u.project_ids || []).length} Projekt{(u.project_ids || []).length !== 1 ? "e" : ""} zugeordnet
+                  </p>
                 </div>
-                <p className="truncate text-xs text-slate-500">{u.email}</p>
-                <p className="mt-0.5 text-[11px] text-slate-400">
-                  {(u.project_ids || []).length} Projekt{(u.project_ids || []).length !== 1 ? "e" : ""} zugeordnet
-                </p>
-              </div>
-              <RoleBadge role={u.role} />
-              <button onClick={() => onToggleUserActive(u)} title={u.active ? "Deaktivieren" : "Aktivieren"}>
-                <ActiveStatusBadge active={u.active} />
-              </button>
-              {u.invite_status === "eingeladen" && (
-                <button
-                  onClick={() => handleResend(u)}
-                  disabled={resendingId === u.id}
-                  title="Einladung erneut senden"
-                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {resendingId === u.id ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />} Erneut senden
+                <RoleBadge role={u.role} />
+                <button onClick={() => onToggleUserActive(u)} title={u.active ? "Deaktivieren" : "Aktivieren"}>
+                  <ActiveStatusBadge active={u.active} />
                 </button>
+                {u.invite_status === "eingeladen" && (
+                  <button
+                    onClick={() => handleResend(u)}
+                    disabled={resendingId === u.id}
+                    title="Einladung erneut senden"
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {resendingId === u.id ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />} Erneut senden
+                  </button>
+                )}
+                <button
+                  onClick={() => setFormState({ mode: "edit", user: u })}
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+                >
+                  <Pencil size={13} /> Bearbeiten
+                </button>
+                <button
+                  onClick={() => setDeleteConfirmUser(u)}
+                  title="Zugang entziehen"
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-rose-500 transition hover:bg-rose-50 hover:text-rose-700"
+                >
+                  <UserX size={13} /> Entfernen
+                </button>
+              </div>
+              {/* Direkter Link-Fallback (Abschnitt 1) — erscheint nur, wenn der letzte
+                  Erinnerungsversand per Mail nicht funktioniert hat, siehe handleResend
+                  oben. Bewusst inline unter der Zeile statt in einem eigenen Modal, damit
+                  mehrere aufeinanderfolgende Erinnerungen an verschiedene Personen
+                  gleichzeitig sichtbar bleiben können. */}
+              {directLinkByUser[u.id] && (
+                <div className="mt-2 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2">
+                  <input
+                    readOnly
+                    value={directLinkByUser[u.id]}
+                    onFocus={(e) => e.target.select()}
+                    className="flex-1 truncate border-none bg-transparent p-0 font-mono text-[11px] text-amber-800 outline-none"
+                  />
+                  <button
+                    onClick={() => handleCopyUserLink(u.id, directLinkByUser[u.id])}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-md bg-amber-600 px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-amber-700"
+                  >
+                    {copiedUserId === u.id ? <Check size={12} /> : <Copy size={12} />} {copiedUserId === u.id ? "Kopiert" : "Kopieren"}
+                  </button>
+                </div>
               )}
-              <button
-                onClick={() => setFormState({ mode: "edit", user: u })}
-                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
-              >
-                <Pencil size={13} /> Bearbeiten
-              </button>
-              <button
-                onClick={() => setDeleteConfirmUser(u)}
-                title="Zugang entziehen"
-                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-rose-500 transition hover:bg-rose-50 hover:text-rose-700"
-              >
-                <UserX size={13} /> Entfernen
-              </button>
             </div>
           ))}
           {users.length === 0 && <p className="text-xs text-slate-400">Noch keine Benutzer angelegt.</p>}
@@ -6160,10 +6306,7 @@ function UsersAdminModal({
           projects={projects}
           existingEmails={users.map((u) => u.email?.toLowerCase())}
           onClose={() => setInviteOpen(false)}
-          onInvite={async (fields) => {
-            await onInviteUser(fields);
-            setInviteOpen(false);
-          }}
+          onInvite={onInviteUser}
         />
       )}
 
@@ -12215,8 +12358,12 @@ function App() {
   // resendUserInvite/deleteUser oben). Bewusst OHNE eigenen try/catch in
   // handleInviteUser — InviteUserModal fängt den Fehler selbst ab und zeigt ihn
   // inline im Formular an (identisches Muster wie handleCreateUser/UserFormModal).
+  // Gibt { directLink } an InviteUserModal zurück (siehe dort) — ist directLink
+  // gesetzt, konnte die Einladungs-E-Mail nicht versendet werden (Zeitlimit/SMTP-
+  // Fehler, siehe sendInviteEmailOrFallbackLink) und das Modal zeigt stattdessen den
+  // direkten Link mit Kopieren-Button, statt sich sofort zu schließen.
   const handleInviteUser = async (fields) => {
-    const created = await inviteUserToApp({
+    const { profile, directLink } = await inviteUserToApp({
       name: fields.name,
       email: fields.email,
       kuerzel: "",
@@ -12224,17 +12371,20 @@ function App() {
       projectIds: fields.projectIds,
       actor: currentActor,
     });
-    setUsers((prev) => [...prev, created].sort((a, b) => a.name.localeCompare(b.name)));
+    setUsers((prev) => [...prev, profile].sort((a, b) => a.name.localeCompare(b.name)));
+    return { directLink };
   };
 
   const handleResendInvite = async (user) => {
     try {
-      await resendUserInvite(user.email);
+      const { directLink } = await resendUserInvite(user.email);
       const updated = await updateUser(user.id, { invited_at: new Date().toISOString() });
       setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, ...updated } : u)));
+      return { directLink };
     } catch (err) {
       console.error("Einladung konnte nicht erneut gesendet werden:", err);
       setGlobalError("Die Einladung konnte nicht erneut gesendet werden. Bitte erneut versuchen.");
+      return null;
     }
   };
 
