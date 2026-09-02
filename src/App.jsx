@@ -69,6 +69,9 @@ import {
   List,
   Archive,
   ArchiveRestore,
+  Copy,
+  ClipboardCheck,
+  LayoutList,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -216,6 +219,58 @@ const PRIORITY = {
   mittel: { label: "Mittel", text: "text-amber-700", bg: "bg-amber-100", bar: "bg-amber-500" },
   hoch: { label: "Hoch", text: "text-red-700", bg: "bg-red-100", bar: "bg-red-600" },
 };
+
+// Vorlagen-Katalog für die Schnellerfassung wiederkehrender Baustellen-Standardmängel
+// (siehe Vorlagen-Chips in PinModal, nur bei neu angelegten Pins sichtbar). tradeName
+// wird beim Anwenden einer Vorlage per Namensvergleich gegen die tatsächlich in DIESEM
+// Projekt hinterlegten Gewerke aufgelöst (siehe resolveTradeIdByName) — das Gewerke-
+// Sortiment ist je Projekt frei konfigurierbar (siehe TradesAdminModal), ein fest
+// verdrahtetes trade_id ist daher nicht möglich. Ist das betreffende Gewerk in diesem
+// Projekt nicht angelegt oder deaktiviert, bleibt beim Anwenden nur das Gewerk-Feld
+// leer, Titel/Priorität/Beschreibung werden trotzdem übernommen. Die Beschreibungs-
+// Standardtexte waren in der Anforderung nicht wörtlich vorgegeben ("Standardtext")
+// und sind daher eigene, fachlich übliche Formulierungen für die jeweilige Mangelart.
+const QUICK_DEFECT_TEMPLATES = [
+  {
+    title: "Bohrloch nicht verspachtelt",
+    tradeName: "Trockenbau",
+    priority: "mittel",
+    description: "Bohrloch in der Gipskartonfläche ist nicht verspachtelt und muss nachgearbeitet werden.",
+  },
+  {
+    title: "Schutzkappe an Bewehrung fehlt",
+    tradeName: "Rohbau",
+    priority: "hoch",
+    description: "Bewehrungsanschluss ohne Schutzkappe — Verletzungsgefahr, umgehend nachrüsten.",
+  },
+  {
+    title: "Restfeuchte im Estrich zu hoch",
+    tradeName: "Bodenbelag",
+    priority: "hoch",
+    description: "CM-Messung erforderlich, Belegreife vor Verlegung des Bodenbelags nachweisen.",
+  },
+  {
+    title: "Beschädigung an Putz/Kante",
+    tradeName: "Maler/Putz",
+    priority: "niedrig",
+    description: "Putzfläche bzw. Kante beschädigt, optische Nacharbeit erforderlich.",
+  },
+  {
+    title: "Fehlende Beschriftung im Verteiler",
+    tradeName: "Elektro",
+    priority: "mittel",
+    description: "Stromkreise im Verteiler sind nicht beschriftet.",
+  },
+];
+
+// Case-insensitive Namensauflösung einer Vorlagen-Gewerkebezeichnung gegen die aktiven
+// Gewerke des aktuell geöffneten Projekts. Liefert "" (kein Treffer), wenn im Projekt
+// kein gleichnamiges aktives Gewerk existiert — das select-Feld im Modal versteht "" bereits
+// heute als "Kein Gewerk zugeordnet" (siehe draft.trade_id in PinModal).
+function resolveTradeIdByName(trades, name) {
+  const match = (trades || []).find((t) => t.active && t.name.trim().toLowerCase() === name.trim().toLowerCase());
+  return match ? match.id : "";
+}
 
 // Menschenlesbare Feld-Bezeichnungen für die Bearbeitungshistorie (Abschnitt 3) —
 // welche Felder beim Speichern eines Pins geändert wurden, wird darüber zu einem
@@ -807,18 +862,25 @@ async function deleteFloorPlanSketch(plan) {
 // über RLS auf Supabase-Ebene. Ein Pin ist strikt an genau eine Grundrissskizze
 // (planId) gebunden; floor_id wird zusätzlich mitgeschrieben, ausschließlich für die
 // geschossweite Kennzahlen-Aggregation in der Geschossübersicht (Ebene 2).
-async function createPin(planId, floorId, x, y, actor) {
+//
+// overrides (optional): title/description/priority/trade_id, mit denen die sonst
+// generischen Standardwerte überschrieben werden — genutzt für das "Mangel
+// duplizieren"-Klemmbrett (copiedPinData, siehe handlePlanClick in App). Bewusst als
+// optionaler, zusätzlicher Parameter mit Default {} statt einer neuen, parallelen
+// Funktion: der reguläre Aufruf ohne Klemmbrett-Inhalt (createPin(planId, floorId, x,
+// y, actor)) bleibt dadurch unverändert und verhält sich exakt wie zuvor.
+async function createPin(planId, floorId, x, y, actor, overrides = {}) {
   const { data, error } = await supabase
     .from("pins")
     .insert({
       plan_id: planId,
       floor_id: floorId,
-      title: "Neuer Eintrag",
-      description: "",
+      title: overrides.title || "Neuer Eintrag",
+      description: overrides.description || "",
       status: "offen",
-      priority: "mittel",
+      priority: overrides.priority || "mittel",
       assigned_to: "",
-      trade_id: null,
+      trade_id: overrides.trade_id || null,
       x,
       y,
       angle: 0,
@@ -3538,6 +3600,32 @@ function ErrorBanner({ message, onClose }) {
       </span>
       <button onClick={onClose} className="shrink-0 rounded p-1 text-rose-500 transition hover:bg-rose-100">
         <X size={15} />
+      </button>
+    </div>
+  );
+}
+
+// Toast-/Signal-Banner für das "Mangel duplizieren"-Klemmbrett (siehe copiedPinData in
+// App sowie den "Mangel duplizieren"-Button in PinModal). Bewusst als GLOBALE, immer
+// sichtbare Kopfleiste umgesetzt (analog zu ErrorBanner direkt darüber, nicht als
+// Element innerhalb von FloorPlanView) — copiedPinData ist App-weiter State und bleibt
+// dadurch auch beim Wechsel auf eine andere Grundrissskizze oder ein anderes Geschoss
+// gültig: ein Mangel lässt sich so bewusst auch AUF EINEM ANDEREN PLAN platzieren, nicht
+// nur auf dem, auf dem er dupliziert wurde. Abbrechen leert das Klemmbrett wieder, ohne
+// einen Pin zu platzieren.
+function DuplicateClipboardBanner({ pinData, onCancel }) {
+  if (!pinData) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-[#FF2A00] sm:px-6">
+      <span className="flex items-center gap-2">
+        <ClipboardCheck size={16} className="shrink-0" />
+        Mangel „{pinData.title || "Ohne Titel"}" in Zwischenablage. Tippe auf den Bauplan, um ihn hier zu platzieren.
+      </span>
+      <button
+        onClick={onCancel}
+        className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs font-semibold text-[#FF2A00] transition hover:bg-red-100"
+      >
+        <X size={14} /> Abbrechen
       </button>
     </div>
   );
@@ -9325,6 +9413,7 @@ function PinModal({
   onRequestLogin,
   onClose,
   onSaveFields,
+  onDuplicate,
   onDelete,
   onAddTodo,
   onToggleTodo,
@@ -9359,6 +9448,36 @@ function PinModal({
   const update = (field, value) => {
     if (readOnly) return;
     setDraft((d) => ({ ...d, [field]: value }));
+  };
+
+  // Vorlagen-Katalog (siehe QUICK_DEFECT_TEMPLATES/resolveTradeIdByName oben): befüllt
+  // Titel/Gewerk/Priorität/Beschreibung in EINEM setDraft-Aufruf, damit die vier Felder
+  // atomar zusammen wechseln statt über vier einzelne update()-Aufrufe. Nur bei neu
+  // angelegten Pins sichtbar (siehe isNew-Guard unten im Markup) — bei einem bereits
+  // gespeicherten Pin würde eine Vorlage bestehende, ggf. schon dokumentierte Angaben
+  // stillschweigend überschreiben.
+  const applyTemplate = (tpl) => {
+    if (readOnly || !isNew) return;
+    setDraft((d) => ({
+      ...d,
+      title: tpl.title,
+      description: tpl.description,
+      priority: tpl.priority,
+      trade_id: resolveTradeIdByName(trades, tpl.tradeName),
+    }));
+  };
+
+  // "Mangel duplizieren" (siehe onDuplicate/handleDuplicatePin in App): übernimmt die
+  // GESPEICHERTEN Stammdaten dieses Pins (nicht den ggf. noch unspeicherten draft) —
+  // bewusst kein Foto, wie in der Anforderung explizit vorgegeben.
+  const handleDuplicateClick = () => {
+    if (readOnly || isNew || !onDuplicate) return;
+    onDuplicate({
+      title: pin.title,
+      description: pin.description,
+      priority: pin.priority,
+      trade_id: pin.trade_id || null,
+    });
   };
 
   // Autocomplete-Vorschlagsliste für "Firma / Zuständige Person" — alle bislang für
@@ -9508,6 +9627,34 @@ function PinModal({
 
         {/* Body */}
         <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
+          {/* Vorlagen-Katalog (Quick Templates) — ausschließlich bei neu angelegten Pins,
+              bewusst ganz oben im Modal, noch vor Status/Priorität: die Vorlage bestimmt
+              typischerweise als Erstes, worum es überhaupt geht, alle anderen Felder
+              darunter füllen sich danach von selbst bzw. lassen sich im Anschluss noch
+              gezielt anpassen. */}
+          {isNew && !readOnly && (
+            <div>
+              <FieldLabel>
+                <span className="inline-flex items-center gap-1.5">
+                  <LayoutList size={12} /> Vorlage für wiederkehrenden Mangel (optional)
+                </span>
+              </FieldLabel>
+              <div className="flex flex-wrap gap-1.5">
+                {QUICK_DEFECT_TEMPLATES.map((tpl) => (
+                  <button
+                    key={tpl.title}
+                    type="button"
+                    onClick={() => applyTemplate(tpl)}
+                    title={`Gewerk: ${tpl.tradeName} · Priorität: ${PRIORITY[tpl.priority]?.label || tpl.priority}`}
+                    className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:border-[#FF2A00] hover:bg-red-50 hover:text-[#FF2A00]"
+                  >
+                    {tpl.title}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Status & Priority */}
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -9777,6 +9924,15 @@ function PinModal({
               >
                 {exportingPdf ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />} Einzel-PDF
               </button>
+              {!readOnly && onDuplicate && (
+                <button
+                  onClick={handleDuplicateClick}
+                  title="Gewerk, Titel, Beschreibung und Priorität in die Zwischenablage übernehmen, um an anderer Stelle einen neuen Pin damit anzulegen"
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100"
+                >
+                  <Copy size={16} /> Mangel duplizieren
+                </button>
+              )}
               {!readOnly && (
                 <button
                   onClick={handleDeleteClick}
@@ -10180,6 +10336,12 @@ function App() {
   const [selectedFloorPlanId, setSelectedFloorPlanId] = useState(null);
   const [query, setQuery] = useState("");
   const [modalState, setModalState] = useState(null); // { pinId, isNew }
+  // "Mangel duplizieren"-Klemmbrett — { title, description, priority, trade_id } oder
+  // null. Bewusst App-weiter State statt lokal in FloorPlanView (siehe Kommentar an
+  // DuplicateClipboardBanner): bleibt auch beim Wechsel der Grundrissskizze gültig, bis
+  // er durch den nächsten Klick auf einen Bauplan (handlePlanClick) verbraucht oder über
+  // das Banner explizit abgebrochen wird.
+  const [copiedPinData, setCopiedPinData] = useState(null);
   const [noteModalState, setNoteModalState] = useState(null); // { noteId, isNew }
   const [floorModalOpen, setFloorModalOpen] = useState(false);
   const [editFloorModalState, setEditFloorModalState] = useState(null); // { floor }
@@ -10605,7 +10767,12 @@ function App() {
       for (const item of queue) {
         const targetPinId = item.pinId ? idMap.get(item.pinId) || resolveOfflineId(item.pinId) : null;
         if (item.type === "create_pin") {
-          const pin = await createPin(item.planId, item.floorId, item.x, item.y, item.actor);
+          // item.overrides trägt ein offline dupliziertes/per Vorlage befülltes
+          // Klemmbrett bis zum Synchronisieren mit — ohne diese Weitergabe würde der
+          // serverseitig neu angelegte Pin wieder auf die generischen createPin-
+          // Standardwerte zurückfallen, obwohl lokal längst die kopierten Stammdaten
+          // angezeigt werden (siehe handlePlanClick).
+          const pin = await createPin(item.planId, item.floorId, item.x, item.y, item.actor, item.overrides || {});
           await logPinActivity(pin.id, "created", "Mängel-Pin angelegt (offline erfasst, synchronisiert)", item.actor);
           idMap.set(item.localId, pin.id);
           rememberSyncedPinId(item.localId, pin.id);
@@ -11112,6 +11279,24 @@ function App() {
     if (!requireAuth()) return;
     setCreatingPin(true);
     setGlobalError(null);
+    // "Mangel duplizieren"-Klemmbrett (copiedPinData, siehe handleDuplicatePin und
+    // DuplicateClipboardBanner): wird HIER, mit dem allernächsten Klick auf den
+    // Bauplan, konsumiert und sofort danach geleert — ein einmaliges "Einfügen", kein
+    // dauerhafter Modus. Ein Fehlschlag der eigentlichen Pin-Anlage unten leert es
+    // trotzdem nicht rückgängig (siehe overrides als lokale Kopie), das ist bewusst
+    // so einfach gehalten wie ein normales Clipboard-Paste.
+    const overrides = copiedPinData
+      ? {
+          title: copiedPinData.title,
+          description: copiedPinData.description,
+          priority: copiedPinData.priority,
+          trade_id: copiedPinData.trade_id,
+        }
+      : {};
+    if (copiedPinData) setCopiedPinData(null);
+    const createdDetail = copiedPinData
+      ? `Mängel-Pin angelegt (dupliziert aus „${copiedPinData.title || "Ohne Titel"}")`
+      : "Mängel-Pin angelegt";
     try {
       // Offline-First (Punkt 15): ohne Verbindung wird der Pin sofort lokal mit einer
       // eigenen Offline-ID angelegt (sichtbar, bearbeitbar, fotografierbar wie jeder
@@ -11124,12 +11309,12 @@ function App() {
           id: localId,
           plan_id: plan.id,
           floor_id: floor.id,
-          title: "Neuer Eintrag",
-          description: "",
+          title: overrides.title || "Neuer Eintrag",
+          description: overrides.description || "",
           status: "offen",
-          priority: "mittel",
+          priority: overrides.priority || "mittel",
           assigned_to: "",
-          trade_id: null,
+          trade_id: overrides.trade_id || null,
           x,
           y,
           angle: 0,
@@ -11144,7 +11329,7 @@ function App() {
               id: generateOfflineId(),
               pin_id: localId,
               action: "created",
-              detail: "Mängel-Pin angelegt (offline erfasst, wird synchronisiert)",
+              detail: `${createdDetail} (offline erfasst, wird synchronisiert)`,
               actor_email: currentActor?.email || null,
               actor_name: currentActor?.name || null,
               created_at: nowIso,
@@ -11153,14 +11338,16 @@ function App() {
         };
         setPins((prev) => [...prev, offlinePin]);
         addPinSummary(floor.id, plan.id, offlinePin);
-        setSyncQueue(enqueueSyncItem({ type: "create_pin", localId, planId: plan.id, floorId: floor.id, x, y, actor: currentActor }));
+        setSyncQueue(
+          enqueueSyncItem({ type: "create_pin", localId, planId: plan.id, floorId: floor.id, x, y, overrides, actor: currentActor })
+        );
         setModalState({ pinId: localId, isNew: true });
         return;
       }
-      const newPin = await createPin(plan.id, floor.id, x, y, currentActor);
+      const newPin = await createPin(plan.id, floor.id, x, y, currentActor, overrides);
       // Abschnitt 3: automatische Zeit-/Benutzererfassung — jede Pin-Erstellung wird
       // sofort mit einem eigenen Eintrag in der Bearbeitungshistorie protokolliert.
-      const activity = await logPinActivity(newPin.id, "created", "Mängel-Pin angelegt", currentActor);
+      const activity = await logPinActivity(newPin.id, "created", createdDetail, currentActor);
       const pinWithActivity = { ...newPin, pin_activity_log: [activity] };
       setPins((prev) => [...prev, pinWithActivity]);
       addPinSummary(floor.id, plan.id, pinWithActivity);
@@ -11174,6 +11361,18 @@ function App() {
   };
 
   const handlePinClick = (pin) => setModalState({ pinId: pin.id, isNew: false });
+
+  // "Mangel duplizieren" (siehe Button in PinModal, nur bei bestehenden Pins sichtbar):
+  // übernimmt Gewerk/Titel/Beschreibung/Priorität des gerade betrachteten Pins in das
+  // Klemmbrett, schließt das Modal und zeigt das Toast-Banner (DuplicateClipboardBanner)
+  // — konsumiert wird das Klemmbrett erst beim nächsten Klick auf den Bauplan, siehe
+  // handlePlanClick oben. Bewusst die GESPEICHERTEN Pin-Felder (nicht den evtl. noch
+  // unspeicherten Modal-Entwurf) — "einen bestehenden, dokumentierten Mangel
+  // duplizieren", nicht "einen halb ausgefüllten Entwurf klonen".
+  const handleDuplicatePin = (data) => {
+    setCopiedPinData(data);
+    setModalState(null);
+  };
 
   // Hängt einen neuen pin_activity_log-Eintrag optimistisch an den lokalen Zustand
   // eines Pins an — kleine, wiederverwendete Hilfsfunktion für die Pin-Handler unten.
@@ -11799,6 +11998,7 @@ function App() {
       </div>
 
       <ErrorBanner message={globalError} onClose={() => setGlobalError(null)} />
+      <DuplicateClipboardBanner pinData={copiedPinData} onCancel={() => setCopiedPinData(null)} />
 
       {screen === "projects" && (
         <ProjectOverview
@@ -11886,6 +12086,7 @@ function App() {
           onRequestLogin={() => setAuthModalOpen(true)}
           onClose={() => setModalState(null)}
           onSaveFields={(fields) => handleSaveFields(activePin.id, fields)}
+          onDuplicate={handleDuplicatePin}
           onDelete={() => handleDeletePin(activePin.id)}
           onAddTodo={(text) => handleAddTodo(activePin.id, text)}
           onToggleTodo={(todo) => handleToggleTodo(activePin.id, todo)}
