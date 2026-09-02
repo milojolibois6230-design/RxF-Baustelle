@@ -765,16 +765,128 @@ function sanitizeFileName(name) {
   return name.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+// ---- Client-seitige PDF-Komprimierung für Baupläne über dem Supabase-Free-Plan-Limit ---
+// Der Storage-Bucket eines Supabase-Free-Plan-Projekts akzeptiert keine Einzeldatei über
+// 50MB. Hochauflösend gescannte oder direkt aus dem CAD-Programm exportierte Baupläne
+// (v.a. A0/A1-Formate) überschreiten das in der Praxis. Ab FLOOR_PLAN_PDF_COMPRESS_
+// THRESHOLD_BYTES wird die Datei deshalb VOR dem Upload automatisch verkleinert, statt den
+// Nutzer erst nach einem fehlschlagenden Upload-Versuch mit einer Fehlermeldung stehen zu
+// lassen (siehe uploadFloorPlan unten).
+const FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_MB = 45;
+const FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_BYTES = FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_MB * 1024 * 1024;
+const FLOOR_PLAN_PDF_HARD_LIMIT_MB = 50;
+const FLOOR_PLAN_PDF_HARD_LIMIT_BYTES = FLOOR_PLAN_PDF_HARD_LIMIT_MB * 1024 * 1024;
+// pdf.js' Skalierungsfaktor ist relativ zur PDF-eigenen 72-DPI-Basiseinheit — Scale 2.0
+// entspricht rechnerisch rund 144 DPI, nicht wörtlich den in der Anforderung genannten
+// "300 DPI". Ein tatsächliches 300-DPI-Rendering (Scale ≈ 4,17) würde bei den auf der
+// Baustelle üblichen A0/A1-Planformaten selbst als JPEG kaum kleiner als das Original
+// ausfallen und liefe dem eigentlichen Ziel (deutlich kleinere Datei, auf Tablet/Handy
+// weiterhin gut lesbar) zuwider. Übernommen wird deshalb der wörtlich genannte Scale-Wert
+// (2.0), nicht die DPI-Zahl — siehe Einordnung in der Antwort.
+const FLOOR_PLAN_PDF_COMPRESS_RENDER_SCALE = 2.0;
+// Unabhängige, eigene Sicherheitsgrenze für diese Hintergrund-Rasterung (nicht dieselbe
+// Konstante wie die Viewer-Caps PDF_SAFE_MAX_CANVAS_DIM_PX_*, die an die aktuelle
+// Fenstergröße/Gerätedichte des Betrachters gekoppelt sind — hier läuft nichts davon,
+// eine Kopplung an das Browserfenster ergäbe für einen Hintergrund-Batch-Vorgang keinen
+// Sinn) — verhindert dennoch zuverlässig eine übermäßige Speicherallokation bei extrem
+// großformatigen Scans.
+const FLOOR_PLAN_PDF_COMPRESS_MAX_CANVAS_DIM_PX = 8000;
+const FLOOR_PLAN_PDF_COMPRESS_JPEG_QUALITY = 0.75;
+
+// Rendert jede Seite der zu großen PDF-Datei clientseitig über pdf.js auf ein Offscreen-
+// Canvas und baut daraus über jsPDF eine neue, als JPEG re-komprimierte PDF-Datei
+// zusammen — dieselben beiden bereits vorhandenen, per CDN nachgeladenen Bibliotheken
+// (loadPdfJs/loadJsPdf), die auch der Grundriss-Viewer bzw. die App-eigenen PDF-Exporte
+// nutzen, hier nur in umgekehrter Richtung (lesen UND neu schreiben statt nur lesen).
+// Läuft vollständig im Browser, kein Server-Aufruf. Vektorinhalte (echter Text, feine
+// CAD-Linien) gehen dabei zwangsläufig verloren, das Ergebnis ist pro Seite ein reines
+// Rasterbild — der unvermeidbare Kompromiss jeder Rasterung, weshalb dieser Pfad auch nur
+// ab der konfigurierten Mindestgröße greift, nicht generell für jede PDF.
+async function compressPdfForUpload(file) {
+  const pdfjsLib = await loadPdfJs();
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const sourceDoc = await loadPdfDocument(pdfjsLib, objectUrl);
+    const JsPdfCtor = await loadJsPdf();
+    let outputDoc = null;
+    for (let pageNum = 1; pageNum <= sourceDoc.numPages; pageNum += 1) {
+      const page = await sourceDoc.getPage(pageNum);
+      let viewport = page.getViewport({ scale: FLOOR_PLAN_PDF_COMPRESS_RENDER_SCALE });
+      const largestDim = Math.max(viewport.width, viewport.height);
+      if (largestDim > FLOOR_PLAN_PDF_COMPRESS_MAX_CANVAS_DIM_PX) {
+        viewport = page.getViewport({
+          scale: FLOOR_PLAN_PDF_COMPRESS_RENDER_SCALE * (FLOOR_PLAN_PDF_COMPRESS_MAX_CANVAS_DIM_PX / largestDim),
+        });
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(viewport.width));
+      canvas.height = Math.max(1, Math.round(viewport.height));
+      const ctx = canvas.getContext("2d", { alpha: false });
+      // Weißer Hintergrund vor dem Zeichnen: JPEG kennt keine Transparenz (siehe
+      // dieselbe Begründung bei compressImage für Pin-Fotos weiter oben).
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      const imageData = canvas.toDataURL("image/jpeg", FLOOR_PLAN_PDF_COMPRESS_JPEG_QUALITY);
+
+      // Seitengröße exakt an die gerenderte Pixelgröße gekoppelt (unit "px"), damit das
+      // Seitenformat des Original-Plans (z.B. A0 quer) erhalten bleibt statt auf ein
+      // festes A4-Format gepresst zu werden.
+      const orientation = canvas.width >= canvas.height ? "landscape" : "portrait";
+      if (!outputDoc) {
+        outputDoc = new JsPdfCtor({ unit: "px", format: [canvas.width, canvas.height], orientation, compress: true });
+      } else {
+        outputDoc.addPage([canvas.width, canvas.height], orientation);
+      }
+      outputDoc.addImage(imageData, "JPEG", 0, 0, canvas.width, canvas.height);
+      // Canvas-Speicher der bereits verarbeiteten Seite sofort freigeben, bevor die
+      // nächste Seite gerendert wird — bei mehrseitigen Planwerken sonst unnötig hoher
+      // Speicher-Spitzenbedarf während der Konvertierung.
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+    if (!outputDoc) throw new Error("Die PDF-Datei enthält keine Seiten.");
+    const blob = outputDoc.output("blob");
+    const baseName = (file.name || "plan").replace(/\.[a-zA-Z0-9]+$/, "");
+    return new File([blob], `${baseName}_komprimiert.pdf`, { type: "application/pdf", lastModified: Date.now() });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 // Lädt eine Grundriss-Datei in den Bucket "floor-plans" hoch und liefert die
-// öffentliche URL + den erkannten Dateityp zurück.
-async function uploadFloorPlan(projectId, file) {
+// öffentliche URL + den erkannten Dateityp zurück. onStatusMessage (optional) meldet
+// dem Aufrufer Fortschrittstexte für ein Toast/Hinweis-UI (siehe compressionNotice in
+// NewFloorPlanModal/EditFloorPlanModal) — wird bei jedem Aufruf zunächst NICHT gesetzt
+// und ausschließlich für die automatische Vorab-Komprimierung überhaupt benutzt, ein
+// regulärer, bereits ausreichend kleiner Upload zeigt also gar nichts an.
+async function uploadFloorPlan(projectId, file, onStatusMessage) {
   const info = getFileInfo(file);
   if (!info) throw new Error("Nicht unterstützter Dateityp. Bitte PNG, JPG, WebP, PDF, DWG oder DXF verwenden.");
 
-  const path = `${projectId}/${crypto.randomUUID()}_${sanitizeFileName(file.name)}`;
+  let uploadFile = file;
+  if (info.kind === "pdf" && file.size > FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_BYTES) {
+    onStatusMessage?.(
+      `Plan ist größer als ${FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_MB}MB. Wird automatisch für Mobilgeräte optimiert…`
+    );
+    try {
+      uploadFile = await compressPdfForUpload(file);
+    } catch (err) {
+      console.error("Automatische PDF-Komprimierung fehlgeschlagen:", err);
+      throw new Error(
+        "Die PDF konnte nicht automatisch komprimiert werden. Bitte die Datei mit einem PDF-Tool vorkomprimieren und erneut hochladen."
+      );
+    }
+    if (uploadFile.size > FLOOR_PLAN_PDF_HARD_LIMIT_BYTES) {
+      throw new Error(`Plan trotz Komprimierung über ${FLOOR_PLAN_PDF_HARD_LIMIT_MB}MB. Bitte die PDF mit einem PDF-Tool vorkomprimieren.`);
+    }
+    onStatusMessage?.(null);
+  }
+
+  const path = `${projectId}/${crypto.randomUUID()}_${sanitizeFileName(uploadFile.name)}`;
   const { error: uploadError } = await supabase.storage
     .from(FLOOR_PLANS_BUCKET)
-    .upload(path, file, { cacheControl: "3600", upsert: false });
+    .upload(path, uploadFile, { cacheControl: "3600", upsert: false });
   if (uploadError) throw uploadError;
 
   const { data: publicUrlData } = supabase.storage.from(FLOOR_PLANS_BUCKET).getPublicUrl(path);
@@ -849,8 +961,8 @@ async function reorderFloors(orderedFloors) {
 // Grundrisskizzen (Ebene 3) — ein Geschoss kann beliebig viele davon enthalten.
 // createFloorPlanSketch benötigt zwingend eine Datei (eine Skizze ohne Plan wäre
 // nutzlos), updateFloorPlanSketch lässt die Datei wie zuvor bei Etagen optional.
-async function createFloorPlanSketch(floorId, projectId, name, file) {
-  const { publicUrl, fileType } = await uploadFloorPlan(projectId, file);
+async function createFloorPlanSketch(floorId, projectId, name, file, onStatusMessage) {
+  const { publicUrl, fileType } = await uploadFloorPlan(projectId, file, onStatusMessage);
   const { data, error } = await supabase
     .from("floor_plans")
     .insert({ floor_id: floorId, name, image_url: publicUrl, file_type: fileType })
@@ -864,10 +976,10 @@ async function createFloorPlanSketch(floorId, projectId, name, file) {
 // optional: wird keine neue Datei übergeben, bleiben image_url/file_type unverändert
 // und nur der Name wird aktualisiert. Die alte Datei im Storage bleibt beim
 // Austausch technisch bedingt liegen (analog zu deleteProject() oben).
-async function updateFloorPlanSketch(planId, projectId, name, file) {
+async function updateFloorPlanSketch(planId, projectId, name, file, onStatusMessage) {
   const fields = { name };
   if (file) {
-    const { publicUrl, fileType } = await uploadFloorPlan(projectId, file);
+    const { publicUrl, fileType } = await uploadFloorPlan(projectId, file, onStatusMessage);
     fields.image_url = publicUrl;
     fields.file_type = fileType;
   }
@@ -6812,6 +6924,11 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // Zwischenstatus der automatischen PDF-Vorab-Komprimierung (siehe uploadFloorPlan/
+  // compressPdfForUpload) — null, solange keine Datei über dem Schwellwert hochgeladen
+  // wird. Bewusst als eigener, informativer Status statt über error angezeigt: kein
+  // Fehler, sondern ein "läuft gerade"-Hinweis, während der Upload weiterläuft.
+  const [compressionNotice, setCompressionNotice] = useState(null);
   const inputRef = useRef(null);
 
   const acceptFile = (f) => {
@@ -6851,15 +6968,17 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
       return;
     }
     setError("");
+    setCompressionNotice(null);
     setSubmitting(true);
     try {
-      await onSave(name.trim(), file);
+      await onSave(name.trim(), file, setCompressionNotice);
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
       console.error("Grundrissskizze konnte nicht gespeichert werden:", err);
       setError(err?.message || "Die Grundrissskizze konnte nicht gespeichert werden. Bitte erneut versuchen.");
     } finally {
       setSubmitting(false);
+      setCompressionNotice(null);
     }
   };
 
@@ -6947,6 +7066,14 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
                 </div>
               )}
             </div>
+            {/* Toast-Hinweis der automatischen PDF-Vorab-Komprimierung (siehe
+                uploadFloorPlan/compressPdfForUpload) — bewusst amber/informativ statt
+                rot, ist kein Fehler, sondern ein "läuft gerade"-Status. */}
+            {compressionNotice && (
+              <p className="mt-1.5 flex items-center gap-1.5 rounded-lg bg-amber-50 px-2.5 py-2 text-xs font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
+                <Loader2 size={13} className="shrink-0 animate-spin" /> {compressionNotice}
+              </p>
+            )}
             {error && <p className="mt-1.5 text-xs font-medium text-rose-600">{error}</p>}
           </div>
         </div>
@@ -6965,7 +7092,7 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
             className={BTN_PRIMARY}
           >
             {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-            {submitting ? "Wird hochgeladen…" : "Grundrissskizze speichern"}
+            {submitting ? (compressionNotice ? "Wird optimiert…" : "Wird hochgeladen…") : "Grundrissskizze speichern"}
           </button>
         </div>
       </div>
@@ -6988,6 +7115,9 @@ function EditFloorPlanModal({ plan, onClose, onSave }) {
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // Siehe identischer Kommentar in NewFloorPlanModal — Zwischenstatus der
+  // automatischen PDF-Vorab-Komprimierung, kein Fehler.
+  const [compressionNotice, setCompressionNotice] = useState(null);
   const inputRef = useRef(null);
 
   const existingKind = resolveFloorKind(plan);
@@ -7024,17 +7154,19 @@ function EditFloorPlanModal({ plan, onClose, onSave }) {
       return;
     }
     setError("");
+    setCompressionNotice(null);
     setSubmitting(true);
     try {
       // file ist bewusst optional: onSave(name, null) aktualisiert nur den Namen und
       // lässt die bestehende Skizzen-Datei unangetastet.
-      await onSave(name.trim(), file);
+      await onSave(name.trim(), file, setCompressionNotice);
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
       console.error("Grundrissskizze konnte nicht aktualisiert werden:", err);
       setError(err?.message || "Die Grundrissskizze konnte nicht aktualisiert werden. Bitte erneut versuchen.");
     } finally {
       setSubmitting(false);
+      setCompressionNotice(null);
     }
   };
 
@@ -7136,6 +7268,12 @@ function EditFloorPlanModal({ plan, onClose, onSave }) {
                 </div>
               )}
             </div>
+            {/* Siehe identischer Hinweis in NewFloorPlanModal. */}
+            {compressionNotice && (
+              <p className="mt-1.5 flex items-center gap-1.5 rounded-lg bg-amber-50 px-2.5 py-2 text-xs font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
+                <Loader2 size={13} className="shrink-0 animate-spin" /> {compressionNotice}
+              </p>
+            )}
             {error && <p className="mt-1.5 text-xs font-medium text-rose-600">{error}</p>}
           </div>
         </div>
@@ -7154,7 +7292,7 @@ function EditFloorPlanModal({ plan, onClose, onSave }) {
             className={BTN_PRIMARY}
           >
             {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-            {submitting ? "Wird gespeichert…" : "Änderungen speichern"}
+            {submitting ? (compressionNotice ? "Wird optimiert…" : "Wird gespeichert…") : "Änderungen speichern"}
           </button>
         </div>
       </div>
@@ -11271,9 +11409,9 @@ function App() {
     setFloorPlanModalOpen(true);
   };
 
-  const handleAddFloorPlanSketch = async (name, file) => {
+  const handleAddFloorPlanSketch = async (name, file, onStatusMessage) => {
     if (!selectedFloorId || !selectedProjectId) return;
-    const newPlan = await createFloorPlanSketch(selectedFloorId, selectedProjectId, name, file);
+    const newPlan = await createFloorPlanSketch(selectedFloorId, selectedProjectId, name, file, onStatusMessage);
     setFloorPlans((prev) => [...prev, { ...newPlan, pins: [] }]);
     setFloorPlanModalOpen(false);
     // Fehler werden NICHT hier gefangen: NewFloorPlanModal wartet auf dieses Promise
@@ -11285,10 +11423,10 @@ function App() {
     setEditFloorPlanModalState({ plan });
   };
 
-  const handleUpdateFloorPlanSketch = async (name, file) => {
+  const handleUpdateFloorPlanSketch = async (name, file, onStatusMessage) => {
     if (!editFloorPlanModalState || !selectedProjectId) return;
     const planId = editFloorPlanModalState.plan.id;
-    const updated = await updateFloorPlanSketch(planId, selectedProjectId, name, file);
+    const updated = await updateFloorPlanSketch(planId, selectedProjectId, name, file, onStatusMessage);
     setFloorPlans((prev) => prev.map((fp) => (fp.id === planId ? { ...fp, ...updated } : fp)));
     setEditFloorPlanModalState(null);
     // Fehler werden NICHT hier gefangen: EditFloorPlanModal wartet auf dieses Promise
