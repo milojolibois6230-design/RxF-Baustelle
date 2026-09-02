@@ -73,6 +73,12 @@ import {
   ClipboardCheck,
   LayoutList,
   GripVertical,
+  Mail,
+  KeyRound,
+  Send,
+  UserX,
+  MailPlus,
+  Settings,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -93,6 +99,20 @@ if (!supabaseUrl || !supabaseAnonKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// Eigener, unabhängiger zweiter Supabase-Client ausschließlich für den Admin-
+// Einladungsversand (siehe inviteUserToApp/resendUserInvite weiter unten). BEWUSST
+// getrennt vom regulären "supabase"-Client oben: ein supabase.auth.signUp()-Aufruf
+// auf dem regulären Client würde bei erfolgreicher Kontoerstellung dessen aktive
+// Session automatisch durch die neu erzeugte Session der EINGELADENEN Person
+// ersetzen — der Administrator wäre nach dem Versenden einer Einladung unerwartet
+// ausgeloggt bzw. als der eingeladene Nutzer angemeldet. persistSession:false und
+// autoRefreshToken:false sorgen dafür, dass dieser zweite Client weder localStorage
+// noch den Auth-Zustand des Haupt-Clients berührt — er wird ausschließlich für den
+// kurzen signUp()/resetPasswordForEmail()-Vorgang benutzt und danach ignoriert.
+const inviteSupabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+});
 
 const FLOOR_PLANS_BUCKET = "floor-plans";
 const PIN_PHOTOS_BUCKET = "pin-photos";
@@ -504,6 +524,29 @@ function canAccessAdmin(session, currentAppUser) {
   if (!session) return false;
   if (!currentAppUser) return true;
   return currentAppUser.role === "Administrator";
+}
+
+// Rollen- & Projekt-Filterung (Abschnitt 3 des Auth-/Rechte-Systems): Administrator
+// sieht ausnahmslos ALLE Projekte, jede andere Rolle nur die ihr über project_ids
+// zugewiesenen. Dieselbe Bootstrap-Ausnahme wie bei canAccessAdmin oben (noch kein
+// app_users-Profil vorhanden -> voller Zugriff), aus demselben Grund: ohne sie könnte
+// sich niemand mehr selbst als ersten Administrator eintragen und danach überhaupt
+// ein Projekt sehen.
+function canUserAccessProject(currentAppUser, projectId) {
+  if (!currentAppUser) return true;
+  if (currentAppUser.role === "Administrator") return true;
+  return (currentAppUser.project_ids || []).includes(projectId);
+}
+
+// Löst eine in created_by/updated_by/uploaded_by gespeicherte E-Mail-Adresse (siehe
+// supabase_schema_v5_audit_trail_and_project_number.sql) auf einen menschenlesbaren
+// "Name (E-Mail)"-Anzeigetext auf, sofern ein passendes app_users-Profil existiert —
+// sonst bleibt es bei der reinen E-Mail-Adresse. Für die Anzeige "Ersteller/
+// Bearbeiter" im Pin-Modal (Abschnitt 2, Audit-Log/Aktivitätsnachweis).
+function resolveUserLabel(email, users) {
+  if (!email) return null;
+  const match = (users || []).find((u) => u.email?.toLowerCase() === email.toLowerCase());
+  return match?.name ? `${match.name} (${email})` : email;
 }
 
 // ----------------------------------------------------------------------------------
@@ -3600,6 +3643,105 @@ async function updateUser(userId, fields) {
   return data;
 }
 
+// Entfernt das fachliche app_users-Profil vollständig — "Zugang entziehen" im Sinne
+// der App: die Person verliert damit sofort jede Rollen-/Projektzuordnung (siehe
+// canAccessAdmin/canUserAccessProject) und taucht in der Benutzerverwaltung nicht
+// mehr auf. WICHTIGE, bewusste Grenze: das darunterliegende Supabase-Auth-Konto
+// (auth.users) selbst bleibt bestehen und kann sich weiterhin mit seinem Passwort
+// anmelden — es sieht danach nur keine Projekte mehr (Bootstrap-Ausnahme in
+// canUserAccessProject greift NICHT, da ja weiterhin ein Profil existiert für andere
+// Nutzer; für DIESE Person existiert schlicht keines mehr, ist also nicht "niemand
+// hat je ein Profil" — canUserAccessProject(null, ...) wird nur aufgerufen, wenn
+// currentAppUser null ist, was nach dem Löschen tatsächlich zutrifft, s.u.). Ein
+// echtes vollständiges Löschen des Auth-Kontos benötigt den Service-Role-Key
+// (supabase.auth.admin.deleteUser) und ist aus denselben Sicherheitsgründen wie beim
+// Einladungsversand (siehe inviteUserToApp) clientseitig NICHT umsetzbar — das
+// müsste über das Supabase-Dashboard oder eine serverseitige Edge Function erfolgen.
+async function deleteUser(userId) {
+  const { error } = await supabase.from("app_users").delete().eq("id", userId);
+  if (error) throw error;
+}
+
+// ----------------------------------------------------------------------------------
+// ADMIN-EINLADUNGSSYSTEM
+// ----------------------------------------------------------------------------------
+// supabase.auth.admin.inviteUserByEmail() würde den Service-Role-Key voraussetzen —
+// dieser darf NIEMALS im Browser-Bundle landen (voller administrativer Zugriff auf
+// die gesamte Supabase-Instanz für jeden, der die Browser-Konsole öffnet). Ohne
+// eigenes Backend (Edge Function) ist dieser Weg daher clientseitig bewusst NICHT
+// nutzbar — siehe Einordnung der Antwort für die Begründung. Stattdessen der von der
+// Anforderung selbst als Alternative benannte "temporäre Direct-Invite-Flow":
+//   1) Ein echtes auth.users-Konto wird mit einem zufälligen, niemandem bekannten
+//      Passwort über den isolierten inviteSupabase-Client (siehe oben) angelegt.
+//   2) resetPasswordForEmail() löst darauf Supabases eingebauten "Passwort
+//      zurücksetzen"-E-Mail-Versand aus (funktioniert für frisch angelegte wie für
+//      bereits bestehende Konten identisch) — die eingeladene Person setzt darüber
+//      ihr eigenes erstes Passwort und meldet sich danach normal über LoginScreen an.
+//      Das Mail-Template dafür lässt sich im Supabase-Dashboard unter Authentication
+//      -> Email Templates -> "Reset Password" auf einen einladungsartigen Wortlaut
+//      umformulieren (z.B. "Willkommen bei BauDoc — Passwort festlegen").
+//   3) Parallel entsteht sofort das fachliche app_users-Profil mit Rolle und
+//      Projektzuordnung (invite_status "eingeladen", siehe
+//      supabase_schema_v15_admin_invite_system.sql) — sobald sich die Person zum
+//      ersten Mal erfolgreich anmeldet, verknüpft currentAppUser (siehe App()) das
+//      Profil automatisch über die E-Mail-Adresse, ohne weiteres Zutun.
+async function inviteUserToApp({ email, name, kuerzel, role, projectIds, actor }) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const throwawayPassword = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+
+  const { error: signUpError } = await inviteSupabase.auth.signUp({
+    email: normalizedEmail,
+    password: throwawayPassword,
+  });
+  // "User already registered" ist hier KEIN Fehlerfall, sondern der erwartete Weg für
+  // eine Einladung an eine E-Mail-Adresse, für die bereits ein Auth-Konto existiert
+  // (z.B. erneuter Einladungsversand nach abgelaufenem Link) — in dem Fall wird kein
+  // zweites Konto angelegt, es geht direkt mit dem Reset-Mail-Versand weiter.
+  if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
+    throw signUpError;
+  }
+
+  const { error: resetError } = await inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
+    redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
+  });
+  if (resetError) throw resetError;
+
+  const payload = {
+    name: name?.trim() || normalizedEmail,
+    kuerzel: kuerzel || "",
+    email: normalizedEmail,
+    role,
+    active: true,
+    project_ids: projectIds || [],
+    permissions: {},
+    invite_status: "eingeladen",
+    invited_at: new Date().toISOString(),
+    invited_by: actor?.email || null,
+  };
+  const { data, error } = await supabase.from("app_users").insert(payload).select().single();
+  if (error) throw error;
+  return data;
+}
+
+// "Einladung erneut senden" für ein bereits bestehendes app_users-Profil mit
+// invite_status "eingeladen" (siehe UsersAdminModal) — wiederholt ausschließlich den
+// signUp()/resetPasswordForEmail()-Versand aus inviteUserToApp oben, OHNE ein neues
+// app_users-Profil anzulegen (das existiert ja bereits).
+async function resendUserInvite(email) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const { error: signUpError } = await inviteSupabase.auth.signUp({
+    email: normalizedEmail,
+    password: `${crypto.randomUUID()}${crypto.randomUUID()}`,
+  });
+  if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
+    throw signUpError;
+  }
+  const { error: resetError } = await inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
+    redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
+  });
+  if (resetError) throw resetError;
+}
+
 // ----------------------------------------------------------------------------------
 // SMALL COMPONENTS
 // ----------------------------------------------------------------------------------
@@ -4818,7 +4960,7 @@ const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, zoomScale
 // innerhalb der App zusätzlich eine Bearbeitungs-Session eröffnet/registriert) — hier
 // geht es um den Zugriff auf die App als Ganzes.
 // ----------------------------------------------------------------------------------
-function LoginScreen({ onLogin, onRegister }) {
+function LoginScreen({ onLogin, onRegister, onForgotPassword }) {
   // Registrieren ist bewusst als sekundärer, eingeklappter Link statt eines
   // gleichwertigen zweiten Tabs gestaltet (anders als im internen AuthModal weiter
   // unten) — die Aufgabenstellung beschreibt hier explizit einen Anmelde-Bildschirm.
@@ -4828,18 +4970,27 @@ function LoginScreen({ onLogin, onRegister }) {
   // Benutzerverwaltung im Hauptbereich legt nur das fachliche Profil in app_users an,
   // siehe createUser) — das hätte eine bestehende Kernfunktion faktisch unerreichbar
   // gemacht.
-  const [mode, setMode] = useState("login"); // "login" | "register"
+  const [mode, setMode] = useState("login"); // "login" | "register" | "forgot"
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
+  // Eigener, vom Anmelde-/Registrierungs-Formular getrennter State für "Passwort
+  // vergessen" — bewusst dieselbe E-Mail-Eingabe wie oben vorbefüllt (falls bereits
+  // eingetippt), aber ein eigenes submitting/error/info-Paar, damit ein Fehler beim
+  // Zurücksetzen nicht mit einem Anmeldefehler verwechselt werden kann.
+  const [forgotSubmitting, setForgotSubmitting] = useState(false);
+  const [forgotError, setForgotError] = useState("");
+  const [forgotInfo, setForgotInfo] = useState("");
 
   const switchMode = (next) => {
     setMode(next);
     setError("");
     setInfo("");
+    setForgotError("");
+    setForgotInfo("");
   };
 
   const handleSubmit = async (e) => {
@@ -4870,6 +5021,83 @@ function LoginScreen({ onLogin, onRegister }) {
       setSubmitting(false);
     }
   };
+
+  const handleForgotSubmit = async (e) => {
+    e.preventDefault();
+    if (!email.trim()) {
+      setForgotError("Bitte zuerst die E-Mail-Adresse eingeben.");
+      return;
+    }
+    setForgotError("");
+    setForgotInfo("");
+    setForgotSubmitting(true);
+    try {
+      await onForgotPassword(email.trim());
+      // Bewusst derselbe, unspezifische Erfolgstext unabhängig davon, ob zu dieser
+      // E-Mail-Adresse tatsächlich ein Konto existiert — sonst ließe sich über diesen
+      // Bildschirm ausprobieren, welche E-Mail-Adressen als Benutzerkonto angelegt
+      // sind (Supabase selbst verhält sich bei resetPasswordForEmail serverseitig
+      // ebenso zurückhaltend).
+      setForgotInfo("Falls zu dieser E-Mail-Adresse ein Konto besteht, wurde soeben ein Link zum Festlegen eines neuen Passworts versendet.");
+    } catch (err) {
+      console.error("Passwort-Zurücksetzen fehlgeschlagen:", err);
+      setForgotError(err?.message || "Der Link konnte nicht versendet werden. Bitte erneut versuchen.");
+    } finally {
+      setForgotSubmitting(false);
+    }
+  };
+
+  if (mode === "forgot") {
+    return (
+      <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-100 px-4">
+        <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl sm:p-8">
+          <div className="mb-6 flex flex-col items-center gap-2 text-center">
+            <BrandLogotype tone="brand" size="md" />
+            <p className="text-sm text-slate-500">Baustellendokumentation — Passwort vergessen</p>
+          </div>
+          <form onSubmit={handleForgotSubmit} className="space-y-4">
+            <div>
+              <FieldLabel>E-Mail</FieldLabel>
+              <input
+                type="email"
+                autoComplete="username"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={forgotSubmitting}
+                placeholder="name@firma.de"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+            {forgotError && (
+              <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                <span>{forgotError}</span>
+              </div>
+            )}
+            {forgotInfo && <p className="text-xs font-medium text-emerald-600">{forgotInfo}</p>}
+            <button
+              type="submit"
+              disabled={forgotSubmitting}
+              className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {forgotSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+              Link senden
+            </button>
+          </form>
+          <div className="mt-4 text-center">
+            <button
+              type="button"
+              onClick={() => switchMode("login")}
+              disabled={forgotSubmitting}
+              className="text-xs font-semibold text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Zurück zur Anmeldung
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-100 px-4">
@@ -4915,6 +5143,18 @@ function LoginScreen({ onLogin, onRegister }) {
                 {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
               </button>
             </div>
+            {mode === "login" && (
+              <div className="mt-1.5 text-right">
+                <button
+                  type="button"
+                  onClick={() => switchMode("forgot")}
+                  disabled={submitting}
+                  className="text-[11px] font-semibold text-slate-400 underline-offset-2 transition hover:text-[#FF2A00] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Passwort vergessen?
+                </button>
+              </div>
+            )}
           </div>
           {error && (
             <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
@@ -5063,6 +5303,164 @@ function AuthModal({ onClose, onSignIn, onSignUp }) {
             {mode === "login" ? "Anmelden" : "Registrieren"}
           </button>
         </form>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// EIGENE PROFIL-EINSTELLUNGEN — E-Mail und Passwort selbst verwalten (Abschnitt 4)
+// ----------------------------------------------------------------------------------
+// Bewusst zwei getrennte <form>-Blöcke mit jeweils eigenem submitting/error/info-
+// Paar statt eines gemeinsamen Formulars: E-Mail- und Passwortänderung sind
+// unabhängige Supabase-Auth-Vorgänge mit unterschiedlichem Erfolgsverhalten (die
+// E-Mail-Änderung wird erst nach Bestätigung der neuen Adresse wirksam, die
+// Passwortänderung sofort) — ein gemeinsamer Submit-Button würde das verwischen.
+function ProfileModal({ session, currentAppUser, onClose, onUpdateEmail, onUpdatePassword }) {
+  const currentEmail = session?.user?.email || "";
+  const [newEmail, setNewEmail] = useState(currentEmail);
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [emailSubmitting, setEmailSubmitting] = useState(false);
+  const [emailError, setEmailError] = useState("");
+  const [emailInfo, setEmailInfo] = useState("");
+  const [passwordSubmitting, setPasswordSubmitting] = useState(false);
+  const [passwordError, setPasswordError] = useState("");
+  const [passwordInfo, setPasswordInfo] = useState("");
+
+  const handleEmailSubmit = async (e) => {
+    e.preventDefault();
+    setEmailError("");
+    setEmailInfo("");
+    if (!newEmail.trim() || newEmail.trim().toLowerCase() === currentEmail.toLowerCase()) {
+      setEmailError("Bitte eine neue, von der aktuellen abweichende E-Mail-Adresse eingeben.");
+      return;
+    }
+    setEmailSubmitting(true);
+    try {
+      await onUpdateEmail(newEmail.trim());
+      setEmailInfo("Bestätigungs-E-Mail an die neue Adresse gesendet. Die Änderung wird erst nach dem Bestätigen dort wirksam.");
+    } catch (err) {
+      console.error("E-Mail-Änderung fehlgeschlagen:", err);
+      setEmailError(err?.message || "Die E-Mail-Adresse konnte nicht geändert werden.");
+    } finally {
+      setEmailSubmitting(false);
+    }
+  };
+
+  const handlePasswordSubmit = async (e) => {
+    e.preventDefault();
+    setPasswordError("");
+    setPasswordInfo("");
+    if (newPassword.length < 6) {
+      setPasswordError("Das neue Passwort muss mindestens 6 Zeichen lang sein.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError("Die beiden Passwörter stimmen nicht überein.");
+      return;
+    }
+    setPasswordSubmitting(true);
+    try {
+      await onUpdatePassword(newPassword);
+      setPasswordInfo("Passwort erfolgreich geändert.");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err) {
+      console.error("Passwort-Änderung fehlgeschlagen:", err);
+      setPasswordError(err?.message || "Das Passwort konnte nicht geändert werden.");
+    } finally {
+      setPasswordSubmitting(false);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-[80]`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[88vh] sm:max-w-sm sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>Mein Konto</p>
+            <h2 className="text-lg font-bold text-slate-900">Profil-Einstellungen</h2>
+          </div>
+          <button onClick={onClose} className={MODAL_CLOSE_BTN}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className={MODAL_BODY_SCROLL}>
+          {currentAppUser && (
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <RoleBadge role={currentAppUser.role} />
+              <span className="text-xs font-medium text-slate-600">{currentAppUser.name}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleEmailSubmit} className="space-y-2 border-t border-slate-100 pt-4">
+            <FieldLabel>E-Mail-Adresse ändern</FieldLabel>
+            <input
+              type="email"
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
+              disabled={emailSubmitting}
+              className={TEXT_INPUT_CLASS}
+            />
+            {emailError && <p className="text-xs font-medium text-rose-600">{emailError}</p>}
+            {emailInfo && <p className="text-xs font-medium text-emerald-600">{emailInfo}</p>}
+            <button
+              type="submit"
+              disabled={emailSubmitting}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {emailSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Mail size={16} />} E-Mail ändern
+            </button>
+          </form>
+
+          <form onSubmit={handlePasswordSubmit} className="space-y-2 border-t border-slate-100 pt-4">
+            <FieldLabel>Passwort ändern</FieldLabel>
+            <div className="relative">
+              <input
+                type={showPassword ? "text" : "password"}
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                disabled={passwordSubmitting}
+                placeholder="Neues Passwort"
+                className={`${TEXT_INPUT_CLASS} pr-10`}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                tabIndex={-1}
+                className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 transition hover:text-slate-600"
+              >
+                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+            <input
+              type={showPassword ? "text" : "password"}
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              disabled={passwordSubmitting}
+              placeholder="Neues Passwort bestätigen"
+              className={TEXT_INPUT_CLASS}
+            />
+            {passwordError && <p className="text-xs font-medium text-rose-600">{passwordError}</p>}
+            {passwordInfo && <p className="text-xs font-medium text-emerald-600">{passwordInfo}</p>}
+            <button
+              type="submit"
+              disabled={passwordSubmitting}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {passwordSubmitting ? <Loader2 size={16} className="animate-spin" /> : <KeyRound size={16} />} Passwort ändern
+            </button>
+          </form>
+        </div>
+
+        <div className={MODAL_FOOTER_ROW}>
+          <button onClick={onClose} className={BTN_SECONDARY}>
+            Schließen
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -5478,11 +5876,181 @@ function UserFormModal({ mode, user, projects, onClose, onSave }) {
 }
 
 // ----------------------------------------------------------------------------------
+// BENUTZERVERWALTUNG — EINLADUNGSFORMULAR (Abschnitt 2, Option B)
+// ----------------------------------------------------------------------------------
+// Bewusst ein eigenständiges Formular statt eines dritten Modus in UserFormModal
+// oben: UserFormModal legt ein app_users-Profil OHNE Auth-Nebenwirkung an (für den
+// Fall, dass die Person sich bereits selbst über "Registrieren" ein Konto angelegt
+// hat und nur noch Rolle/Projekte zugeordnet bekommen muss) — dieses Formular hier
+// löst zusätzlich den echten Einladungsversand aus (siehe inviteUserToApp), setzt
+// also ein noch NICHT vorhandenes Auth-Konto voraus. Beide Wege bestehen bewusst
+// nebeneinander, siehe Einordnung.
+function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("Projektmitarbeiter");
+  const [projectIds, setProjectIds] = useState([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const toggleProject = (projectId) => {
+    setProjectIds((prev) => (prev.includes(projectId) ? prev.filter((id) => id !== projectId) : [...prev, projectId]));
+  };
+
+  const handleSubmit = async () => {
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) {
+      setError("Bitte eine E-Mail-Adresse eingeben.");
+      return;
+    }
+    if ((existingEmails || []).includes(normalizedEmail)) {
+      setError("Für diese E-Mail-Adresse existiert bereits ein Benutzerprofil. Projekte/Rolle lassen sich über „Bearbeiten“ anpassen.");
+      return;
+    }
+    setError("");
+    setSubmitting(true);
+    try {
+      await onInvite({ name: name.trim(), email: normalizedEmail, role, projectIds });
+      // Bei Erfolg schließt der Aufrufer (UsersAdminModal) das Formular selbst.
+    } catch (err) {
+      console.error("Einladung konnte nicht versendet werden:", err);
+      setError(err?.message || "Die Einladung konnte nicht versendet werden. Bitte erneut versuchen.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-[75]`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[90vh] sm:max-w-lg sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>Einladungssystem</p>
+            <h2 className="text-lg font-bold text-slate-900">Benutzer einladen</h2>
+          </div>
+          <button onClick={onClose} disabled={submitting} className={MODAL_CLOSE_BTN_DISABLED}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className={MODAL_BODY_SCROLL}>
+          <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs leading-relaxed text-slate-500">
+            Es wird ein Konto für diese E-Mail-Adresse angelegt und ein Link zum Festlegen eines eigenen Passworts per
+            E-Mail versendet. Rolle und Projektzuordnung gelten sofort ab der ersten Anmeldung.
+          </p>
+          <div>
+            <FieldLabel>Name</FieldLabel>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={submitting}
+              placeholder="Vor- und Nachname"
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+          <div>
+            <FieldLabel>E-Mail-Adresse</FieldLabel>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              disabled={submitting}
+              placeholder="name@firma.de"
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+          <div>
+            <FieldLabel>Rolle</FieldLabel>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              disabled={submitting}
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+            >
+              {USER_ROLES.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[11px] text-slate-400">{ROLE_META[role]?.description}</p>
+          </div>
+          <div>
+            <FieldLabel>Projektzuordnung</FieldLabel>
+            <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2">
+              {projects.map((p) => (
+                <label
+                  key={p.id}
+                  className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
+                >
+                  <input
+                    type="checkbox"
+                    checked={projectIds.includes(p.id)}
+                    onChange={() => toggleProject(p.id)}
+                    disabled={submitting}
+                    className="h-3.5 w-3.5 accent-[#FF2A00]"
+                  />
+                  {p.name}
+                </label>
+              ))}
+              {projects.length === 0 && <p className="px-2 py-1.5 text-xs text-slate-400">Noch keine Projekte vorhanden.</p>}
+            </div>
+          </div>
+          {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
+        </div>
+
+        <div className={MODAL_FOOTER_ROW}>
+          <button onClick={onClose} disabled={submitting} className={BTN_SECONDARY}>
+            Abbrechen
+          </button>
+          <button onClick={handleSubmit} disabled={submitting} className={BTN_PRIMARY}>
+            {submitting ? <Loader2 size={16} className="animate-spin" /> : <MailPlus size={16} />} Einladung senden
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
 // BENUTZERVERWALTUNG — ÜBERSICHT (ADMIN-MODAL)
 // ----------------------------------------------------------------------------------
 
-function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, onToggleUserActive }) {
+function UsersAdminModal({
+  users,
+  projects,
+  onClose,
+  onCreateUser,
+  onEditUser,
+  onToggleUserActive,
+  onInviteUser,
+  onResendInvite,
+  onDeleteUser,
+}) {
   const [formState, setFormState] = useState(null); // { mode, user }
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [resendingId, setResendingId] = useState(null);
+  const [deleteConfirmUser, setDeleteConfirmUser] = useState(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const handleResend = async (u) => {
+    setResendingId(u.id);
+    try {
+      await onResendInvite(u);
+    } finally {
+      setResendingId(null);
+    }
+  };
+
+  const handleConfirmDelete = async () => {
+    setDeleteBusy(true);
+    try {
+      await onDeleteUser(deleteConfirmUser);
+      setDeleteConfirmUser(null);
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
 
   return (
     <div className={`${MODAL_BACKDROP_BASE} z-[65]`}>
@@ -5496,10 +6064,10 @@ function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, o
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setFormState({ mode: "create", user: null })}
+              onClick={() => setInviteOpen(true)}
               className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
             >
-              <Plus size={14} /> Neuer Benutzer
+              <MailPlus size={14} /> Benutzer einladen
             </button>
             <button onClick={onClose} className={MODAL_CLOSE_BTN}>
               <X size={20} />
@@ -5514,6 +6082,11 @@ function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, o
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-sm font-semibold text-slate-900">{u.name}</span>
                   {u.kuerzel && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">{u.kuerzel}</span>}
+                  {u.invite_status === "eingeladen" && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
+                      <MailPlus size={10} /> Einladung ausstehend
+                    </span>
+                  )}
                 </div>
                 <p className="truncate text-xs text-slate-500">{u.email}</p>
                 <p className="mt-0.5 text-[11px] text-slate-400">
@@ -5524,18 +6097,41 @@ function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, o
               <button onClick={() => onToggleUserActive(u)} title={u.active ? "Deaktivieren" : "Aktivieren"}>
                 <ActiveStatusBadge active={u.active} />
               </button>
+              {u.invite_status === "eingeladen" && (
+                <button
+                  onClick={() => handleResend(u)}
+                  disabled={resendingId === u.id}
+                  title="Einladung erneut senden"
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {resendingId === u.id ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />} Erneut senden
+                </button>
+              )}
               <button
                 onClick={() => setFormState({ mode: "edit", user: u })}
                 className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
               >
                 <Pencil size={13} /> Bearbeiten
               </button>
+              <button
+                onClick={() => setDeleteConfirmUser(u)}
+                title="Zugang entziehen"
+                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-rose-500 transition hover:bg-rose-50 hover:text-rose-700"
+              >
+                <UserX size={13} /> Entfernen
+              </button>
             </div>
           ))}
           {users.length === 0 && <p className="text-xs text-slate-400">Noch keine Benutzer angelegt.</p>}
         </div>
 
-        <div className="flex items-center justify-end border-t border-slate-100 px-5 py-3.5">
+        <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3.5">
+          <button
+            onClick={() => setFormState({ mode: "create", user: null })}
+            className="text-xs font-semibold text-slate-400 underline-offset-2 transition hover:text-slate-600 hover:underline"
+          >
+            Profil manuell verknüpfen (bereits bestehendes Konto)
+          </button>
           <button onClick={onClose} className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-500 transition hover:bg-slate-100">
             Schließen
           </button>
@@ -5556,6 +6152,29 @@ function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, o
             }
             setFormState(null);
           }}
+        />
+      )}
+
+      {inviteOpen && (
+        <InviteUserModal
+          projects={projects}
+          existingEmails={users.map((u) => u.email?.toLowerCase())}
+          onClose={() => setInviteOpen(false)}
+          onInvite={async (fields) => {
+            await onInviteUser(fields);
+            setInviteOpen(false);
+          }}
+        />
+      )}
+
+      {deleteConfirmUser && (
+        <ConfirmDialog
+          title="Zugang wirklich entziehen?"
+          message={`„${deleteConfirmUser.name}“ (${deleteConfirmUser.email}) verliert sofort jede Rollen- und Projektzuordnung in BauDoc. Das zugrunde liegende Anmeldekonto selbst bleibt bestehen und muss bei Bedarf zusätzlich über das Supabase-Dashboard entfernt werden.`}
+          confirmLabel="Zugang entziehen"
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setDeleteConfirmUser(null)}
+          busy={deleteBusy}
         />
       )}
     </div>
@@ -9669,6 +10288,7 @@ function PinModal({
   project,
   floor,
   plan,
+  users,
   generatedBy,
   onRequestLogin,
   onClose,
@@ -9878,9 +10498,9 @@ function PinModal({
             einsehbar, nicht manuell editierbar. */}
         {!isNew && (
           <p className="mx-5 mt-3 text-[11px] text-slate-400">
-            Angelegt von {pin.created_by || "unbekannt"} am {formatDateTime(pin.created_at)}
+            Angelegt von {resolveUserLabel(pin.created_by, users) || "unbekannt"} am {formatDateTime(pin.created_at)}
             {pin.updated_by && pin.updated_at && pin.updated_at !== pin.created_at && (
-              <> · zuletzt bearbeitet von {pin.updated_by} am {formatDateTime(pin.updated_at)}</>
+              <> · zuletzt bearbeitet von {resolveUserLabel(pin.updated_by, users)} am {formatDateTime(pin.updated_at)}</>
             )}
           </p>
         )}
@@ -10566,6 +11186,37 @@ function App() {
     forgetOfflineSession();
   };
 
+  // "Passwort vergessen" auf dem Login-Bildschirm (siehe LoginScreen) — läuft
+  // bewusst über den ganz regulären "supabase"-Client (nicht inviteSupabase): hier
+  // ist noch niemand angemeldet, es gibt also keine bestehende Admin-Session, die
+  // durch einen Nebeneffekt gefährdet werden könnte.
+  const handleRequestPasswordReset = async (email) => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
+    });
+    if (error) throw error;
+  };
+
+  // Eigene Profil-Einstellungen (Abschnitt 4, siehe ProfileModal) — beide Aktionen
+  // setzen zwingend eine echte, angemeldete Supabase-Session voraus (supabase.auth.
+  // updateUser arbeitet immer auf der aktuell aktiven Session des Haupt-Clients).
+  const handleUpdateEmail = async (newEmail) => {
+    const { error } = await supabase.auth.updateUser({ email: newEmail });
+    if (error) throw error;
+  };
+
+  const handleUpdatePassword = async (newPassword) => {
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) throw error;
+    // Den Offline-Anmeldefingerabdruck (siehe cacheOfflineCredential) an das neue
+    // Passwort anpassen — sonst würde die nächste Offline-Anmeldung an diesem Gerät
+    // noch mit dem alten, inzwischen ungültigen Passwort geprüft, obwohl die
+    // Online-Änderung gerade erfolgreich war.
+    if (session?.user?.email) {
+      cacheOfflineCredential(session.user.email, newPassword);
+    }
+  };
+
   // -------------------------------------------------------------------------------
   // DATEN-STATE
   // -------------------------------------------------------------------------------
@@ -10620,6 +11271,7 @@ function App() {
 
   const [users, setUsers] = useState([]); // app_users, nur für angemeldete Nutzer ladbar (RLS)
   const [usersAdminOpen, setUsersAdminOpen] = useState(false);
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
 
   const [dropboxConnected, setDropboxConnected] = useState(() => isDropboxConnected());
   const [dropboxModalOpen, setDropboxModalOpen] = useState(false);
@@ -10676,6 +11328,15 @@ function App() {
   // (Abschnitt 3, siehe logPinActivity/created_by/updated_by) — null, solange
   // niemand angemeldet ist (Mängel-Aktionen erfordern ohnehin eine Anmeldung).
   const currentActor = session?.user?.email ? { email: session.user.email, name: currentAppUser?.name || session.user.email } : null;
+
+  // Rollen- & Projekt-Filterung (Abschnitt 3): die Projektübersicht bekommt diese
+  // gefilterte Liste statt der rohen "projects" gereicht — Administrator (bzw. noch
+  // kein app_users-Profil vorhanden, siehe canUserAccessProject-Bootstrap) sieht
+  // dadurch weiterhin ausnahmslos alle Projekte, jede andere Rolle nur die eigenen.
+  // Bewusst NUR die Sichtbarkeit der Liste betroffen — welche Schreibrechte eine
+  // Rolle innerhalb eines ihr zugeordneten Projekts hat, ist nicht Teil dieser
+  // Anforderung und bleibt unverändert (siehe Einordnung).
+  const visibleProjects = projects.filter((p) => canUserAccessProject(currentAppUser, p.id));
 
   // -------------------------------------------------------------------------------
   // DATA FETCHING
@@ -11135,6 +11796,15 @@ function App() {
   // -------------------------------------------------------------------------------
 
   const openProject = (id) => {
+    // Verteidigung in der Tiefe zur clientseitigen Filterung von visibleProjects
+    // oben (siehe canUserAccessProject): die Projektübersicht zeigt einer
+    // Standard-Rolle ohnehin nur zugeordnete Projekte an, dieser zusätzliche Guard
+    // greift nur, falls eine nicht mehr zugängliche Projekt-ID auf anderem Weg
+    // angesteuert würde (z.B. veralteter Offline-Cache-Eintrag).
+    if (!canUserAccessProject(currentAppUser, id)) {
+      setGlobalError("Für dieses Projekt liegt keine Berechtigung vor.");
+      return;
+    }
     setSelectedProjectId(id);
     setSelectedFloorId(null);
     setSelectedFloorPlanId(null);
@@ -11538,6 +12208,43 @@ function App() {
     } catch (err) {
       console.error("Benutzerstatus konnte nicht geändert werden:", err);
       setGlobalError("Der Benutzerstatus konnte nicht geändert werden. Bitte erneut versuchen.");
+    }
+  };
+
+  // Admin-Einladungssystem (Abschnitt 2, Option B, siehe inviteUserToApp/
+  // resendUserInvite/deleteUser oben). Bewusst OHNE eigenen try/catch in
+  // handleInviteUser — InviteUserModal fängt den Fehler selbst ab und zeigt ihn
+  // inline im Formular an (identisches Muster wie handleCreateUser/UserFormModal).
+  const handleInviteUser = async (fields) => {
+    const created = await inviteUserToApp({
+      name: fields.name,
+      email: fields.email,
+      kuerzel: "",
+      role: fields.role,
+      projectIds: fields.projectIds,
+      actor: currentActor,
+    });
+    setUsers((prev) => [...prev, created].sort((a, b) => a.name.localeCompare(b.name)));
+  };
+
+  const handleResendInvite = async (user) => {
+    try {
+      await resendUserInvite(user.email);
+      const updated = await updateUser(user.id, { invited_at: new Date().toISOString() });
+      setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, ...updated } : u)));
+    } catch (err) {
+      console.error("Einladung konnte nicht erneut gesendet werden:", err);
+      setGlobalError("Die Einladung konnte nicht erneut gesendet werden. Bitte erneut versuchen.");
+    }
+  };
+
+  const handleDeleteUser = async (user) => {
+    try {
+      await deleteUser(user.id);
+      setUsers((prev) => prev.filter((u) => u.id !== user.id));
+    } catch (err) {
+      console.error("Zugang konnte nicht entzogen werden:", err);
+      setGlobalError("Der Zugang konnte nicht entzogen werden. Bitte erneut versuchen.");
     }
   };
 
@@ -12172,7 +12879,7 @@ function App() {
           Rendering-Baum, entsprechende Datenabrufe (siehe DATA-FETCHING-Effekte weiter
           oben) laufen ebenfalls erst nach erfolgreicher Anmeldung an. */}
       {!isAuthenticated ? (
-        <LoginScreen onLogin={handleGateLogin} onRegister={handleSignUp} />
+        <LoginScreen onLogin={handleGateLogin} onRegister={handleSignUp} onForgotPassword={handleRequestPasswordReset} />
       ) : (
         <>
       {/* Top bar — klares Weiß mit feiner Umrandung statt einer dunklen Fläche: passt
@@ -12256,6 +12963,13 @@ function App() {
                   <User size={13} /> Angemeldet als {session.user?.email}
                 </span>
                 <button
+                  onClick={() => setProfileModalOpen(true)}
+                  title="Mein Profil"
+                  className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
+                >
+                  <Settings size={13} /> <span className="hidden sm:inline">Profil</span>
+                </button>
+                <button
                   onClick={handleAppLogout}
                   className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
                 >
@@ -12298,7 +13012,7 @@ function App() {
 
       {screen === "projects" && (
         <ProjectOverview
-          projects={projects}
+          projects={visibleProjects}
           loading={loadingProjects}
           onOpenProject={openProject}
           onToggleFavorite={handleToggleProjectFavorite}
@@ -12379,6 +13093,7 @@ function App() {
           project={project}
           floor={floor}
           plan={plan}
+          users={users}
           generatedBy={currentActor?.name}
           onRequestLogin={() => setAuthModalOpen(true)}
           onClose={() => setModalState(null)}
@@ -12488,6 +13203,19 @@ function App() {
           onCreateUser={handleCreateUser}
           onEditUser={handleEditUser}
           onToggleUserActive={handleToggleUserActive}
+          onInviteUser={handleInviteUser}
+          onResendInvite={handleResendInvite}
+          onDeleteUser={handleDeleteUser}
+        />
+      )}
+
+      {profileModalOpen && (
+        <ProfileModal
+          session={session}
+          currentAppUser={currentAppUser}
+          onClose={() => setProfileModalOpen(false)}
+          onUpdateEmail={handleUpdateEmail}
+          onUpdatePassword={handleUpdatePassword}
         />
       )}
 
