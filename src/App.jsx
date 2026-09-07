@@ -3481,12 +3481,27 @@ function buildFloorExportRowValues(pin, tradesById, floorName) {
 // die vollständige, tabellarische Rohdaten-Variante (inkl. Priorität, exakter
 // Plan-Position und aller Foto-Links) und daher unabhängig von der Filterleiste; diese
 // PDF-Ausgabe ist demgegenüber bewusst ein kuratierter, filterbarer visueller Bericht.
-async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, trades, generatedBy, filterSummary, includeOnboarding = false }) {
-  const jsPDF = await loadJsPdf();
-  // compress: true aktiviert jsPDFs eigene interne Bild-/Stream-Kompression zusätzlich
-  // zur bereits vor dem Einbetten durchgeführten Downscaling-Komprimierung der Fotos
-  // und der Planübersicht (siehe compressImageDataUrl).
-  const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape", compress: true });
+// Zeichnet EINEN vollständigen Skizzen-Abschnitt (Deckblatt + Planübersicht, gefolgt
+// von den fließenden Mangel-Karten inkl. Fotoraster) direkt auf ein BEREITS
+// bestehendes jsPDF-Dokument, statt selbst eines zu erzeugen und zu speichern — dieser
+// gesamte Block war ursprünglich der alleinige Inhalt von generateFloorPinsTablePdf
+// (Bericht für GENAU EINE Grundrissskizze). Durch die Auslagerung kann exakt dieselbe,
+// unveränderte Zeichenlogik jetzt zweimal wiederverwendet werden: einmal für den
+// weiterhin bestehenden Einzelskizzen-Export (siehe generateFloorPinsTablePdf unten,
+// dünner Wrapper der EIN Dokument erzeugt, hier genau einmal zeichnet und speichert)
+// und einmal für den neuen Sammelbericht über mehrere vom Nutzer ausgewählte Skizzen
+// eines Geschosses (siehe generateMultiSketchFloorReportPdf weiter unten, derselbe
+// Aufruf in einer Schleife über alle ausgewählten Skizzen auf EIN gemeinsames
+// Dokument). isFirstSection steuert nur, ob VOR dem Zeichnen eine neue Querformat-
+// Seite begonnen wird: bei der ersten Skizze eines Dokuments ist die Ausgangsseite
+// bereits im richtigen Format angelegt (siehe new jsPDF({..., orientation:
+// "landscape"}) beim Aufrufer), bei jeder weiteren Skizze im selben Sammelbericht
+// dagegen nicht — dort würde ohne addPage() die letzte Foto-/Mangel-Karten-Seite der
+// vorherigen Skizze (Hochformat) einfach weiterbeschrieben.
+async function drawFloorPinsReportSection(
+  doc,
+  { project, floor, plan, pins, allPins, trades, generatedBy, filterSummary, includeOnboarding = false, isFirstSection = true }
+) {
   const tradesById = new Map((trades || []).map((t) => [t.id, t]));
 
   const bold = () => doc.setFont("helvetica", "bold");
@@ -3507,7 +3522,8 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
     .map((pin) => ({ ...pin, exportNumber: exportNumberEntryById.get(pin.id)?.label ?? "" }))
     .sort((a, b) => comparePinNumberEntries(exportNumberEntryById.get(a.id), exportNumberEntryById.get(b.id)));
 
-  // ---- Seite 1 — Deckblatt & visuelle Planübersicht -------------------------------
+  // ---- Seite 1 (dieser Skizze) — Deckblatt & visuelle Planübersicht ---------------
+  if (!isFirstSection) doc.addPage("a4", "landscape");
   {
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
@@ -3864,10 +3880,75 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       y = cardBottom + cardBottomGap;
     }
   }
+}
 
+// Dünner Wrapper um drawFloorPinsReportSection (siehe dort) für den weiterhin
+// unverändert bestehenden Einzelskizzen-Export (Bericht für GENAU EINE
+// Grundrissskizze, siehe handleExportFloor in FloorPlanView) — erzeugt EIN neues
+// jsPDF-Dokument, zeichnet exakt einen Abschnitt hinein und speichert die Datei.
+// Signatur, Verhalten und Dateiname bleiben zu 100% wie zuvor.
+async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, trades, generatedBy, filterSummary, includeOnboarding = false }) {
+  const jsPDF = await loadJsPdf();
+  // compress: true aktiviert jsPDFs eigene interne Bild-/Stream-Kompression zusätzlich
+  // zur bereits vor dem Einbetten durchgeführten Downscaling-Komprimierung der Fotos
+  // und der Planübersicht (siehe compressImageDataUrl).
+  const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape", compress: true });
+  await drawFloorPinsReportSection(doc, {
+    project,
+    floor,
+    plan,
+    pins,
+    allPins,
+    trades,
+    generatedBy,
+    filterSummary,
+    includeOnboarding,
+    isFirstSection: true,
+  });
   const fileName = `${sanitizeFileNamePart(project.name)}_${sanitizeFileNamePart(floor.name)}${
     plan?.name ? `_${sanitizeFileNamePart(plan.name)}` : ""
   }_Grundrissbericht_${new Date().toISOString().slice(0, 10)}.pdf`;
+  doc.save(fileName);
+  return fileName;
+}
+
+// ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": Sammelbericht über
+// eine vom Nutzer in der Geschossansicht gezielt gewählte Teilmenge der Grundriss-
+// skizzen eines Geschosses (siehe SketchExportModal/handleExportSelectedSketchesPdf) —
+// EIN gemeinsames PDF-Dokument, in dem für jede ausgewählte Skizze exakt derselbe
+// Abschnitt erscheint wie im bisherigen Einzelskizzen-Bericht (Deckblatt mit
+// nummerierten Pin-Markierungen, anschließend die fließenden Mangel-Karten inkl.
+// 2-Spalten-Fotoraster, siehe drawFloorPinsReportSection oben) — nicht ausgewählte
+// Skizzen tauchen im Ergebnis-PDF an keiner Stelle auf. plans ist die vom Nutzer im
+// Auswahl-Modal bestätigte Teilmenge (in der gewünschten Reihenfolge, siehe dort);
+// pinsByPlanId ordnet jeder Skizzen-ID ihre VOLLSTÄNDIGE, ungefilterte Pin-Liste
+// (inkl. Fotos) zu — diese Funktion filtert selbst nicht, das aufrufende
+// handleExportSelectedSketchesPdf lädt bereits gezielt nur die benötigten Daten.
+async function generateMultiSketchFloorReportPdf({ project, floor, plans, pinsByPlanId, trades, generatedBy, includeOnboarding = false }) {
+  const jsPDF = await loadJsPdf();
+  const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape", compress: true });
+  for (let i = 0; i < plans.length; i++) {
+    const plan = plans[i];
+    const planPins = pinsByPlanId.get(plan.id) || [];
+    await drawFloorPinsReportSection(doc, {
+      project,
+      floor,
+      plan,
+      pins: planPins,
+      allPins: planPins,
+      trades,
+      generatedBy,
+      // Der Sammelbericht kennt keine aktive Filter-/Suchleiste (die gibt es nur in
+      // der Live-Planansicht einer einzelnen Skizze) — filterSummary bleibt daher
+      // immer leer, jede ausgewählte Skizze erscheint vollständig ungefiltert.
+      filterSummary: null,
+      includeOnboarding,
+      isFirstSection: i === 0,
+    });
+  }
+  const fileName = `${sanitizeFileNamePart(project.name)}_${sanitizeFileNamePart(floor.name)}_Sammelbericht_${plans.length}_Skizzen_${new Date()
+    .toISOString()
+    .slice(0, 10)}.pdf`;
   doc.save(fileName);
   return fileName;
 }
@@ -9618,13 +9699,194 @@ function FloorOverview({
 }
 
 // ----------------------------------------------------------------------------------
+// ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": Auswahl-Modal für
+// den PDF-Sammelbericht mehrerer Grundrisskizzen EINES Geschosses (siehe
+// SketchOverview unten, "Skizzen für PDF auswählen"). Listet alle Skizzen des
+// Geschosses mit Checkbox, Vorschau/Titel und Pin-Anzahl auf — standardmäßig sind
+// alle vorausgewählt (spart in der Praxis am häufigsten Klicks: meist soll ohnehin
+// das gesamte Geschoss exportiert werden, gezielt EINZELNE Skizzen abzuwählen ist der
+// Ausnahmefall). Die eigentliche PDF-Erzeugung (inkl. Nachladen der vollständigen
+// Pin-/Fotodaten aller AUSGEWÄHLTEN Skizzen) übernimmt onExport im Aufrufer (siehe
+// handleExportSelectedSketchesPdf in App) — dieses Modal kennt selbst keine
+// Supabase-Zugriffe, exakt wie NewFloorPlanModal/EditFloorPlanModal nebenan.
+function SketchExportModal({ floor, plans, project, onClose, onExport }) {
+  const [selectedIds, setSelectedIds] = useState(() => new Set((plans || []).map((p) => p.id)));
+  const [includeOnboarding, setIncludeOnboarding] = useState(() => hasOnboardingInfo(project));
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState("");
+
+  const toggle = (id) => {
+    if (exporting) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const selectAll = () => !exporting && setSelectedIds(new Set((plans || []).map((p) => p.id)));
+  const selectNone = () => !exporting && setSelectedIds(new Set());
+
+  const handleExport = async () => {
+    if (selectedIds.size === 0) {
+      setError("Bitte mindestens eine Grundrissskizze auswählen.");
+      return;
+    }
+    setError("");
+    setExporting(true);
+    try {
+      // Reihenfolge im PDF folgt der Anzeigereihenfolge in diesem Modal (= Reihenfolge
+      // von plans, siehe SketchOverview — nach Anlagedatum), nicht der Klickreihenfolge
+      // der Checkboxen.
+      const selectedPlans = (plans || []).filter((p) => selectedIds.has(p.id));
+      // onExport (siehe handleExportSelectedSketchesPdf in App) lädt erst die
+      // vollständigen Pin-/Fotodaten der ausgewählten Skizzen nach und löst danach
+      // synchron den Browser-Download aus (doc.save, siehe generateMultiSketchFloorReportPdf)
+      // — erst NACH erfolgreichem Abschluss wird das Modal hier geschlossen, bei einem
+      // Fehler bleibt es offen und zeigt die Fehlermeldung unten.
+      await onExport(selectedPlans, { includeOnboarding });
+      onClose();
+    } catch (err) {
+      console.error("PDF-Sammelbericht konnte nicht erstellt werden:", err);
+      setError(err?.message || "Der PDF-Sammelbericht konnte nicht erstellt werden. Bitte erneut versuchen.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const total = (plans || []).length;
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-50`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[85vh] sm:max-w-lg sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>{floor?.name}</p>
+            <h2 className="text-lg font-bold text-slate-900">Skizzen für PDF-Sammelbericht</h2>
+          </div>
+          <button onClick={onClose} disabled={exporting} className={MODAL_CLOSE_BTN_DISABLED}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 border-b border-slate-100 px-5 py-2.5">
+          <button
+            type="button"
+            onClick={selectAll}
+            disabled={exporting}
+            className="text-xs font-semibold text-[#FF2A00] transition hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Alle auswählen
+          </button>
+          <span className="text-slate-300">·</span>
+          <button
+            type="button"
+            onClick={selectNone}
+            disabled={exporting}
+            className="text-xs font-semibold text-slate-500 transition hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Auswahl aufheben
+          </button>
+          <span className="ml-auto text-xs font-medium text-slate-400">
+            {selectedIds.size} von {total} ausgewählt
+          </span>
+        </div>
+
+        <div className="flex-1 space-y-1.5 overflow-y-auto px-5 py-3">
+          {total === 0 ? (
+            <p className="py-6 text-center text-sm text-slate-400">Dieses Geschoss enthält noch keine Grundrisskizzen.</p>
+          ) : (
+            (plans || []).map((plan) => {
+              const planKind = resolveFloorKind(plan);
+              const isCad = planKind === "cad";
+              const isPdf = planKind === "pdf";
+              const pinCount = (plan.pins || []).length;
+              const checked = selectedIds.has(plan.id);
+              return (
+                <label
+                  key={plan.id}
+                  className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 transition ${
+                    checked ? "border-[#FF2A00]/40 bg-red-50/50" : "border-slate-200 hover:bg-slate-50"
+                  } ${exporting ? "cursor-not-allowed opacity-70" : ""}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggle(plan.id)}
+                    disabled={exporting}
+                    className="h-4 w-4 shrink-0 accent-[#FF2A00]"
+                  />
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-900">
+                    {isCad ? (
+                      <Ruler size={16} className="text-sky-300" />
+                    ) : isPdf ? (
+                      <FileText size={16} className="text-rose-400" />
+                    ) : (
+                      <img src={plan.image_url} alt="" className="h-full w-full object-cover opacity-80" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold text-slate-800">{plan.name}</p>
+                    <p className="text-[11px] text-slate-400">
+                      {pinCount} Pin{pinCount !== 1 ? "s" : ""}
+                    </p>
+                  </div>
+                </label>
+              );
+            })
+          )}
+        </div>
+
+        {hasOnboardingInfo(project) && (
+          <label className="flex cursor-pointer items-start gap-2 border-t border-slate-100 px-5 py-2.5 hover:bg-slate-50">
+            <input
+              type="checkbox"
+              checked={includeOnboarding}
+              onChange={(e) => setIncludeOnboarding(e.target.checked)}
+              disabled={exporting}
+              className="mt-0.5 accent-[#FF2A00]"
+            />
+            <span className="text-[11px] leading-snug text-slate-600">
+              Baustellen-Info auf der ersten Seite jeder ausgewählten Skizze einbinden
+            </span>
+          </label>
+        )}
+
+        {error && <p className="border-t border-slate-100 px-5 pt-2 text-xs font-medium text-rose-600">{error}</p>}
+
+        <div className={MODAL_FOOTER_ROW}>
+          <button onClick={onClose} disabled={exporting} className={BTN_SECONDARY}>
+            Abbrechen
+          </button>
+          <button onClick={handleExport} disabled={exporting || selectedIds.size === 0} className={BTN_PRIMARY}>
+            {exporting ? <Loader2 size={16} className="animate-spin" /> : <FileDown size={16} />}
+            {exporting ? "Wird erstellt…" : `PDF erstellen (${selectedIds.size})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
 // SCREEN 3: GRUNDRISSSKIZZEN-ÜBERSICHT je Geschoss
 // Ein Geschoss kann mehrere Grundrisskizzen enthalten (z.B. "Grundriss Gesamt",
 // "Bereich A / Nord", "Detailplan Haustechnik") — erst der Klick auf eine konkrete
 // Skizze führt zur interaktiven Planansicht (Screen 4) mit den daran gebundenen Pins.
 // ----------------------------------------------------------------------------------
 
-function SketchOverview({ floor, plans, loading, onBack, onOpenPlan, onOpenAddPlan, onEditPlan, onDeletePlan, readOnly = false }) {
+function SketchOverview({
+  floor,
+  plans,
+  loading,
+  onBack,
+  onOpenPlan,
+  onOpenAddPlan,
+  onEditPlan,
+  onDeletePlan,
+  onOpenExportModal,
+  readOnly = false,
+}) {
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <button
@@ -9641,12 +9903,27 @@ function SketchOverview({ floor, plans, loading, onBack, onOpenPlan, onOpenAddPl
             Grundrisskizzen dieses Geschosses — jede Skizze hat ihre eigenen Pins und Mängel.
           </p>
         </div>
-        <button
-          onClick={onOpenAddPlan}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
-        >
-          <Plus size={16} /> Neue Grundrissskizze hinzufügen
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": eigener,
+              zusätzlicher Button neben dem bisherigen "Neue Grundrissskizze
+              hinzufügen" — öffnet SketchExportModal, in dem gezielt einzelne Skizzen
+              dieses Geschosses für EINEN gemeinsamen PDF-Sammelbericht ausgewählt
+              werden können. Nur sichtbar, wenn überhaupt Skizzen vorhanden sind. */}
+          {plans.length > 0 && (
+            <button
+              onClick={onOpenExportModal}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-600 shadow-sm transition hover:border-[#FF2A00] hover:text-[#FF2A00]"
+            >
+              <FileDown size={16} /> Skizzen für PDF auswählen
+            </button>
+          )}
+          <button
+            onClick={onOpenAddPlan}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+          >
+            <Plus size={16} /> Neue Grundrissskizze hinzufügen
+          </button>
+        </div>
       </div>
 
       {loading ? (
@@ -12887,6 +13164,9 @@ function App() {
   const [editFloorPlanModalState, setEditFloorPlanModalState] = useState(null); // { plan }
   const [deleteFloorPlanConfirm, setDeleteFloorPlanConfirm] = useState(null); // { target }
   const [deleteFloorPlanBusy, setDeleteFloorPlanBusy] = useState(false);
+  // ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL" — siehe
+  // SketchExportModal/handleExportSelectedSketchesPdf weiter unten.
+  const [sketchExportModalOpen, setSketchExportModalOpen] = useState(false);
   const [projectModalState, setProjectModalState] = useState(null); // { mode: "create" | "edit", project }
   const [deleteConfirm, setDeleteConfirm] = useState(null); // { target }
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -13743,6 +14023,44 @@ function App() {
     // und zeigt einen Fehlertext direkt im Modal, falls Upload oder Insert scheitern —
     // das Modal bleibt in diesem Fall offen, bereits erfolgreich hochgeladene Dateien
     // sind zu diesem Zeitpunkt aber schon oben in floorPlans übernommen.
+  };
+
+  const openSketchExportModal = () => setSketchExportModalOpen(true);
+
+  // ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": erzeugt EINEN
+  // gemeinsamen PDF-Sammelbericht über die im SketchExportModal vom Nutzer
+  // ausgewählte Teilmenge der Grundrisskizzen des aktuellen Geschosses. floorPlans
+  // (Ebene-3-State) enthält je Skizze bewusst nur eine LEICHTGEWICHTIGE Pin-
+  // Zusammenfassung (nur id + status, siehe fetchFloorPlansWithPinSummary — reicht für
+  // die Status-Badges/Checkbox-Liste in SketchOverview/SketchExportModal, aber nicht
+  // für einen PDF-Bericht mit Fotos). Für den tatsächlichen Bericht werden daher hier
+  // gezielt die VOLLSTÄNDIGEN Pins (inkl. Fotos) aller Skizzen dieses Geschosses in
+  // EINEM Request nachgeladen (fetchPinsForFloor — dieselbe, bereits für den
+  // projektweiten Export genutzte Funktion, siehe fetchAllPinsForProject) und
+  // anschließend client-seitig nach plan_id gruppiert; nicht ausgewählte Skizzen
+  // werden dabei schlicht nie in pinsByPlanId nachgeschlagen und tauchen im
+  // Ergebnis-PDF an keiner Stelle auf.
+  const handleExportSelectedSketchesPdf = async (selectedPlans, { includeOnboarding }) => {
+    if (!floor) return;
+    const allFloorPins = await fetchPinsForFloor(floor.id);
+    const pinsByPlanId = new Map();
+    for (const pin of allFloorPins) {
+      const list = pinsByPlanId.get(pin.plan_id) || [];
+      list.push(pin);
+      pinsByPlanId.set(pin.plan_id, list);
+    }
+    await generateMultiSketchFloorReportPdf({
+      project,
+      floor,
+      plans: selectedPlans,
+      pinsByPlanId,
+      trades: projectTrades,
+      generatedBy: currentActor?.name,
+      includeOnboarding: includeOnboarding && hasOnboardingInfo(project),
+    });
+    // Fehler werden NICHT hier gefangen: SketchExportModal wartet auf dieses Promise
+    // und zeigt einen Fehlertext direkt im Modal, falls Nachladen oder PDF-Erzeugung
+    // scheitern — das Modal bleibt in diesem Fall bewusst offen.
   };
 
   const openEditFloorPlanModal = (plan) => {
@@ -14666,6 +14984,7 @@ function App() {
           onOpenAddPlan={openFloorPlanModal}
           onEditPlan={openEditFloorPlanModal}
           onDeletePlan={handleDeleteFloorPlanClick}
+          onOpenExportModal={openSketchExportModal}
           readOnly={!session}
         />
       )}
@@ -14761,6 +15080,16 @@ function App() {
 
       {floorPlanModalOpen && (
         <NewFloorPlanModal floor={floor} onClose={() => setFloorPlanModalOpen(false)} onSave={handleAddFloorPlanSketch} />
+      )}
+
+      {sketchExportModalOpen && floor && (
+        <SketchExportModal
+          floor={floor}
+          plans={floorPlans}
+          project={project}
+          onClose={() => setSketchExportModalOpen(false)}
+          onExport={handleExportSelectedSketchesPdf}
+        />
       )}
 
       {editFloorPlanModalState && (
