@@ -251,11 +251,61 @@ const PIN_FIELD_LABELS = {
   title: "Titel",
   description: "Beschreibung",
   priority: "Priorität",
-  trade_id: "Gewerk",
+  trade_ids: "Gewerke",
   angle: "Blickrichtung",
   due_date: "Frist / Fälligkeitsdatum",
   area: "Bereich",
 };
+
+// MULTI-SELECT GEWERKE JE PIN (siehe ANFORDERUNG "Multi-Select Trades for Pins"): ein
+// Pin kann jetzt mehreren Gewerken gleichzeitig zugeordnet sein, gespeichert als
+// Array von Gewerke-IDs in pins.trade_ids (siehe supabase_schema_v19_pin_multi_trade.sql).
+// getPinTradeIds() ist die EINZIGE Stelle, an der ein Pin-Datensatz auf seine
+// zugeordneten Gewerke-IDs abgefragt wird — bevorzugt das neue trade_ids-Array, fällt
+// für ältere bzw. rein offline zwischengespeicherte Pin-Datensätze (vor dieser
+// Erweiterung angelegt oder noch nicht synchronisiert) auf das frühere Einzelfeld
+// trade_id zurück, damit eine bestehende Gewerke-Zuordnung dabei nicht stillschweigend
+// verloren geht. getPinTradeNames() baut daraus die kommagetrennte Anzeige ("Trockenbau,
+// Maler, Fliesenleger"), einheitlich für Pin-Detailansicht, kompakte Tabelle unter dem
+// Grundriss, PDF-Export und CSV/Excel-Export.
+function getPinTradeIds(pin) {
+  if (!pin) return [];
+  // Bewusst NICHT auf "trade_ids nicht leer" geprüft, sondern nur darauf, ob das Feld
+  // überhaupt als Array vorliegt: ein bereits vorhandenes, aber bewusst leeres Array
+  // (z.B. weil zuletzt explizit alle Gewerke wieder abgewählt wurden) muss als "keine
+  // Gewerke zugeordnet" gelten dürfen, statt fälschlich auf ein ggf. noch vorhandenes,
+  // veraltetes Einzelfeld trade_id zurückzufallen. Der Fallback greift also NUR, wenn
+  // trade_ids am Pin-Objekt komplett fehlt — das betrifft ausschließlich vor dieser
+  // Erweiterung angelegte, noch nicht synchronisierte Offline-Datensätze.
+  if (Array.isArray(pin.trade_ids)) return pin.trade_ids;
+  if (pin.trade_id) return [pin.trade_id];
+  return [];
+}
+
+function getPinTradeNames(pin, tradesById) {
+  const ids = getPinTradeIds(pin);
+  if (ids.length === 0) return "";
+  return ids
+    .map((id) => tradesById.get(id)?.name)
+    .filter(Boolean)
+    .join(", ");
+}
+
+// Vergleicht einen einzelnen Feldwert zwischen dem neu gespeicherten Stand (fields[key])
+// und dem vorherigen Pin (prevPin[key]) für die Bearbeitungshistorie (siehe
+// handleSaveFields) — bei trade_ids reicht ein einfacher !==-Vergleich nicht, da bei
+// jedem Speichern ein NEUES Array-Objekt entsteht (React-State), selbst wenn die
+// enthaltenen Gewerke-IDs unverändert sind; ein reiner Referenzvergleich hätte hier bei
+// JEDER Speicherung fälschlich "Gewerke geändert" protokolliert.
+function pinFieldValueChanged(key, newVal, oldVal) {
+  if (key === "trade_ids") {
+    const a = Array.isArray(newVal) ? [...newVal].sort() : [];
+    const b = Array.isArray(oldVal) ? [...oldVal].sort() : [];
+    if (a.length !== b.length) return true;
+    return a.some((v, i) => v !== b[i]);
+  }
+  return newVal !== oldVal;
+}
 
 // Menschenlesbare Bezeichnungen + Icons für die Aktions-Typen in pin_activity_log —
 // verwendet sowohl im Verlauf im Pin-Modal als auch im PDF-Export.
@@ -1349,7 +1399,7 @@ async function deleteFloorPlanSketch(plan) {
 // (planId) gebunden; floor_id wird zusätzlich mitgeschrieben, ausschließlich für die
 // geschossweite Kennzahlen-Aggregation in der Geschossübersicht (Ebene 2).
 //
-// overrides (optional): title/description/priority/trade_id, mit denen die sonst
+// overrides (optional): title/description/priority/trade_ids, mit denen die sonst
 // generischen Standardwerte überschrieben werden können — allgemeine, optionale
 // Erweiterung mit Default {} statt einer neuen, parallelen Funktion. Das direkte
 // Duplizieren eines bestehenden Pins (siehe "Mangel duplizieren" im PinModal-Kopf)
@@ -1367,7 +1417,7 @@ async function createPin(planId, floorId, x, y, actor, overrides = {}) {
       status: "offen",
       priority: overrides.priority || "mittel",
       assigned_to: "",
-      trade_id: overrides.trade_id || null,
+      trade_ids: overrides.trade_ids || [],
       x,
       y,
       angle: 0,
@@ -1451,7 +1501,7 @@ async function deletePin(pin) {
 
 // "Mangel duplizieren" (siehe Duplizieren-Button im PinModal-Kopf, handleDuplicatePin
 // in App): legt SOFORT eine vollständige Kopie des übergebenen Pins an — Titel,
-// Beschreibung, Status, Priorität, Gewerk, Bereich, Frist und Blickrichtung werden 1:1
+// Beschreibung, Status, Priorität, Gewerke, Bereich, Frist und Blickrichtung werden 1:1
 // übernommen. Fotos werden BEWUSST NICHT mitkopiert: eine Kopie dokumentiert
 // typischerweise einen ähnlichen, aber eigenständigen Mangel an anderer Stelle — die
 // Fotos des Originals würden dort den falschen Ort zeigen. Die Kopie erscheint minimal
@@ -1480,7 +1530,7 @@ async function duplicatePin(sourcePin, actor) {
       status: sourcePin.status,
       priority: sourcePin.priority,
       assigned_to: "",
-      trade_id: sourcePin.trade_id || null,
+      trade_ids: getPinTradeIds(sourcePin),
       area: sourcePin.area || "",
       due_date: sourcePin.due_date || null,
       x: clampCoord((sourcePin.x ?? 50) + 2),
@@ -2903,7 +2953,9 @@ async function fetchAllPinsForProject(floors) {
 function filterExportPins(pins, filters) {
   return pins.filter((pin) => {
     if (filters.floorIds?.length && !filters.floorIds.includes(pin.floor.id)) return false;
-    if (filters.tradeIds?.length && !filters.tradeIds.includes(pin.trade_id)) return false;
+    // Ein Pin gilt als Treffer, sobald IRGENDEINES seiner (ggf. mehreren) Gewerke in der
+    // Filterauswahl enthalten ist (siehe getPinTradeIds — Mehrfachauswahl je Pin).
+    if (filters.tradeIds?.length && !getPinTradeIds(pin).some((id) => filters.tradeIds.includes(id))) return false;
     if (filters.statuses?.length && !filters.statuses.includes(pin.status)) return false;
     if (filters.creators?.length && !filters.creators.includes(pin.created_by)) return false;
     if (filters.fromDate && new Date(pin.created_at) < new Date(`${filters.fromDate}T00:00:00`)) return false;
@@ -3312,7 +3364,7 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     field("Grundrissskizze", pin.plan?.name);
     field("Status", STATUS[pin.status]?.label || pin.status);
     field("Priorität", PRIORITY[pin.priority]?.label || pin.priority);
-    field("Gewerk", tradesById.get(pin.trade_id)?.name);
+    field("Gewerke", getPinTradeNames(pin, tradesById) || null);
     field("Bereich", pin.area);
     field("Frist", pin.due_date ? formatDateOnly(pin.due_date) : null);
     field("Ersteller", pin.created_by);
@@ -3394,7 +3446,11 @@ function buildFloorExportRowValues(pin, tradesById, floorName) {
     number: String(pin.exportNumber),
     recordedDate: formatDateShort(pin.created_at),
     topic: pin.title || "–",
-    trade: tradesById.get(pin.trade_id)?.name || "–",
+    // Mehrere Gewerke kommagetrennt (siehe getPinTradeNames/ANFORDERUNG "Multi-Select
+    // Trades for Pins") — der Feldname "trade" (Einzahl) bleibt aus Kompatibilität zu
+    // allen bestehenden Aufrufstellen unten unverändert, der Inhalt ist jetzt aber
+    // ggf. eine kommagetrennte Liste mehrerer Gewerke statt nur eines einzelnen Namens.
+    trade: getPinTradeNames(pin, tradesById) || "–",
     area: pin.area || "–",
     floor: floorName || "–",
     status: STATUS[pin.status]?.label || pin.status || "–",
@@ -3647,7 +3703,7 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       // weiter unten) steht für Datenfakten und Kommentar die gesamte Breite zur
       // Verfügung, was auch die Lesbarkeit langer Kommentare verbessert.
       const shortFieldDefs = [
-        ["Gewerk", rowValues.trade],
+        ["Gewerke", rowValues.trade],
         ["Bereich", rowValues.area],
       ];
       const shortFields = shortFieldDefs.map(([label, value]) => {
@@ -3840,7 +3896,9 @@ function pinsToFloorExportRows(pins, trades, floorName) {
       Aufnahmedatum: formatDateShort(pin.created_at),
       Thema: pin.title || "",
       Anschlussbezeichnung: pin.reference_code || "",
-      Gewerk: tradesById.get(pin.trade_id)?.name || "",
+      // Mehrere Gewerke kommagetrennt in einer Spalte (siehe getPinTradeNames/
+      // ANFORDERUNG "Multi-Select Trades for Pins") statt bisher genau einem Namen.
+      Gewerke: getPinTradeNames(pin, tradesById) || "",
       Bereich: pin.area || "",
       Geschoss: floorName || "",
       Status: STATUS[pin.status]?.label || pin.status || "",
@@ -4108,7 +4166,7 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
   };
   field("Projekt", project?.name);
   field("Etage", floor?.name);
-  field("Gewerk", rowValues.trade);
+  field("Gewerke", rowValues.trade);
   field("Bereich", rowValues.area);
 
   doc.setFontSize(7.5);
@@ -10665,7 +10723,9 @@ function FloorPlanView({
   const searchNormalized = searchQuery.trim().toLowerCase();
   const visiblePins = pins.filter((p) => {
     if (statusFilter !== "all" && p.status !== statusFilter) return false;
-    if (tradeFilterIds.length > 0 && !tradeFilterIds.includes(p.trade_id)) return false;
+    // Ein Pin gilt als Treffer, sobald IRGENDEINES seiner (ggf. mehreren) Gewerke in der
+    // Filterauswahl enthalten ist (siehe getPinTradeIds — Mehrfachauswahl je Pin).
+    if (tradeFilterIds.length > 0 && !getPinTradeIds(p).some((id) => tradeFilterIds.includes(id))) return false;
     if (searchNormalized) {
       const haystack = [String(pinNumberById.get(p.id) || ""), p.title, p.area, p.assigned_to, p.description]
         .filter(Boolean)
@@ -11161,7 +11221,7 @@ function FloorPlanView({
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-sm font-semibold text-slate-800">{pin.title}</span>
                     <span className="block truncate text-xs text-slate-400">
-                      {tradesById.get(pin.trade_id)?.name || "Kein Gewerk"}
+                      {getPinTradeNames(pin, tradesById) || "Kein Gewerk"}
                     </span>
                   </span>
                   <span
@@ -11964,7 +12024,9 @@ function PinModal({
     priority: pin.priority,
     description: pin.description,
     angle: pin.angle ?? 0,
-    trade_id: pin.trade_id || "",
+    // Mehrfachauswahl (siehe ANFORDERUNG "Multi-Select Trades for Pins"): getPinTradeIds
+    // fängt auch ältere, noch mit dem früheren Einzelfeld trade_id angelegte Pins ab.
+    trade_ids: getPinTradeIds(pin),
     dueDate: pin.due_date || "",
     area: pin.area || "",
   });
@@ -11986,6 +12048,18 @@ function PinModal({
   const update = (field, value) => {
     if (readOnly) return;
     setDraft((d) => ({ ...d, [field]: value }));
+  };
+
+  // An-/Abwählen eines einzelnen Gewerks in der Mehrfachauswahl (siehe TradeChipsPicker
+  // unten, ANFORDERUNG "Multi-Select Trades for Pins") — toggelt ausschließlich die
+  // angeklickte ID, alle bereits gewählten anderen Gewerke bleiben unverändert erhalten.
+  const toggleTrade = (tradeId) => {
+    if (readOnly) return;
+    setDraft((d) => {
+      const current = d.trade_ids || [];
+      const next = current.includes(tradeId) ? current.filter((id) => id !== tradeId) : [...current, tradeId];
+      return { ...d, trade_ids: next };
+    });
   };
 
   // "Mangel duplizieren" (siehe onDuplicate/handleDuplicatePin in App): übergibt den
@@ -12021,7 +12095,7 @@ function PinModal({
         priority: draft.priority,
         description: draft.description,
         angle: draft.angle,
-        trade_id: draft.trade_id || null,
+        trade_ids: draft.trade_ids || [],
         due_date: draft.dueDate || null,
         area: draft.area.trim(),
       });
@@ -12207,45 +12281,32 @@ function PinModal({
             </div>
           </div>
 
-          {/* Gewerk & Bereich nebeneinander — "Anschlussbezeichnung" und "Firma /
-              Zuständige Person" wurden entfernt (siehe PDF LAYOUT CLEANUP-
-              Anforderung: beide Felder komplett aus Anlege-/Bearbeiten-Modal und
-              PDF-Bericht entfernt). */}
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <div>
-              <FieldLabel>Gewerk</FieldLabel>
-              <div className="relative">
-                <Wrench className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                <select
-                  value={draft.trade_id || ""}
-                  onChange={(e) => update("trade_id", e.target.value)}
-                  disabled={readOnly}
-                  className="w-full appearance-none rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
-                >
-                  <option value="">Kein Gewerk zugeordnet</option>
-                  {(trades || [])
-                    .filter((t) => t.active || t.id === pin.trade_id)
-                    .map((t) => (
-                      <option key={t.id} value={t.id}>
-                        {t.name}
-                        {!t.active ? " (inaktiv)" : ""}
-                      </option>
-                    ))}
-                </select>
-              </div>
-            </div>
-            <div>
-              <FieldLabel>Bereich</FieldLabel>
-              <div className="relative">
-                <MapPin className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                <input
-                  value={draft.area}
-                  onChange={(e) => update("area", e.target.value)}
-                  disabled={readOnly}
-                  placeholder="z.B. Flur Nord"
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
-                />
-              </div>
+          {/* Gewerke (Mehrfachauswahl, siehe ANFORDERUNG "Multi-Select Trades for
+              Pins") — bekommt als Chip-Auswahl bewusst die volle Modalbreite statt wie
+              zuvor die halbe Spalte des früheren Dropdowns, damit mehrere gewählte
+              Gewerke lesbar umbrechen können. Bereich bleibt als eigenes Feld direkt
+              darunter. "Anschlussbezeichnung" und "Firma / Zuständige Person" wurden
+              entfernt (siehe PDF LAYOUT CLEANUP-Anforderung: beide Felder komplett aus
+              Anlege-/Bearbeiten-Modal und PDF-Bericht entfernt). */}
+          <div>
+            <FieldLabel>Gewerke</FieldLabel>
+            {/* TradeChipsPicker filtert intern bereits selbst auf "aktiv ODER aktuell
+                ausgewählt" anhand von selected (siehe Komponente oben) — ein bereits
+                gewähltes, inzwischen deaktiviertes Gewerk bleibt dadurch sichtbar,
+                ohne dass hier zusätzlich vorgefiltert werden muss. */}
+            <TradeChipsPicker trades={trades} selected={draft.trade_ids || []} onToggle={toggleTrade} disabled={readOnly} />
+          </div>
+          <div>
+            <FieldLabel>Bereich</FieldLabel>
+            <div className="relative">
+              <MapPin className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+              <input
+                value={draft.area}
+                onChange={(e) => update("area", e.target.value)}
+                disabled={readOnly}
+                placeholder="z.B. Flur Nord"
+                className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+              />
             </div>
           </div>
 
@@ -12874,14 +12935,16 @@ function App() {
   // Gewerk-Auswahl im Mängel-Modal (PinModal).
   const projectTradeIds = resolveProjectTradeIds(project);
   const projectTrades = projectTradeIds === null ? trades : trades.filter((t) => projectTradeIds.includes(t.id));
-  // Ist dem aktuell geöffneten Pin ein Gewerk zugeordnet, das (z.B. durch eine
-  // spätere Änderung der Projekt-Gewerke) nicht mehr in projectTrades enthalten ist,
-  // wird es dem Pin-Modal zusätzlich mitgegeben — sonst würde eine bestehende
-  // Zuordnung im Dropdown kommentarlos verschwinden, statt nur nicht mehr neu
-  // wählbar zu sein.
-  const activePinTrade = activePin?.trade_id ? trades.find((t) => t.id === activePin.trade_id) : null;
-  const pinModalTrades =
-    activePinTrade && !projectTrades.some((t) => t.id === activePinTrade.id) ? [...projectTrades, activePinTrade] : projectTrades;
+  // Sind dem aktuell geöffneten Pin ein oder mehrere Gewerke zugeordnet, die (z.B.
+  // durch eine spätere Änderung der Projekt-Gewerke) nicht mehr in projectTrades
+  // enthalten sind, werden sie dem Pin-Modal zusätzlich mitgegeben — sonst würde eine
+  // bestehende Zuordnung in der Chip-Auswahl kommentarlos verschwinden, statt nur
+  // nicht mehr neu wählbar zu sein (siehe TradeChipsPicker/getPinTradeIds).
+  const activePinExtraTrades = getPinTradeIds(activePin)
+    .filter((id) => !projectTrades.some((t) => t.id === id))
+    .map((id) => trades.find((t) => t.id === id))
+    .filter(Boolean);
+  const pinModalTrades = activePinExtraTrades.length > 0 ? [...projectTrades, ...activePinExtraTrades] : projectTrades;
 
   // Verknüpft die angemeldete Supabase-Auth-Session (nur E-Mail bekannt) mit dem
   // fachlichen Benutzerprofil aus app_users, sofern eines mit derselben E-Mail-
@@ -13906,7 +13969,7 @@ function App() {
           status: "offen",
           priority: overrides.priority || "mittel",
           assigned_to: "",
-          trade_id: overrides.trade_id || null,
+          trade_ids: overrides.trade_ids || [],
           x,
           y,
           angle: 0,
@@ -14045,9 +14108,16 @@ function App() {
         });
       }
       if (prevPin) {
-        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter(
-          (key) => Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== prevPin[key]
-        );
+        // pinFieldValueChanged statt eines rohen !==-Vergleichs: bei trade_ids (Array,
+        // siehe Multi-Select Gewerke) entsteht bei JEDEM Speichern ein neues Array-
+        // Objekt, ein reiner Referenzvergleich hätte hier fälschlich immer "geändert"
+        // protokolliert. getPinTradeIds(prevPin) statt prevPin.trade_ids direkt fängt
+        // zusätzlich ältere, noch nicht auf trade_ids migrierte Pin-Datensätze ab.
+        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter((key) => {
+          if (!Object.prototype.hasOwnProperty.call(fields, key)) return false;
+          const oldVal = key === "trade_ids" ? getPinTradeIds(prevPin) : prevPin[key];
+          return pinFieldValueChanged(key, fields[key], oldVal);
+        });
         if (changedLabels.length > 0) {
           updatedDetail = `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}`;
           newActivity.push({
@@ -14085,9 +14155,16 @@ function App() {
         newActivity.push(await logPinActivity(pinId, "status_changed", `Status: ${fromLabel} → ${toLabel}`, currentActor));
       }
       if (prevPin) {
-        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter(
-          (key) => Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== prevPin[key]
-        );
+        // pinFieldValueChanged statt eines rohen !==-Vergleichs: bei trade_ids (Array,
+        // siehe Multi-Select Gewerke) entsteht bei JEDEM Speichern ein neues Array-
+        // Objekt, ein reiner Referenzvergleich hätte hier fälschlich immer "geändert"
+        // protokolliert. getPinTradeIds(prevPin) statt prevPin.trade_ids direkt fängt
+        // zusätzlich ältere, noch nicht auf trade_ids migrierte Pin-Datensätze ab.
+        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter((key) => {
+          if (!Object.prototype.hasOwnProperty.call(fields, key)) return false;
+          const oldVal = key === "trade_ids" ? getPinTradeIds(prevPin) : prevPin[key];
+          return pinFieldValueChanged(key, fields[key], oldVal);
+        });
         if (changedLabels.length > 0) {
           const detail = `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}`;
           newActivity.push(await logPinActivity(pinId, "updated", detail, currentActor));
