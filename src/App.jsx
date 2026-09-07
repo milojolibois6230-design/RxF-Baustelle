@@ -2899,37 +2899,12 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
       if (col !== 0) dy += cellH + PDF_PHOTO_GRID_GAP_MM;
       dy += 2;
     }
-
-    // Vollständige Bearbeitungshistorie (Abschnitt 3), chronologisch aufsteigend
-    if (dy > pageHeight - 40) {
-      doc.addPage();
-      dy = margin;
-    }
-    bold();
-    doc.text("Bearbeitungshistorie:", margin, dy);
-    dy += 6;
-    normal();
-    doc.setFontSize(9);
-    const history = [...(pin.pin_activity_log || [])].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-    if (history.length === 0) {
-      doc.text("Kein Verlauf vorhanden.", margin, dy);
-      dy += 5;
-    } else {
-      history.forEach((entry) => {
-        if (dy > pageHeight - margin) {
-          doc.addPage();
-          dy = margin;
-        }
-        const label = PIN_ACTIVITY_META[entry.action]?.label || entry.action;
-        const lines = doc.splitTextToSize(
-          `${formatDateTime(entry.created_at)} · ${entry.actor_name || entry.actor_email || "Unbekannt"} · ${entry.detail || label}`,
-          contentWidth
-        );
-        doc.text(lines, margin, dy);
-        dy += lines.length * 4.5;
-      });
-    }
-    doc.setFontSize(10);
+    // EXPORT CLEANUP (NO HISTORY): die Bearbeitungshistorie/das Änderungsprotokoll
+    // (pin_activity_log) wird hier bewusst NICHT mehr gedruckt — sie bleibt exklusiv
+    // der internen Ansicht vorbehalten (siehe PinActivityHistory im Pin-Bearbeiten-
+    // Modal). Alle drei PDF-Exportfunktionen (Gesamt-, Geschoss- und Einzelpin-Export)
+    // ignorieren pin_activity_log konsequent; die anderen beiden hatten ohnehin nie
+    // einen Historie-Abschnitt gedruckt.
   }
 
   const fileName = `${sanitizeFileNamePart(project.name)}_Baudokumentation_${new Date().toISOString().slice(0, 10)}.pdf`;
@@ -11233,9 +11208,28 @@ function PinModal({
               {!readOnly && <DictationButton dictation={titleDictation} label="Thema" />}
             </div>
           </div>
-          <button onClick={onClose} className={MODAL_CLOSE_BTN}>
-            <X size={20} />
-          </button>
+          <div className="flex shrink-0 items-center gap-1">
+            {/* DIREKTES LÖSCHEN VON PINS: gut sichtbarer Löschen-Button direkt oben im
+                Modalkopf, neben dem Schließen-Button — sofort erreichbar, ohne erst durch
+                das gesamte Formular scrollen zu müssen. Öffnet dieselbe kurze
+                Sicherheitsabfrage wie der Löschen-Button im Footer (siehe
+                handleDeleteClick/deleteConfirmOpen/ConfirmDialog unten) — ein
+                versehentlich gesetzter Pin lässt sich dadurch in zwei schnellen Klicks
+                wieder entfernen. */}
+            {!isNew && !readOnly && (
+              <button
+                onClick={handleDeleteClick}
+                disabled={deleting}
+                title="Pin löschen"
+                className="rounded-lg p-1.5 text-rose-500 transition hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {deleting ? <Loader2 size={20} className="animate-spin" /> : <Trash2 size={20} />}
+              </button>
+            )}
+            <button onClick={onClose} className={MODAL_CLOSE_BTN}>
+              <X size={20} />
+            </button>
+          </div>
         </div>
 
         {readOnly && (
