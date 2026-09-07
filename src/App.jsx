@@ -70,7 +70,6 @@ import {
   Archive,
   ArchiveRestore,
   Copy,
-  ClipboardCheck,
   GripVertical,
   Mail,
   KeyRound,
@@ -995,11 +994,12 @@ async function deleteFloorPlanSketch(plan) {
 // geschossweite Kennzahlen-Aggregation in der Geschossübersicht (Ebene 2).
 //
 // overrides (optional): title/description/priority/trade_id, mit denen die sonst
-// generischen Standardwerte überschrieben werden — genutzt für das "Mangel
-// duplizieren"-Klemmbrett (copiedPinData, siehe handlePlanClick in App). Bewusst als
-// optionaler, zusätzlicher Parameter mit Default {} statt einer neuen, parallelen
-// Funktion: der reguläre Aufruf ohne Klemmbrett-Inhalt (createPin(planId, floorId, x,
-// y, actor)) bleibt dadurch unverändert und verhält sich exakt wie zuvor.
+// generischen Standardwerte überschrieben werden können — allgemeine, optionale
+// Erweiterung mit Default {} statt einer neuen, parallelen Funktion. Das direkte
+// Duplizieren eines bestehenden Pins (siehe "Mangel duplizieren" im PinModal-Kopf)
+// läuft NICHT über diesen Parameter, sondern über die eigenständige duplicatePin-
+// Funktion weiter unten (kopiert zusätzlich Status, Bereich, Frist und Aufgaben und
+// vergibt die Wurzel-/Unter-Nummerierung, siehe dort).
 async function createPin(planId, floorId, x, y, actor, overrides = {}) {
   const { data, error } = await supabase
     .from("pins")
@@ -1087,6 +1087,138 @@ async function deletePin(pin) {
 
   const { error } = await supabase.from("pins").delete().eq("id", pin.id);
   if (error) throw error;
+}
+
+// "Mangel duplizieren" (siehe Duplizieren-Button im PinModal-Kopf, handleDuplicatePin
+// in App): legt SOFORT eine vollständige Kopie des übergebenen Pins an — Titel,
+// Beschreibung, Status, Priorität, Gewerk, Bereich, Frist, Blickrichtung und alle
+// offenen wie erledigten Aufgaben werden 1:1 übernommen. Fotos werden BEWUSST NICHT
+// mitkopiert: eine Kopie dokumentiert typischerweise einen ähnlichen, aber
+// eigenständigen Mangel an anderer Stelle — die Fotos des Originals würden dort den
+// falschen Ort zeigen. Die Kopie erscheint minimal versetzt (+2 %/+2 %, an den
+// Plan-Rand geklammert wie jede reguläre Pin-Platzierung, siehe posFromEvent in
+// FloorPlanView) neben dem Original, damit sich beide Marker nicht exakt überdecken.
+//
+// parent_pin_id verweist auf den unmittelbaren Quell-Pin (reine Audit-Spur).
+// root_pin_id verweist auf den ursprünglichen, selbst NICHT duplizierten Wurzel-Pin
+// und bestimmt die Unter-Nummerierung (siehe computePinNumberById weiter unten) — ist
+// der Quell-Pin selbst bereits eine Kopie, wird root_pin_id von IHM geerbt statt
+// erneut auf ihn zu zeigen, damit die Nummerierung flach bleibt: Pin "3" dupliziert
+// ergibt "3.1"; wird "3.1" anschließend erneut dupliziert, ergibt das "3.2" und NICHT
+// das verschachtelte "3.1.1".
+async function duplicatePin(sourcePin, actor) {
+  const rootPinId = sourcePin.root_pin_id || sourcePin.id;
+  const clampCoord = (v) => Math.min(98, Math.max(2, v));
+  const { data, error } = await supabase
+    .from("pins")
+    .insert({
+      plan_id: sourcePin.plan_id,
+      floor_id: sourcePin.floor_id,
+      title: sourcePin.title,
+      description: sourcePin.description || "",
+      status: sourcePin.status,
+      priority: sourcePin.priority,
+      assigned_to: "",
+      trade_id: sourcePin.trade_id || null,
+      area: sourcePin.area || "",
+      due_date: sourcePin.due_date || null,
+      x: clampCoord((sourcePin.x ?? 50) + 2),
+      y: clampCoord((sourcePin.y ?? 50) + 2),
+      angle: sourcePin.angle ?? 0,
+      parent_pin_id: sourcePin.id,
+      root_pin_id: rootPinId,
+      created_by: actor?.email || null,
+      updated_by: actor?.email || null,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+
+  // Aufgaben separat, aber im selben Zug mitkopieren — ein Fehlschlag hierbei bricht
+  // die Duplikation selbst NICHT ab (der Pin ist zu diesem Zeitpunkt bereits
+  // angelegt), wird aber protokolliert, analog zum Umgang mit einzelnen fehlgeschla-
+  // genen Bildern beim PDF-Export.
+  const sourceTodos = sourcePin.pin_todos || [];
+  let copiedTodos = [];
+  if (sourceTodos.length > 0) {
+    const { data: todoRows, error: todosError } = await supabase
+      .from("pin_todos")
+      .insert(
+        sourceTodos.map((t) => ({
+          pin_id: data.id,
+          text: t.text,
+          completed: t.completed,
+          created_by: actor?.email || null,
+        }))
+      )
+      .select();
+    if (todosError) {
+      console.error("Aufgaben konnten beim Duplizieren nicht mitkopiert werden:", todosError);
+    } else {
+      copiedTodos = todoRows || [];
+    }
+  }
+
+  return { ...data, pin_todos: copiedTodos, pin_photos: [], pin_activity_log: [] };
+}
+
+// Berechnet für eine Menge von Pins die anzuzeigende Pin-Nummer inklusive der
+// Unter-Nummerierung per "Duplizieren" erzeugter Kopien (siehe duplicatePin oben):
+// jeder eigenständige ("Wurzel"-)Pin bekommt fortlaufend 1, 2, 3 … (per sortCompare
+// sortiert, standardmäßig nach Anlagedatum aufsteigend — exakt wie bisher). Ein per
+// Duplizieren erzeugter Pin hängt IMMER an seiner Wurzel (root_pin_id, wird beim
+// Duplizieren bereits geflacht, siehe Kommentar dort) und bekommt fortlaufend
+// N.1, N.2, N.3 … (ebenfalls per sortCompare innerhalb der Gruppe sortiert). Zeigt
+// root_pin_id auf keinen (mehr) in dieser Menge vorhandenen Pin (z.B. weil die
+// Wurzel inzwischen gelöscht wurde), wird der betroffene Pin wie ein eigener
+// Wurzel-Pin behandelt statt eine undefinierte Nummer zu erhalten.
+//
+// Gibt eine Map<pinId, {number, subNumber, label}> zurück — number/subNumber sind
+// für eine stabile NUMERISCHE Sortierung gedacht (siehe comparePinNumberEntries,
+// ein reiner String-Vergleich von "10" vs. "2" oder "1.10" vs. "1.2" wäre falsch),
+// label ist der anzuzeigende Text ("3" bzw. "3.2").
+//
+// Wird von FloorPlanView (Plan-Marker, kompakte Pin-Liste), App (Modal-Kopf-
+// Nummer) sowie generateProjectReportPdf/generateFloorPinsTablePdf/
+// pinsToFloorExportRows (CSV) gemeinsam genutzt, damit dieselbe Nummer garantiert
+// überall identisch erscheint.
+function computePinNumberById(pinsList, sortCompare = (a, b) => new Date(a.created_at) - new Date(b.created_at)) {
+  const list = pinsList || [];
+  const idSet = new Set(list.map((p) => p.id));
+  const hasValidRoot = (p) => p.root_pin_id && p.root_pin_id !== p.id && idSet.has(p.root_pin_id);
+
+  const result = new Map();
+  const rootNumberById = new Map();
+  [...list]
+    .filter((p) => !hasValidRoot(p))
+    .sort(sortCompare)
+    .forEach((p, idx) => {
+      const number = idx + 1;
+      rootNumberById.set(p.id, number);
+      result.set(p.id, { number, subNumber: null, label: String(number) });
+    });
+
+  const childrenByRoot = new Map();
+  list.forEach((p) => {
+    if (!hasValidRoot(p)) return;
+    if (!childrenByRoot.has(p.root_pin_id)) childrenByRoot.set(p.root_pin_id, []);
+    childrenByRoot.get(p.root_pin_id).push(p);
+  });
+  childrenByRoot.forEach((children, rootId) => {
+    const rootNumber = rootNumberById.get(rootId);
+    [...children].sort(sortCompare).forEach((p, idx) => {
+      const subNumber = idx + 1;
+      result.set(p.id, { number: rootNumber, subNumber, label: `${rootNumber}.${subNumber}` });
+    });
+  });
+  return result;
+}
+
+// Numerischer Vergleich zweier computePinNumberById-Einträge (nicht der Label-Strings,
+// siehe Kommentar dort) — für jede Stelle, die Pins in Nummern-Reihenfolge sortiert.
+function comparePinNumberEntries(a, b) {
+  if (!a || !b) return 0;
+  return a.number - b.number || (a.subNumber || 0) - (b.subNumber || 0);
 }
 
 // ----------------------------------------------------------------------------------
@@ -2650,12 +2782,19 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
   const normal = () => doc.setFont("helvetica", "normal");
 
   // Globale, fortlaufende Nummerierung über alle Etagen hinweg (nach Etagenname,
-  // dann Anlagedatum sortiert) — dieselbe Nummer erscheint auf der Planübersicht UND
-  // als Überschrift der zugehörigen Detailseite, damit beide Ansichten eindeutig
-  // zueinander referenzierbar sind.
+  // dann Anlagedatum sortiert), inkl. Unter-Nummerierung per "Duplizieren" erzeugter
+  // Kopien (siehe computePinNumberById) — dieselbe Nummer erscheint auf der
+  // Planübersicht UND als Überschrift der zugehörigen Detailseite, damit beide
+  // Ansichten eindeutig zueinander referenzierbar sind. Die Liste wird anschließend
+  // NACH Nummer sortiert statt in reiner Anlage-Reihenfolge zu bleiben, damit eine
+  // Kopie ("3.1") direkt hinter ihrer Wurzel ("3") erscheint, statt chronologisch
+  // irgendwo dazwischen zu landen.
+  const projectPinNumberSort = (a, b) =>
+    a.floor.id !== b.floor.id ? a.floor.name.localeCompare(b.floor.name) : new Date(a.created_at) - new Date(b.created_at);
+  const projectPinNumberById = computePinNumberById(pins, projectPinNumberSort);
   const numberedPins = [...pins]
-    .sort((a, b) => (a.floor.id !== b.floor.id ? a.floor.name.localeCompare(b.floor.name) : new Date(a.created_at) - new Date(b.created_at)))
-    .map((pin, idx) => ({ ...pin, exportNumber: idx + 1 }));
+    .map((pin) => ({ ...pin, exportNumber: projectPinNumberById.get(pin.id)?.label ?? "" }))
+    .sort((a, b) => comparePinNumberEntries(projectPinNumberById.get(a.id), projectPinNumberById.get(b.id)));
 
   // ---- 1. Deckblatt ---------------------------------------------------------------
   doc.setFontSize(20);
@@ -2773,7 +2912,10 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
         drawPdfViewCone(doc, px, py, pin.angle, rgb);
         doc.setFillColor(...rgb);
         doc.circle(px, py, 3, "F");
-        doc.setFontSize(7);
+        // Etwas kleinere Schrift bei längeren Unter-Nummern (z.B. "12.3" für per
+        // "Duplizieren" erzeugte Kopien, siehe computePinNumberById), damit die Nummer
+        // im kleinen Kreis lesbar bleibt.
+        doc.setFontSize(String(pin.exportNumber).length > 2 ? 5.3 : 7);
         doc.setTextColor(255, 255, 255);
         doc.text(String(pin.exportNumber), px, py + 1, { align: "center" });
         doc.setTextColor(0, 0, 0);
@@ -3000,14 +3142,16 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
   const mutedColor = () => doc.setTextColor(100, 116, 139);
 
   // Nummernvergabe IMMER über die vollständige, ungefilterte Pin-Liste (allPins,
-  // fällt auf pins zurück, falls nicht mitgegeben) — siehe Erläuterung oben.
+  // fällt auf pins zurück, falls nicht mitgegeben) — siehe Erläuterung oben. Inkl.
+  // Unter-Nummerierung per "Duplizieren" erzeugter Kopien (siehe
+  // computePinNumberById); numberedPins wird anschließend NACH Nummer sortiert
+  // (comparePinNumberEntries), damit eine Kopie ("3.1") direkt hinter ihrer Wurzel
+  // ("3") erscheint statt chronologisch irgendwo dazwischen.
   const numberSource = allPins && allPins.length ? allPins : pins;
-  const exportNumberById = new Map(
-    [...numberSource].sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).map((p, idx) => [p.id, idx + 1])
-  );
+  const exportNumberEntryById = computePinNumberById(numberSource);
   const numberedPins = [...pins]
-    .map((pin) => ({ ...pin, exportNumber: exportNumberById.get(pin.id) ?? 0 }))
-    .sort((a, b) => a.exportNumber - b.exportNumber);
+    .map((pin) => ({ ...pin, exportNumber: exportNumberEntryById.get(pin.id)?.label ?? "" }))
+    .sort((a, b) => comparePinNumberEntries(exportNumberEntryById.get(a.id), exportNumberEntryById.get(b.id)));
 
   // ---- Seite 1 — Deckblatt & visuelle Planübersicht -------------------------------
   {
@@ -3122,7 +3266,8 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
         drawPdfViewCone(doc, px, py, pin.angle, rgb);
         doc.setFillColor(...rgb);
         doc.circle(px, py, 3.4, "F");
-        doc.setFontSize(7);
+        // Etwas kleinere Schrift bei längeren Unter-Nummern (siehe computePinNumberById).
+        doc.setFontSize(String(pin.exportNumber).length > 2 ? 5.3 : 7);
         bold();
         doc.setTextColor(255, 255, 255);
         doc.text(String(pin.exportNumber), px, py + 1.1, { align: "center" });
@@ -3438,10 +3583,17 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
 // NICHT Teil der vorgegebenen Struktur sind.
 function pinsToFloorExportRows(pins, trades, floorName) {
   const tradesById = new Map((trades || []).map((t) => [t.id, t]));
+  // Nummernvergabe inkl. Unter-Nummerierung per "Duplizieren" erzeugter Kopien
+  // (siehe computePinNumberById) — identischer Sortierschlüssel wie auf dem Plan und
+  // im PDF-Export (siehe Funktionskommentar oben), damit "Nr." hier garantiert
+  // übereinstimmt. Zeilen erscheinen anschließend NACH Nummer sortiert, damit eine
+  // Kopie ("3.1") direkt hinter ihrer Wurzel ("3") steht statt chronologisch
+  // irgendwo dazwischen.
+  const rowNumberById = computePinNumberById(pins);
   return [...pins]
-    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-    .map((pin, idx) => ({
-      "Nr.": idx + 1,
+    .sort((a, b) => comparePinNumberEntries(rowNumberById.get(a.id), rowNumberById.get(b.id)))
+    .map((pin) => ({
+      "Nr.": rowNumberById.get(pin.id)?.label ?? "",
       Aufnahmedatum: formatDateShort(pin.created_at),
       Thema: pin.title || "",
       Anschlussbezeichnung: pin.reference_code || "",
@@ -3672,7 +3824,8 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
       drawPdfViewCone(doc, markerX, markerY, pin.angle, rgb);
       doc.setFillColor(...rgb);
       doc.circle(markerX, markerY, 3, "F");
-      doc.setFontSize(7);
+      // Etwas kleinere Schrift bei längeren Unter-Nummern (siehe computePinNumberById).
+      doc.setFontSize(String(exportNumber).length > 2 ? 5.3 : 7);
       bold();
       doc.setTextColor(255, 255, 255);
       doc.text(String(exportNumber), markerX, markerY + 1, { align: "center" });
@@ -4272,32 +4425,6 @@ function ErrorBanner({ message, onClose }) {
       </span>
       <button onClick={onClose} className="shrink-0 rounded p-1 text-rose-500 transition hover:bg-rose-100">
         <X size={15} />
-      </button>
-    </div>
-  );
-}
-
-// Toast-/Signal-Banner für das "Mangel duplizieren"-Klemmbrett (siehe copiedPinData in
-// App sowie den "Mangel duplizieren"-Button in PinModal). Bewusst als GLOBALE, immer
-// sichtbare Kopfleiste umgesetzt (analog zu ErrorBanner direkt darüber, nicht als
-// Element innerhalb von FloorPlanView) — copiedPinData ist App-weiter State und bleibt
-// dadurch auch beim Wechsel auf eine andere Grundrissskizze oder ein anderes Geschoss
-// gültig: ein Mangel lässt sich so bewusst auch AUF EINEM ANDEREN PLAN platzieren, nicht
-// nur auf dem, auf dem er dupliziert wurde. Abbrechen leert das Klemmbrett wieder, ohne
-// einen Pin zu platzieren.
-function DuplicateClipboardBanner({ pinData, onCancel }) {
-  if (!pinData) return null;
-  return (
-    <div className="flex items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-[#FF2A00] sm:px-6">
-      <span className="flex items-center gap-2">
-        <ClipboardCheck size={16} className="shrink-0" />
-        Mangel „{pinData.title || "Ohne Titel"}" in Zwischenablage. Tippe auf den Bauplan, um ihn hier zu platzieren.
-      </span>
-      <button
-        onClick={onCancel}
-        className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs font-semibold text-[#FF2A00] transition hover:bg-red-100"
-      >
-        <X size={14} /> Abbrechen
       </button>
     </div>
   );
@@ -9068,7 +9195,10 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
         {/* Visuelle Pin-Nummerierung: voll deckender, statusfarbener Marker (statt weißer
             Fläche mit dünner Kontur) als Hintergrund für eine fett gedruckte, weiße
             Nummer — zentriert im runden "Kopf" des Icons, für 1:1-Abgleich mit der
-            "Nr."-Spalte im Geschoss-Export (siehe pinNumberById in FloorPlanView). */}
+            "Nr."-Spalte im Geschoss-Export (siehe pinNumberById in FloorPlanView).
+            Etwas kleinere Schrift bei längeren Unter-Nummern (z.B. "12.3" für per
+            "Duplizieren" erzeugte Kopien, siehe computePinNumberById), damit die
+            Nummer im kleinen Markerkopf lesbar bleibt. */}
         <MapPin
           size={30}
           strokeWidth={1.5}
@@ -9077,7 +9207,9 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
         />
         {number != null && (
           <span
-            className="pointer-events-none absolute top-[6px] left-1/2 -translate-x-1/2 text-[10px] font-extrabold leading-none text-white"
+            className={`pointer-events-none absolute top-[6px] left-1/2 -translate-x-1/2 font-extrabold leading-none text-white ${
+              String(number).length > 2 ? "text-[7.5px]" : "text-[10px]"
+            }`}
             style={{ textShadow: "0 1px 1.5px rgba(0,0,0,0.55)" }}
           >
             {number}
@@ -9788,14 +9920,17 @@ function FloorPlanView({
   };
 
   const activeTrades = (trades || []).filter((t) => t.active);
-  // Fortlaufende Pin-Nummerierung dieser Grundrissskizze: sortiert nach Anlagedatum,
-  // exakt wie im Geschoss-Export (siehe generateFloorPinsTablePdf/pinsToFloorExportRows)
-  // — GARANTIERT dieselbe Nummer für denselben Pin auf Plan UND in der Export-Tabelle
-  // ("Nr."), unabhängig von der aktuell aktiven Filter-/Suchleiste (die nur die
-  // Sichtbarkeit auf dem Plan steuert, nie die Nummerierung selbst).
-  const pinNumberById = new Map(
-    [...pins].sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).map((p, idx) => [p.id, idx + 1])
-  );
+  // Fortlaufende Pin-Nummerierung dieser Grundrissskizze (inkl. Unter-Nummerierung
+  // per "Duplizieren" erzeugter Kopien, siehe computePinNumberById): sortiert nach
+  // Anlagedatum, exakt wie im Geschoss-Export (siehe generateFloorPinsTablePdf/
+  // pinsToFloorExportRows) — GARANTIERT dieselbe Nummer für denselben Pin auf Plan UND
+  // in der Export-Tabelle ("Nr."), unabhängig von der aktuell aktiven Filter-/
+  // Suchleiste (die nur die Sichtbarkeit auf dem Plan steuert, nie die Nummerierung
+  // selbst). pinNumberEntryById trägt zusätzlich die reinen Zahlenwerte für eine
+  // stabile numerische Sortierung (siehe comparePinNumberEntries, sortedListPins
+  // unten); pinNumberById bleibt der anzuzeigende Text ("3" bzw. "3.2").
+  const pinNumberEntryById = computePinNumberById(pins);
+  const pinNumberById = new Map([...pinNumberEntryById].map(([id, entry]) => [id, entry.label]));
   // Dynamische Filter-/Suchleiste (Status-Toggle, Gewerke-Mehrfachauswahl,
   // Volltextsuche) — alle drei Kriterien wirken kombiniert (UND-Verknüpfung) rein
   // clientseitig auf die bereits geladenen Pins dieser Skizze. Die Suche prüft
@@ -9832,8 +9967,8 @@ function FloorPlanView({
   // Kompakte Pin-Liste unter dem Grundriss: dieselbe Teilmenge wie auf dem Plan
   // markiert (visiblePins, respektiert also die Filter-/Suchleiste direkt darüber),
   // aber in fester Nummern-Reihenfolge sortiert statt in Roh-Ladereihenfolge.
-  const sortedListPins = [...visiblePins].sort(
-    (a, b) => (pinNumberById.get(a.id) || 0) - (pinNumberById.get(b.id) || 0)
+  const sortedListPins = [...visiblePins].sort((a, b) =>
+    comparePinNumberEntries(pinNumberEntryById.get(a.id), pinNumberEntryById.get(b.id))
   );
 
   // Die drei Status-Zähler zeigen bewusst die Gesamtzahlen ALLER Pins dieser
@@ -11088,6 +11223,7 @@ function PinModal({
   const [todoBusy, setTodoBusy] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
   const [exportPdfError, setExportPdfError] = useState("");
+  const [duplicating, setDuplicating] = useState(false); // siehe handleDuplicateClick
   const [markupPhoto, setMarkupPhoto] = useState(null); // aktuell im Foto-Markup-Editor geöffnetes Foto
   const fileInputRef = useRef(null);
 
@@ -11096,17 +11232,20 @@ function PinModal({
     setDraft((d) => ({ ...d, [field]: value }));
   };
 
-  // "Mangel duplizieren" (siehe onDuplicate/handleDuplicatePin in App): übernimmt die
-  // GESPEICHERTEN Stammdaten dieses Pins (nicht den ggf. noch unspeicherten draft) —
-  // bewusst kein Foto, wie in der Anforderung explizit vorgegeben.
-  const handleDuplicateClick = () => {
-    if (readOnly || isNew || !onDuplicate) return;
-    onDuplicate({
-      title: pin.title,
-      description: pin.description,
-      priority: pin.priority,
-      trade_id: pin.trade_id || null,
-    });
+  // "Mangel duplizieren" (siehe onDuplicate/handleDuplicatePin in App): übergibt den
+  // vollständigen, GESPEICHERTEN Pin (nicht den ggf. noch unspeicherten draft) — App
+  // legt daraus sofort eine vollständige Kopie inkl. Aufgaben an (siehe duplicatePin)
+  // und öffnet direkt im Anschluss deren Bearbeitungs-Modal (siehe key={activePin.id}
+  // an der PinModal-Einbindung in App, sorgt für einen sauberen Formular-Reset beim
+  // Umspringen auf die neue Kopie).
+  const handleDuplicateClick = async () => {
+    if (readOnly || isNew || !onDuplicate || duplicating) return;
+    setDuplicating(true);
+    try {
+      await onDuplicate(pin);
+    } finally {
+      setDuplicating(false);
+    }
   };
 
   // Voice-to-Text (Abschnitt 2): zwei unabhängige Diktier-Sitzungen, je eine für
@@ -11230,40 +11369,6 @@ function PinModal({
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            {/* EINZEL-PDF-EXPORT & MANGEL DUPLIZIEREN: als schlanke Icon-Buttons im
-                Modalkopf statt im Footer — der Footer ist bewusst für exakt drei
-                Buttons reserviert (Löschen | Abbrechen | Speichern, siehe unten), damit
-                "Löschen" dort bei JEDEM Pin, auch direkt nach dem Anlegen per Long
-                Press, sofort auffindbar ist. Beide Aktionen bleiben unverändert nur bei
-                bereits bestehenden, gespeicherten Pins sinnvoll (Export/Duplikat eines
-                noch leeren Entwurfs wäre wenig hilfreich), daher weiterhin an !isNew
-                gebunden. */}
-            {!isNew && !readOnly && (
-              <div className="relative">
-                <button
-                  onClick={handleExportSinglePin}
-                  disabled={exportingPdf}
-                  title="Diesen Pin als schnelles 1-Seiten-PDF exportieren — inkl. Foto und Lageplan-Ausschnitt"
-                  className="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {exportingPdf ? <Loader2 size={18} className="animate-spin" /> : <Crosshair size={18} />}
-                </button>
-                {exportPdfError && (
-                  <p className="absolute right-0 top-full z-10 mt-1.5 w-48 rounded-md bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 ring-1 ring-inset ring-rose-200">
-                    {exportPdfError}
-                  </p>
-                )}
-              </div>
-            )}
-            {!isNew && !readOnly && onDuplicate && (
-              <button
-                onClick={handleDuplicateClick}
-                title="Gewerk, Titel, Beschreibung und Priorität in die Zwischenablage übernehmen, um an anderer Stelle einen neuen Pin damit anzulegen"
-                className="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
-              >
-                <Copy size={18} />
-              </button>
-            )}
             <button onClick={onClose} className={MODAL_CLOSE_BTN}>
               <X size={20} />
             </button>
@@ -11518,40 +11623,73 @@ function PinModal({
           )}
         </div>
 
-        {/* Footer: exakt drei Buttons nebeneinander — Löschen (rot) | Abbrechen (grau) |
-            Speichern (rot/Markenfarbe) — siehe ANFORDERUNG "ADD DIRECT LÖSCHEN BUTTON IN
-            PIN MODAL FOOTER". "Löschen" ist ab sofort bei JEDEM Öffnen des Modals
-            sichtbar und funktionsfähig, ausdrücklich auch direkt nach einem Long Press
-            bei einem frisch angelegten (isNew) Pin: der Pin existiert zu diesem
-            Zeitpunkt bereits real in pins/Supabase bzw. — offline — als lokal
-            angelegter Pin mit eigener Offline-ID in der Sync-Warteschlange (siehe
-            handlePlanClick weiter oben in App). handleDeletePin behandelt isNew- und
-            bestehende Pins deshalb ohnehin bereits vollkommen identisch: Klick auf
-            "Löschen" -> kurze Sicherheitsabfrage (ConfirmDialog unten, verhindert
-            versehentliches Löschen) -> bei Bestätigung entweder direktes
-            supabase.from('pins').delete().eq('id', pin.id) inkl. vorherigem Aufräumen
-            von pin_todos/pin_photos (siehe deletePin) oder, offline, das entsprechende
-            Warteschlangen-Handling — in beiden Fällen sofortiges Filtern aus setPins,
-            sofortiges Entfernen des Markers vom Grundriss ohne Reload und sofortiges
-            Schließen des Modals (setModalState(null) in handleDeletePin). Einzel-PDF-
-            Export und "Mangel duplizieren" sind dafür in den Modal-Header gewandert
-            (siehe oben) statt hier im Footer Platz wegzunehmen. */}
-        <div className="flex items-center justify-between gap-3 border-t border-slate-100 px-5 py-3.5">
+        {/* Footer: fünf Buttons in der Fußzeile — Löschen | Einzel-PDF Export |
+            Duplizieren | Abbrechen | Speichern (siehe ANFORDERUNG "PIN DUPLICATION WITH
+            SUB-NUMBERING & FOOTER ACTION BUTTONS"). "Löschen" bleibt unverändert bei
+            JEDEM Pin sichtbar und funktionsfähig, ausdrücklich auch direkt nach einem
+            Long Press bei einem frisch angelegten (isNew) Pin (siehe vorherige
+            ANFORDERUNG "ADD DIRECT LÖSCHEN BUTTON…", unverändert erhalten: der Pin
+            existiert zu diesem Zeitpunkt bereits real in pins/Supabase bzw. — offline —
+            als lokal angelegter Pin mit eigener Offline-ID in der Sync-Warteschlange,
+            handleDeletePin behandelt isNew- und bestehende Pins deshalb ohnehin bereits
+            identisch). Einzel-PDF Export und Duplizieren bleiben dagegen bewusst nur bei
+            bereits ausgefüllten, bestehenden Pins aktiv (deaktiviert samt Tooltip bei
+            isNew) — ein Export oder eine vollständige Kopie eines gerade erst leeren
+            Entwurfs wäre wenig hilfreich. Position/Reihenfolge der fünf Buttons bleibt
+            dabei immer gleich, nur der Aktivierungszustand ändert sich — bei schmalen
+            Bildschirmen (siehe flex-wrap) bricht die linke Gruppe bei Bedarf in eine
+            zweite Zeile um, statt Buttons abzuschneiden. */}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-5 py-3.5">
           {!readOnly ? (
-            <button
-              onClick={handleDeleteClick}
-              disabled={deleting}
-              className="inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {deleting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />} Löschen
-            </button>
+            <div className="flex flex-wrap items-center gap-1">
+              <button
+                onClick={handleDeleteClick}
+                disabled={deleting || duplicating}
+                className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {deleting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />} Löschen
+              </button>
+              <div className="relative">
+                <button
+                  onClick={handleExportSinglePin}
+                  disabled={isNew || exportingPdf || deleting || duplicating}
+                  title={
+                    isNew
+                      ? "Für einen gerade erst angelegten, noch leeren Pin nicht verfügbar"
+                      : "Diesen Pin als schnelles 1-Seiten-PDF exportieren — inkl. Foto und Lageplan-Ausschnitt"
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {exportingPdf ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />} PDF Export
+                </button>
+                {exportPdfError && (
+                  <p className="absolute bottom-full left-0 mb-1.5 w-52 rounded-md bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 ring-1 ring-inset ring-rose-200">
+                    {exportPdfError}
+                  </p>
+                )}
+              </div>
+              {onDuplicate && (
+                <button
+                  onClick={handleDuplicateClick}
+                  disabled={isNew || duplicating || deleting}
+                  title={
+                    isNew
+                      ? "Für einen gerade erst angelegten, noch leeren Pin nicht verfügbar"
+                      : "Sofort eine vollständige Kopie dieses Pins anlegen (inkl. aller Aufgaben), leicht versetzt daneben auf dem Plan"
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {duplicating ? <Loader2 size={16} className="animate-spin" /> : <Copy size={16} />} Duplizieren
+                </button>
+              )}
+            </div>
           ) : (
             <span />
           )}
           <div className="flex gap-2">
             <button
               onClick={onClose}
-              disabled={saving || deleting}
+              disabled={saving || deleting || duplicating}
               className={BTN_SECONDARY}
             >
               {readOnly ? "Schließen" : "Abbrechen"}
@@ -11566,7 +11704,7 @@ function PinModal({
             ) : (
               <button
                 onClick={handleSave}
-                disabled={saving || deleting}
+                disabled={saving || deleting || duplicating}
                 className={BTN_PRIMARY}
               >
                 {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Speichern
@@ -11978,12 +12116,6 @@ function App() {
   const [selectedFloorPlanId, setSelectedFloorPlanId] = useState(null);
   const [query, setQuery] = useState("");
   const [modalState, setModalState] = useState(null); // { pinId, isNew }
-  // "Mangel duplizieren"-Klemmbrett — { title, description, priority, trade_id } oder
-  // null. Bewusst App-weiter State statt lokal in FloorPlanView (siehe Kommentar an
-  // DuplicateClipboardBanner): bleibt auch beim Wechsel der Grundrissskizze gültig, bis
-  // er durch den nächsten Klick auf einen Bauplan (handlePlanClick) verbraucht oder über
-  // das Banner explizit abgebrochen wird.
-  const [copiedPinData, setCopiedPinData] = useState(null);
   const [noteModalState, setNoteModalState] = useState(null); // { noteId, isNew }
   const [floorModalOpen, setFloorModalOpen] = useState(false);
   const [editFloorModalState, setEditFloorModalState] = useState(null); // { floor }
@@ -12021,13 +12153,15 @@ function App() {
   const floor = floors.find((f) => f.id === selectedFloorId);
   const plan = floorPlans.find((fp) => fp.id === selectedFloorPlanId);
   const activePin = modalState ? pins.find((p) => p.id === modalState.pinId) : null;
-  // Fortlaufende Pin-Nummer des aktuell im Modal geöffneten Pins — exakt dieselbe
-  // Sortierlogik (created_at aufsteigend, Index+1) wie pinNumberById in FloorPlanView
-  // und wie die Export-Funktionen, damit die im Modal-Header angezeigte "Pin Nr. X"
-  // garantiert mit der Nummer auf dem Plan und in der Export-Tabelle übereinstimmt.
-  const activePinNumber = activePin
-    ? [...pins].sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).findIndex((p) => p.id === activePin.id) + 1
-    : null;
+  // Fortlaufende Pin-Nummer(n) ALLER Pins dieser Grundrissskizze — exakt dieselbe
+  // Logik (inkl. Unter-Nummerierung per "Duplizieren" erzeugter Kopien, siehe
+  // computePinNumberById) wie pinNumberById in FloorPlanView und wie die
+  // Export-Funktionen, damit die im Modal-Header angezeigte "Pin Nr. X" garantiert
+  // mit der Nummer auf dem Plan und in der Export-Tabelle übereinstimmt. Wird
+  // zusätzlich in handleDuplicatePin gebraucht, um die Nummer des Quell-Pins in die
+  // Bearbeitungshistorie der neuen Kopie zu schreiben.
+  const pinNumberEntryById = computePinNumberById(pins);
+  const activePinNumber = activePin ? pinNumberEntryById.get(activePin.id)?.label ?? null : null;
   const activeNote = noteModalState ? planNotes.find((n) => n.id === noteModalState.noteId) : null;
 
   // Projektspezifische Gewerke-Einschränkung: null bedeutet "für dieses Projekt wurde
@@ -13020,24 +13154,12 @@ function App() {
     if (!requireAuth()) return;
     setCreatingPin(true);
     setGlobalError(null);
-    // "Mangel duplizieren"-Klemmbrett (copiedPinData, siehe handleDuplicatePin und
-    // DuplicateClipboardBanner): wird HIER, mit dem allernächsten Klick auf den
-    // Bauplan, konsumiert und sofort danach geleert — ein einmaliges "Einfügen", kein
-    // dauerhafter Modus. Ein Fehlschlag der eigentlichen Pin-Anlage unten leert es
-    // trotzdem nicht rückgängig (siehe overrides als lokale Kopie), das ist bewusst
-    // so einfach gehalten wie ein normales Clipboard-Paste.
-    const overrides = copiedPinData
-      ? {
-          title: copiedPinData.title,
-          description: copiedPinData.description,
-          priority: copiedPinData.priority,
-          trade_id: copiedPinData.trade_id,
-        }
-      : {};
-    if (copiedPinData) setCopiedPinData(null);
-    const createdDetail = copiedPinData
-      ? `Mängel-Pin angelegt (dupliziert aus „${copiedPinData.title || "Ohne Titel"}")`
-      : "Mängel-Pin angelegt";
+    // "Mangel duplizieren" legt seine Kopie inzwischen SOFORT selbst an (siehe
+    // duplicatePin/handleDuplicatePin) statt hier über ein Klemmbrett beim nächsten
+    // Plan-Klick konsumiert zu werden — handlePlanClick legt daher ausnahmslos einen
+    // neuen, leeren Pin mit den generischen Standardwerten an.
+    const overrides = {};
+    const createdDetail = "Mängel-Pin angelegt";
     try {
       // Offline-First (Punkt 15): ohne Verbindung wird der Pin sofort lokal mit einer
       // eigenen Offline-ID angelegt (sichtbar, bearbeitbar, fotografierbar wie jeder
@@ -13103,16 +13225,37 @@ function App() {
 
   const handlePinClick = (pin) => setModalState({ pinId: pin.id, isNew: false });
 
-  // "Mangel duplizieren" (siehe Button in PinModal, nur bei bestehenden Pins sichtbar):
-  // übernimmt Gewerk/Titel/Beschreibung/Priorität des gerade betrachteten Pins in das
-  // Klemmbrett, schließt das Modal und zeigt das Toast-Banner (DuplicateClipboardBanner)
-  // — konsumiert wird das Klemmbrett erst beim nächsten Klick auf den Bauplan, siehe
-  // handlePlanClick oben. Bewusst die GESPEICHERTEN Pin-Felder (nicht den evtl. noch
-  // unspeicherten Modal-Entwurf) — "einen bestehenden, dokumentierten Mangel
-  // duplizieren", nicht "einen halb ausgefüllten Entwurf klonen".
-  const handleDuplicatePin = (data) => {
-    setCopiedPinData(data);
-    setModalState(null);
+  // "Mangel duplizieren" (siehe Button im PinModal-Kopf, nur bei bestehenden Pins
+  // sichtbar): legt SOFORT eine vollständige Kopie des betrachteten Pins an (Gewerk,
+  // Bereich, Beschreibung, Status, Priorität, Frist und alle Aufgaben, siehe
+  // duplicatePin) minimal versetzt daneben und öffnet direkt im Anschluss das
+  // Bearbeitungs-Modal der neuen Kopie — kein Zwischenschritt über ein Klemmbrett und
+  // einen weiteren Klick auf den Plan mehr nötig. Bewusst die GESPEICHERTEN Pin-Felder
+  // (der volle pin-Prop aus PinModal, nicht der evtl. noch unspeicherte Modal-Entwurf)
+  // — "einen bestehenden, dokumentierten Mangel duplizieren", nicht "einen halb
+  // ausgefüllten Entwurf klonen". Wie das Anlegen/Ändern von Aufgaben (siehe
+  // handleAddTodo/handleToggleTodo/handleRemoveTodo, die hier ja mitkopiert werden)
+  // bewusst an eine bestehende Verbindung gebunden (requireOnline) statt zusätzlich
+  // eine eigene Offline-Warteschlangen-Variante einzuführen.
+  const handleDuplicatePin = async (sourcePin) => {
+    if (!requireOnline("Ein Mangel kann")) return;
+    try {
+      const newPin = await duplicatePin(sourcePin, currentActor);
+      const sourceNumber = pinNumberEntryById.get(sourcePin.id)?.label || "?";
+      const activity = await logPinActivity(
+        newPin.id,
+        "created",
+        `Mängel-Pin dupliziert aus Pin Nr. ${sourceNumber} („${sourcePin.title || "Ohne Titel"}")`,
+        currentActor
+      );
+      const pinWithActivity = { ...newPin, pin_activity_log: [activity] };
+      setPins((prev) => [...prev, pinWithActivity]);
+      addPinSummary(floor.id, plan.id, pinWithActivity);
+      setModalState({ pinId: newPin.id, isNew: false });
+    } catch (err) {
+      console.error("Pin konnte nicht dupliziert werden:", err);
+      setGlobalError("Der Pin konnte nicht dupliziert werden. Bitte erneut versuchen.");
+    }
   };
 
   // Hängt einen neuen pin_activity_log-Eintrag optimistisch an den lokalen Zustand
@@ -13746,7 +13889,6 @@ function App() {
       </div>
 
       <ErrorBanner message={globalError} onClose={() => setGlobalError(null)} />
-      <DuplicateClipboardBanner pinData={copiedPinData} onCancel={() => setCopiedPinData(null)} />
 
       {screen === "projects" && (
         <ProjectOverview
@@ -13822,6 +13964,16 @@ function App() {
 
       {activePin && (
         <PinModal
+          // key=Pin-ID: erzwingt einen vollständigen Remount, sobald sich modalState.pinId
+          // ändert, WÄHREND das Modal bereits geöffnet ist — genau der Fall beim direkten
+          // Umspringen von einem Pin auf seine frisch angelegte Kopie (siehe "Mangel
+          // duplizieren"/handleDuplicatePin: setModalState wechselt hier von der Quelle
+          // direkt auf newPin.id, ohne das Modal zwischendurch zu schließen). Ohne diesen
+          // Key würde React dieselbe Komponenten-Instanz weiterverwenden und der interne
+          // draft-Formzustand (Titel, Beschreibung, Status, …) bliebe fälschlich auf den
+          // Werten des vorherigen Pins stehen, obwohl Kopfzeile, Fotos und Aufgaben
+          // bereits korrekt die neue Kopie zeigen.
+          key={activePin.id}
           pin={activePin}
           pins={pins}
           pinNumber={activePinNumber}
