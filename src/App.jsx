@@ -2168,20 +2168,81 @@ function compressImageDataUrl(sourceDataUrl, maxWidth, maxHeight, quality) {
   });
 }
 
-// ---- EINZEL-BILD-PRELOAD: Foto-URL -> Base64/Data-URL -------------------------------
+// Feste Normalisierungsgröße (4:3) & Hintergrundfarbe — dieselbe Hintergrundfarbe wie
+// die Bild-Box im Bericht (siehe drawPdfPhotoBox), damit ein eventueller Rand nahtlos
+// mit der umgebenden Box verschmilzt statt als sichtbarer Balken aufzufallen.
+const PDF_PHOTO_NORMALIZE_WIDTH = 800;
+const PDF_PHOTO_NORMALIZE_HEIGHT = 600;
+const PDF_PHOTO_NORMALIZE_BG = "#f8fafc";
+
+// ---- BILDER-GRID IM PDF-LAYOUT: 2-Spalten-Raster mit fester Boxhöhe ---------------
+// Einheitliches 2-Spalten-Foto-Raster für ALLE DREI PDF-Export-Funktionen — jede Box
+// bekommt dieselbe feste Höhe (rechnerisches Äquivalent zu CSS height: 220px bei
+// ~96dpi: 220 / 96 * 25.4 ≈ 58.2mm, auf 58mm gerundet) und die volle verfügbare
+// Spaltenbreite (width: 100% der Spalte), unabhängig von der Fotoanzahl je Pin. In
+// Kombination mit der 4:3-Bildnormalisierung beim Preload (siehe
+// normalizeImageTo4x3Canvas) ergibt das für JEDES Foto im gesamten Bericht exakt
+// dieselbe Darstellungsgröße auf den Millimeter genau.
+const PDF_PHOTO_GRID_COLS = 2;
+const PDF_PHOTO_GRID_GAP_MM = 6;
+const PDF_PHOTO_GRID_ROW_HEIGHT_MM = 58;
+// Bild-Box-Optik (entspricht der Vorgabe background:#f8fafc, border:1px solid #e2e8f0,
+// border-radius:8px — hier als jsPDF-RGB/mm-Äquivalente): dieselben Werte wie
+// PDF_PHOTO_NORMALIZE_BG oben, damit der Normalisierungs-Rand nahtlos in die Box
+// übergeht. 8px Radius bei ~96dpi ≈ 2.1mm.
+const PDF_PHOTO_BOX_BG_RGB = [248, 250, 252];
+const PDF_PHOTO_BOX_BORDER_RGB = [226, 232, 240];
+const PDF_PHOTO_BOX_RADIUS_MM = 2.1;
+
+// ---- CANVAS-BASED IMAGE NORMALIZATION (ALLE FOTOS EXAKT GLEICH GROSS) -------------
+// Zeichnet ein bereits geladenes Bild (Data-URL) zentriert und seitenverhältnistreu
+// ("object-fit: contain" — es wird NICHTS vom eigentlichen Bildinhalt beschnitten) auf
+// einen Offscreen-Canvas mit FESTEM Seitenverhältnis 4:3 (Standardgröße 800×600px).
+// Hoch- UND Querformat-Aufnahmen erhalten dadurch identische Außenmaße: jedes
+// vorgeladene Foto lässt sich anschließend 1:1 in eine gleich große Box im PDF-Raster
+// einsetzen. Bewusst KEIN Zuschnitt (kein "object-fit: cover") — bei Mängeldokumentation
+// liefert gerade der Bildrand oft den entscheidenden Kontext (Anschluss an die
+// Wand/Decke, Ausdehnung eines Risses); ein Zuschnitt könnte genau diesen Kontext
+// abschneiden. Der schmale, ggf. entstehende Rand links/rechts bzw. oben/unten wird mit
+// derselben Hintergrundfarbe gefüllt wie die Bild-Box selbst (siehe drawPdfPhotoBox),
+// sodass er im fertigen Bericht praktisch nicht auffällt.
+function normalizeImageTo4x3Canvas(sourceDataUrl, targetWidthPx = PDF_PHOTO_NORMALIZE_WIDTH, targetHeightPx = PDF_PHOTO_NORMALIZE_HEIGHT, quality = PDF_PHOTO_JPEG_QUALITY, bgColor = PDF_PHOTO_NORMALIZE_BG) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = targetWidthPx;
+      canvas.height = targetHeightPx;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, targetWidthPx, targetHeightPx);
+      const ratio = Math.min(targetWidthPx / img.naturalWidth, targetHeightPx / img.naturalHeight);
+      const w = img.naturalWidth * ratio;
+      const h = img.naturalHeight * ratio;
+      ctx.drawImage(img, (targetWidthPx - w) / 2, (targetHeightPx - h) / 2, w, h);
+      resolve({ dataUrl: canvas.toDataURL("image/jpeg", quality), width: targetWidthPx, height: targetHeightPx });
+    };
+    img.onerror = () => reject(new Error("Bild konnte für die einheitliche 4:3-Normalisierung nicht dekodiert werden."));
+    img.src = sourceDataUrl;
+  });
+}
+
+// ---- EINZEL-BILD-PRELOAD: Foto-URL -> normalisierte 4:3-Base64/Data-URL ------------
 // Lädt EINE Foto-URL vollständig als Base64-Data-String vor — über fetch() + Blob +
 // FileReader (siehe loadImageAsDataUrl), NICHT per <img crossOrigin>/Canvas-Snapshot,
 // da Supabase-Storage-URLs je nach Bucket-Konfiguration keine anonyme Canvas-Lesbarkeit
-// garantieren (Tainted-Canvas-Risiko). Direkt im Anschluss auf PDF-taugliche Auflösung
-// herunterskaliert & als JPEG re-encodiert (siehe compressImageDataUrl), damit der
-// vorgeladene Cache bereits das fertige, einbettbare Format enthält. Wirft bei einem
-// Lade-/Dekodierfehler ganz normal (kein internes try/catch) — die Fehlerbehandlung je
-// Bild liegt bewusst bei der aufrufenden Stelle (siehe preloadPinPhotosForPdf,
-// Promise.allSettled), damit ein einzelnes fehlschlagendes Foto individuell und
-// nachvollziehbar behandelt werden kann, ohne die übrigen Ladevorgänge zu beeinflussen.
-async function preloadImageAsBase64(url, { maxWidth = PDF_PHOTO_MAX_WIDTH, maxHeight = PDF_PHOTO_MAX_HEIGHT, quality = PDF_PHOTO_JPEG_QUALITY } = {}) {
+// garantieren (Tainted-Canvas-Risiko). Direkt im Anschluss auf das feste 4:3-Format
+// normalisiert (siehe normalizeImageTo4x3Canvas) — dadurch enthält der vorgeladene
+// Cache bereits das fertige, einbettbare UND größenvereinheitlichte Format, das
+// Zeichnen selbst (siehe drawPdfPhotoBox) muss keine weitere Bildbearbeitung mehr
+// vornehmen. Wirft bei einem Lade-/Dekodierfehler ganz normal (kein internes
+// try/catch) — die Fehlerbehandlung je Bild liegt bewusst bei der aufrufenden Stelle
+// (siehe preloadPinPhotosForPdf, Promise.allSettled), damit ein einzelnes
+// fehlschlagendes Foto individuell und nachvollziehbar behandelt werden kann, ohne die
+// übrigen Ladevorgänge zu beeinflussen.
+async function preloadImageAsBase64(url, { quality = PDF_PHOTO_JPEG_QUALITY } = {}) {
   const raw = await loadImageAsDataUrl(url);
-  return await compressImageDataUrl(raw.dataUrl, maxWidth, maxHeight, quality);
+  return await normalizeImageTo4x3Canvas(raw.dataUrl, PDF_PHOTO_NORMALIZE_WIDTH, PDF_PHOTO_NORMALIZE_HEIGHT, quality, PDF_PHOTO_NORMALIZE_BG);
 }
 
 // ---- ASYNCHRONES BILDER-PRELOADING (Promise.allSettled) für den Geschoss-PDF-Export -
@@ -2220,70 +2281,37 @@ async function preloadPinPhotosForPdf(pins, opts = {}) {
   return cache;
 }
 
-// ---- EINHEITLICHE BILDGRÖSSEN IM PDF-EXPORT (object-fit: cover-Äquivalent) --------
-// jsPDF kennt kein CSS und damit kein object-fit: eingebettete Bilder werden von
-// doc.addImage() immer exakt auf die angegebene Breite/Höhe GESTRECKT bzw. — wenn man
-// vorher das Seitenverhältnis erhält (bisheriges Verhalten) — mittig eingepasst mit
-// Leerraum an den kürzeren Kanten ("object-fit: contain"). Für ein einheitliches
-// Raster-Layout ist das unerwünscht: unterschiedliche Kamera-Seitenverhältnisse lassen
-// dieselbe Box dann unterschiedlich "voll" wirken. coverCropDataUrl schneidet das
-// Quellbild deshalb per Offscreen-Canvas VORAB exakt auf das Ziel-Seitenverhältnis zu
-// (mittig, überstehende Ränder werden abgeschnitten) — exakt das Verhalten von CSS
-// "object-fit: cover". Die Box wird dadurch garantiert lückenlos gefüllt, unabhängig
-// von der Ausgangsauflösung/dem Ausgangs-Seitenverhältnis des Kamerafotos.
-function coverCropDataUrl(sourceDataUrl, targetWidthPx, targetHeightPx, quality = 0.82) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      const targetRatio = targetWidthPx / targetHeightPx;
-      const srcRatio = img.naturalWidth / img.naturalHeight;
-      let sx, sy, sw, sh;
-      if (srcRatio > targetRatio) {
-        // Quellbild im Verhältnis breiter als die Zielbox -> links/rechts kappen.
-        sh = img.naturalHeight;
-        sw = sh * targetRatio;
-        sy = 0;
-        sx = (img.naturalWidth - sw) / 2;
-      } else {
-        // Quellbild im Verhältnis höher als die Zielbox -> oben/unten kappen.
-        sw = img.naturalWidth;
-        sh = sw / targetRatio;
-        sx = 0;
-        sy = (img.naturalHeight - sh) / 2;
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = Math.max(1, Math.round(targetWidthPx));
-      canvas.height = Math.max(1, Math.round(targetHeightPx));
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-      resolve(canvas.toDataURL("image/jpeg", quality));
-    };
-    img.onerror = () => reject(new Error("Bild konnte für den einheitlichen Bild-Zuschnitt nicht dekodiert werden."));
-    img.src = sourceDataUrl;
-  });
-}
-
-// Auflösung des Cover-Zuschnitts in Pixel je mm PDF-Seitenfläche — ca. 200 dpi-
-// Äquivalent (200 / 25.4 ≈ 7.9, aufgerundet auf 8), ausreichend scharf für die
-// typischen Bild-Boxgrößen im Bericht (Haupt- wie Vorschaubild), ohne die
-// Zieldateigröße des Gesamtberichts (siehe compressImageDataUrl) unnötig zu sprengen.
-const PDF_PHOTO_COVER_PX_PER_MM = 8;
-
+// ---- EINHEITLICHE BILDGRÖSSEN IM PDF-EXPORT: Zeichnen ------------------------------
 // Zeichnet EIN Foto — oder, falls keine URL vorliegt bzw. der Preload für genau dieses
 // Foto fehlgeschlagen ist (siehe photoCache/preloadPinPhotosForPdf), einen dezenten
-// Platzhalter — exakt füllend (object-fit: cover, siehe coverCropDataUrl) und mit
-// abgerundeten Ecken in eine fest vorgegebene Box. Zentrale, von ALLEN DREI
-// PDF-Export-Funktionen (generateProjectReportPdf, generateFloorPinsTablePdf,
-// generateSinglePinPdf) gemeinsam genutzte Stelle — dadurch besitzen Hauptbild UND
-// Vorschaubilder/Anhänge im gesamten PDF-Export garantiert exakt dieselbe, einheitlich
-// zugeschnittene Darstellungsgröße, unabhängig von Kamera-Auflösung/-Seitenverhältnis.
-// Die abgerundeten Ecken werden über jsPDF's natives Clipping erzeugt (roundedRect-Pfad
-// ohne Füllung/Strich, .clip(), Bild zeichnen, Grafikzustand wiederherstellen) statt
-// über eine transparente PNG-Maske — das hält die Bilder als komprimiertes JPEG und
-// damit die Berichtsgröße klein.
+// Platzhalter — mit abgerundeten Ecken in eine fest vorgegebene Box. Da der Cache
+// bereits normalisierte 4:3-Bilder enthält (siehe normalizeImageTo4x3Canvas), muss
+// hier zur Laufzeit keine Bildbearbeitung mehr stattfinden: einfaches, seitenverhältnis-
+// treues Einpassen (object-fit: contain, zentriert) genügt — weil JEDES Foto bereits
+// dasselbe 4:3-Ausgangsformat besitzt, fällt das Ergebnis für jedes Foto in derselben
+// Box-Größe pixelgenau identisch groß aus, unabhängig vom ursprünglichen Kamera-
+// Seitenverhältnis. Zentrale, von ALLEN DREI PDF-Export-Funktionen
+// (generateProjectReportPdf, generateFloorPinsTablePdf, generateSinglePinPdf)
+// gemeinsam genutzte Stelle. Die abgerundeten Ecken werden über jsPDF's natives
+// Clipping erzeugt (roundedRect-Pfad ohne Füllung/Strich, .clip(), Bild zeichnen,
+// Grafikzustand wiederherstellen) statt über eine transparente PNG-Maske — das hält
+// die Bilder als komprimiertes JPEG und damit die Berichtsgröße klein.
 async function drawPdfPhotoBox(
   doc,
-  { url, photoCache, x, y, w, h, radius = 2, placeholderText = "Foto konnte nicht geladen werden", mutedRgb = [100, 116, 139], inkRgb = [15, 23, 42], bgRgb = [248, 250, 252], borderRgb = [226, 232, 240] }
+  {
+    url,
+    photoCache,
+    x,
+    y,
+    w,
+    h,
+    radius = PDF_PHOTO_BOX_RADIUS_MM,
+    placeholderText = "Foto konnte nicht geladen werden",
+    mutedRgb = [100, 116, 139],
+    inkRgb = [15, 23, 42],
+    bgRgb = PDF_PHOTO_BOX_BG_RGB,
+    borderRgb = PDF_PHOTO_BOX_BORDER_RGB,
+  }
 ) {
   const cached = url ? photoCache.get(url) : null;
   doc.setFillColor(...bgRgb);
@@ -2298,17 +2326,17 @@ async function drawPdfPhotoBox(
   };
   if (cached && cached.ok) {
     try {
-      const targetWidthPx = Math.max(1, Math.round(w * PDF_PHOTO_COVER_PX_PER_MM));
-      const targetHeightPx = Math.max(1, Math.round(h * PDF_PHOTO_COVER_PX_PER_MM));
-      const covered = await coverCropDataUrl(cached.dataUrl, targetWidthPx, targetHeightPx);
+      const ratio = Math.min(w / cached.width, h / cached.height);
+      const drawW = cached.width * ratio;
+      const drawH = cached.height * ratio;
       doc.saveGraphicsState();
       doc.roundedRect(x, y, w, h, radius, radius, null);
       doc.clip();
       doc.discardPath();
-      doc.addImage(covered, "JPEG", x, y, w, h);
+      doc.addImage(cached.dataUrl, "JPEG", x + (w - drawW) / 2, y + (h - drawH) / 2, drawW, drawH);
       doc.restoreGraphicsState();
     } catch (err) {
-      console.warn("Bild konnte nicht auf einheitliche Größe zugeschnitten werden, zeige Platzhalter:", err);
+      console.warn("Bild konnte nicht in den PDF-Export eingebettet werden, zeige Platzhalter:", err);
       drawPlaceholder();
     }
   } else {
@@ -2834,13 +2862,13 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
       dy += 3;
     }
 
-    // Fotos im Raster (3 Spalten), seitenübergreifend falls nötig — EINHEITLICHE
-    // BILDGRÖSSEN (object-fit: cover-Äquivalent mit abgerundeten Ecken, siehe
-    // drawPdfPhotoBox) statt wie zuvor zentriert mit Leerraum an den kürzeren Kanten.
-    // Fotos DIESES Pins werden vorab parallel geladen (preloadPinPhotosForPdf,
-    // Promise.allSettled) statt sequentiell im Zeichen-Loop — dieselbe robuste
-    // Fehlerbehandlung wie im Geschoss- und Einzelpin-Export: ein fehlgeschlagenes
-    // Foto zeigt nur einen Platzhalter, der Rest des Berichts bleibt unberührt.
+    // GUARANTEED UNIFORM IMAGE RESIZING: 2-Spalten-Raster mit fester Zeilenhöhe (siehe
+    // PDF_PHOTO_GRID_COLS/PDF_PHOTO_GRID_ROW_HEIGHT_MM), seitenübergreifend falls nötig.
+    // Fotos DIESES Pins werden vorab parallel geladen und auf ein einheitliches
+    // 4:3-Format normalisiert (preloadPinPhotosForPdf → normalizeImageTo4x3Canvas)
+    // statt sequentiell im Zeichen-Loop — dieselbe robuste Fehlerbehandlung wie im
+    // Geschoss- und Einzelpin-Export: ein fehlgeschlagenes Foto zeigt nur einen
+    // Platzhalter, der Rest des Berichts bleibt unberührt.
     const photos = pin.pin_photos || [];
     if (photos.length > 0) {
       bold();
@@ -2848,26 +2876,23 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
       dy += 6;
       normal();
       const projectPinPhotoCache = await preloadPinPhotosForPdf([pin]);
-      const cols = 3;
-      const gap = 4;
-      const cellW = (contentWidth - gap * (cols - 1)) / cols;
-      const cellH = cellW * 0.75;
+      const cellW = (contentWidth - PDF_PHOTO_GRID_GAP_MM * (PDF_PHOTO_GRID_COLS - 1)) / PDF_PHOTO_GRID_COLS;
+      const cellH = PDF_PHOTO_GRID_ROW_HEIGHT_MM;
       let col = 0;
       for (const photo of photos) {
-        if (dy + cellH > pageHeight - margin) {
+        if (col === 0 && dy + cellH > pageHeight - margin) {
           doc.addPage();
           dy = margin;
-          col = 0;
         }
-        const px = margin + col * (cellW + gap);
+        const px = margin + col * (cellW + PDF_PHOTO_GRID_GAP_MM);
         await drawPdfPhotoBox(doc, { url: photo.photo_url, photoCache: projectPinPhotoCache, x: px, y: dy, w: cellW, h: cellH });
         col += 1;
-        if (col >= cols) {
+        if (col >= PDF_PHOTO_GRID_COLS) {
           col = 0;
-          dy += cellH + gap;
+          dy += cellH + PDF_PHOTO_GRID_GAP_MM;
         }
       }
-      if (col !== 0) dy += cellH + gap;
+      if (col !== 0) dy += cellH + PDF_PHOTO_GRID_GAP_MM;
       dy += 2;
     }
 
@@ -3144,26 +3169,18 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
     let pageHeight = doc.internal.pageSize.getHeight();
     const margin = 15;
     const contentWidth = pageWidth - margin * 2;
-    const colGap = 8;
-    const leftW = contentWidth * 0.58;
-    const rightW = contentWidth - leftW - colGap;
-    const rightX = margin + leftW + colGap;
     const cardBottomGap = 9;
-    // Feste, moderate Foto-Boxhöhe statt "füllt die restliche Seite" — im kompakten,
-    // fließenden Layout braucht die Karte eine planbare, von der Seitenrestfläche
-    // unabhängige Höhe. Weitere Fotos (siehe unten) hängen sich als Raster darunter an.
-    const photoBoxH = Math.min(58, rightW * 1.1);
-    // Rasterlayout für alle Fotos AB dem zweiten (das erste bekommt die große Box
-    // oben) — 3 Spalten quadratischer Kacheln, Größe ergibt sich aus rightW.
-    const thumbCols = 3;
-    const thumbGap = 2.5;
-    const thumbSize = (rightW - thumbGap * (thumbCols - 1)) / thumbCols;
+    // GUARANTEED UNIFORM IMAGE RESIZING: 2-Spalten-Foto-Raster über die volle
+    // Kartenbreite statt der bisherigen schmalen Seitenspalte — dank der 4:3-
+    // Bildnormalisierung beim Preload (siehe normalizeImageTo4x3Canvas) füllt jedes
+    // Foto seine Kachel auf den Millimeter genau identisch groß, unabhängig vom
+    // Ausgangs-Seitenverhältnis. Spaltenbreite hängt nur von contentWidth ab, daher
+    // einmal außerhalb der Pin-Schleife berechnet.
+    const photoColWidth = (contentWidth - PDF_PHOTO_GRID_GAP_MM * (PDF_PHOTO_GRID_COLS - 1)) / PDF_PHOTO_GRID_COLS;
 
     // Zeichnet EIN Foto (oder einen Platzhalter, falls url fehlt/Preload
-    // fehlgeschlagen ist) — EINHEITLICHE BILDGRÖSSEN: object-fit: cover-Äquivalent mit
-    // abgerundeten Ecken über die gemeinsame drawPdfPhotoBox (siehe oben), damit
-    // Haupt- und Rasterfotos exakt gleich behandelt werden und die Box unabhängig vom
-    // Kamera-Seitenverhältnis IMMER lückenlos gefüllt ist (kein Letterboxing mehr).
+    // fehlgeschlagen ist) — siehe drawPdfPhotoBox oben (einheitliche 4:3-Normalisierung
+    // + abgerundete Ecken, dieselbe Behandlung in allen drei PDF-Export-Funktionen).
     const drawPhotoBox = (url, bx, by, bw, bh, placeholderText) =>
       drawPdfPhotoBox(doc, { url, photoCache, x: bx, y: by, w: bw, h: bh, placeholderText });
 
@@ -3183,28 +3200,33 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
 
       doc.setFontSize(10);
       normal();
+      // Volle Kartenbreite statt bisheriger linker Spalte — seit dem Wegfall der
+      // rechten Foto-Spalte (Fotos rutschen jetzt als eigener, voller Raster-Block
+      // weiter unten) steht für Datenfakten und Kommentar die gesamte Breite zur
+      // Verfügung, was auch die Lesbarkeit langer Kommentare verbessert.
       const shortFieldDefs = [
         ["Gewerk", rowValues.trade],
         ["Bereich", rowValues.area],
       ];
       const shortFields = shortFieldDefs.map(([label, value]) => {
-        const lines = doc.splitTextToSize(String(value ?? "–"), leftW);
+        const lines = doc.splitTextToSize(String(value ?? "–"), contentWidth);
         return { label, lines, height: 4.3 + lines.length * 4.6 + 3.6 };
       });
       const shortFieldsHeight = shortFields.reduce((sum, f) => sum + f.height, 0);
 
       doc.setFontSize(9.5);
-      const commentLines = doc.splitTextToSize(rowValues.comment, leftW);
+      const commentLines = doc.splitTextToSize(rowValues.comment, contentWidth);
       const commentBlockHeight = 4.3 + commentLines.length * 4.6;
 
-      // Rechte Spalte: Hauptfoto + Raster ALLER weiteren Fotos (AUSNAHMSLOS alle,
-      // nicht mehr nur gezählt) — Höhe wächst mit der Fotoanzahl.
-      const extraPhotoCount = Math.max(0, photos.length - 1);
-      const thumbRows = Math.ceil(extraPhotoCount / thumbCols);
-      const photosExtraHeight = thumbRows > 0 ? thumbGap + thumbRows * (thumbSize + thumbGap) : 0;
-      const rightColumnHeight = photoBoxH + photosExtraHeight;
+      // GUARANTEED UNIFORM IMAGE RESIZING & 2-Column Grid: AUSNAHMSLOS alle Fotos
+      // dieses Pins, in einem 2-Spalten-Raster mit fester Zeilenhöhe (siehe
+      // PDF_PHOTO_GRID_ROW_HEIGHT_MM). Ohne Foto wird trotzdem EIN Platzhalter in
+      // voller Kartenbreite gezeigt ("Kein Bild vorhanden") — auch das Fehlen eines
+      // Fotos soll im Bericht sichtbar dokumentiert sein, nicht stillschweigend fehlen.
+      const photoRows = Math.max(1, Math.ceil(photos.length / PDF_PHOTO_GRID_COLS));
+      const photoSectionHeight = 9.5 + photoRows * PDF_PHOTO_GRID_ROW_HEIGHT_MM + (photoRows - 1) * PDF_PHOTO_GRID_GAP_MM;
 
-      // Aufgaben/Checkliste — volle Kartenbreite, unterhalb beider Spalten, siehe
+      // Aufgaben/Checkliste — volle Kartenbreite, unterhalb des Fotorasters, siehe
       // Zeichnung weiter unten. Höhe wird hier nur GEMESSEN (splitTextToSize zeichnet
       // nichts), damit die Seitenumbruch-Entscheidung der ganzen Karte sie korrekt
       // mit einrechnet.
@@ -3214,13 +3236,14 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       const todosHeight =
         todos.length > 0 ? 9.5 + todoLineSets.reduce((sum, lines) => sum + lines.length * 4.6 + 1.5, 0) : 0;
 
-      const contentHeight = Math.max(shortFieldsHeight + commentBlockHeight, rightColumnHeight);
-      const estimatedCardHeight = headerBottomOffset + 6 + contentHeight + todosHeight + cardBottomGap;
+      const estimatedCardHeight =
+        headerBottomOffset + 6 + shortFieldsHeight + commentBlockHeight + 4 + photoSectionHeight + todosHeight + cardBottomGap;
 
       // ---- Seitenumbruch-Entscheidung: Karte als Ganzes auf eine neue Seite, wenn sie
       // hier nicht mehr vollständig Platz findet (y > margin verhindert eine leere
       // Endlosschleife, falls eine einzelne Karte selbst eine ganze Seite sprengt — in
-      // dem seltenen Fall greift die Kommentar-Fortsetzungslogik weiter unten). ----
+      // dem seltenen Fall greifen die Fortsetzungslogiken für Kommentar/Fotos/Aufgaben
+      // weiter unten). ----
       if (y + estimatedCardHeight > pageHeight - margin && y > margin) {
         doc.addPage("a4", "portrait");
         y = margin;
@@ -3261,40 +3284,11 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       doc.setDrawColor(226, 232, 240);
       doc.line(margin, headerBottom, pageWidth - margin, headerBottom);
 
-      const columnsStartY = headerBottom + 6;
-
-      // ---- Rechte Spalte — Foto-Nachweis: zuerst gezeichnet, damit sie sicher auf
-      // DIESER Karten-Seite landet, bevor ein eventueller Kommentar-/Aufgaben-
-      // Seitenumbruch weiter unten den aktuellen jsPDF-Seitenkontext wechselt.
-      // AUSNAHMSLOS ALLE Fotos werden gedruckt (nicht mehr nur gezählt): das erste
-      // groß oben, alle weiteren als Raster darunter — dank photoCache (siehe
-      // preloadPinPhotosForPdf, oben vor der Schleife parallel geladen) ohne
-      // zusätzlichen Netzwerk-Request an dieser Stelle. ----
-      if (photos.length > 0) {
-        await drawPhotoBox(photos[0].photo_url, rightX, columnsStartY, rightW, photoBoxH, "Foto konnte nicht geladen werden");
-        if (extraPhotoCount > 0) {
-          const gridY = columnsStartY + photoBoxH + thumbGap;
-          let idx = 0;
-          for (const photo of photos.slice(1)) {
-            const col = idx % thumbCols;
-            const row = Math.floor(idx / thumbCols);
-            const tx = rightX + col * (thumbSize + thumbGap);
-            const ty = gridY + row * (thumbSize + thumbGap);
-            await drawPhotoBox(photo.photo_url, tx, ty, thumbSize, thumbSize, "Fehler");
-            idx += 1;
-          }
-        }
-      } else {
-        await drawPhotoBox(null, rightX, columnsStartY, rightW, photoBoxH, "Kein Bild vorhanden");
-      }
-      doc.setDrawColor(226, 232, 240);
-      const photoColumnBottom = columnsStartY + rightColumnHeight;
-
-      // ---- Linke Spalte — Datenfakten (Gewerk, Bereich — Status/Aufnahmedatum/
-      // Erledigt bis sitzen bereits kompakt im Kartenkopf) und vollständiger
-      // Kommentar. "Anschlussbezeichnung" und "Erledigen durch" wurden entfernt
-      // (siehe PDF LAYOUT CLEANUP-Anforderung). ----
-      let dy = columnsStartY;
+      // ---- Datenfakten (Gewerk, Bereich — Status/Aufnahmedatum/Erledigt bis sitzen
+      // bereits kompakt im Kartenkopf) und vollständiger Kommentar, jetzt über die
+      // volle Kartenbreite. "Anschlussbezeichnung" und "Erledigen durch" wurden
+      // entfernt (siehe PDF LAYOUT CLEANUP-Anforderung). ----
+      let dy = headerBottom + 6;
       shortFields.forEach(({ label, lines }) => {
         doc.setFontSize(7.5);
         bold();
@@ -3319,9 +3313,7 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       // Vollständiger Kommentartext, ohne jede Kürzung — für sehr lange Kommentare läuft
       // die Karte notfalls über den unteren Seitenrand hinaus in eine direkt
       // anschließende Fortsetzungsseite (bewusst in Kauf genommen: eine Kürzung des
-      // Kommentartexts käme für ein Baugutachten nicht infrage). Die rechte Spalte
-      // (Foto) ist zu diesem Zeitpunkt bereits vollständig gezeichnet, ein hier
-      // eventuell ausgelöster Seitenumbruch kann sie also nicht mehr betreffen.
+      // Kommentartexts käme für ein Baugutachten nicht infrage).
       let commentY = dy;
       for (const line of commentLines) {
         if (commentY > pageHeight - margin) {
@@ -3334,13 +3326,54 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
         commentY += 4.6;
       }
 
-      // ---- Aufgaben/Checkliste — volle Kartenbreite unterhalb beider Spalten, ALLE
+      // ---- Fotoraster — volle Kartenbreite, 2 Spalten, AUSNAHMSLOS alle Fotos dieses
+      // Pins (dank photoCache, siehe preloadPinPhotosForPdf oben vor der Schleife
+      // parallel geladen, ohne weiteren Netzwerk-Request an dieser Stelle). Startet
+      // unterhalb des Kommentarendes; ein eigener Seitenumbruch VOR dem Raster stellt
+      // sicher, dass zumindest die Überschrift nicht isoliert am Seitenende landet. ----
+      let photoY = commentY + 4;
+      if (photoY + 8 > pageHeight - margin) {
+        doc.addPage("a4", "portrait");
+        pageWidth = doc.internal.pageSize.getWidth();
+        pageHeight = doc.internal.pageSize.getHeight();
+        photoY = margin;
+      }
+      doc.setFontSize(7.5);
+      bold();
+      mutedColor();
+      doc.text(`FOTOS${photos.length > 0 ? ` (${photos.length})` : ""}`, margin, photoY);
+      inkColor();
+      photoY += 5.5;
+      normal();
+      if (photos.length > 0) {
+        let idx = 0;
+        for (const photo of photos) {
+          const col = idx % PDF_PHOTO_GRID_COLS;
+          // Zeilenanfang: prüfen ob die GANZE Bildzeile (nicht nur ein einzelnes Foto)
+          // noch auf die aktuelle Seite passt — verhindert, dass eine Bildreihe mitten
+          // durchgeschnitten wird (das PDF-Äquivalent zu CSS "break-inside: avoid").
+          if (col === 0 && photoY + PDF_PHOTO_GRID_ROW_HEIGHT_MM > pageHeight - margin) {
+            doc.addPage("a4", "portrait");
+            pageWidth = doc.internal.pageSize.getWidth();
+            pageHeight = doc.internal.pageSize.getHeight();
+            photoY = margin;
+          }
+          const bx = margin + col * (photoColWidth + PDF_PHOTO_GRID_GAP_MM);
+          await drawPhotoBox(photo.photo_url, bx, photoY, photoColWidth, PDF_PHOTO_GRID_ROW_HEIGHT_MM, "Foto konnte nicht geladen werden");
+          if (col === PDF_PHOTO_GRID_COLS - 1 || idx === photos.length - 1) {
+            photoY += PDF_PHOTO_GRID_ROW_HEIGHT_MM + PDF_PHOTO_GRID_GAP_MM;
+          }
+          idx += 1;
+        }
+      } else {
+        await drawPhotoBox(null, margin, photoY, contentWidth, PDF_PHOTO_GRID_ROW_HEIGHT_MM, "Kein Bild vorhanden");
+        photoY += PDF_PHOTO_GRID_ROW_HEIGHT_MM + PDF_PHOTO_GRID_GAP_MM;
+      }
+      let cardBottom = photoY - PDF_PHOTO_GRID_GAP_MM;
+
+      // ---- Aufgaben/Checkliste — volle Kartenbreite unterhalb des Fotorasters, ALLE
       // Einträge (offen wie erledigt) mit Erledigt-Kennzeichnung, analog zum
-      // projektweiten Gesamtexport (generateProjectReportPdf). Startet unterhalb des
-      // jeweils tieferen Punkts von Kommentar- und Fotospalte — zu diesem Zeitpunkt
-      // sind beide bereits vollständig gezeichnet, ein hier ausgelöster Seitenumbruch
-      // kann sie also nicht mehr betreffen. ----
-      let cardBottom = Math.max(commentY, photoColumnBottom);
+      // projektweiten Gesamtexport (generateProjectReportPdf). ----
       if (todos.length > 0) {
         let tdy = cardBottom + 4;
         if (tdy + 8 > pageHeight - margin) {
@@ -3382,8 +3415,7 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
         cardBottom = tdy;
       }
 
-      // Nächste Karte setzt direkt unterhalb des tiefsten Punkts dieser Karte fort
-      // (Kommentar-/Aufgabenende ODER Fotospalte, je nachdem was tiefer reicht) —
+      // Nächste Karte setzt direkt unterhalb des tiefsten Punkts dieser Karte fort —
       // daher der fließende, lückenlose Mehr-Pin-Fluss ohne erzwungene Seitenumbrüche.
       y = cardBottom + cardBottomGap;
     }
@@ -3766,8 +3798,9 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
     sectionY += 3;
   }
 
-  // ---- Fotos — vollständig, im selben 3-Spalten-Raster wie der Gesamtexport (siehe
-  // generateProjectReportPdf) statt bisher nur eines einzelnen Vorschaubilds. ----
+  // ---- Fotos — vollständig, im selben 2-Spalten-Raster mit fester Zeilenhöhe wie der
+  // Gesamt- und Geschoss-Export (siehe generateProjectReportPdf/
+  // generateFloorPinsTablePdf) statt bisher nur eines einzelnen Vorschaubilds. ----
   const photos = pin.pin_photos || [];
   ensureSpace(10);
   doc.setFontSize(7.5);
@@ -3778,23 +3811,23 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
   sectionY += 5;
   normal();
   if (photos.length > 0) {
-    // Auch hier: alle Fotos dieses einen Pins parallel vorladen (Promise.all, siehe
-    // preloadPinPhotosForPdf) statt sie nacheinander im Zeichen-Loop zu laden — bei
+    // Auch hier: alle Fotos dieses einen Pins parallel vorladen und auf ein
+    // einheitliches 4:3-Format normalisieren (preloadPinPhotosForPdf →
+    // normalizeImageTo4x3Canvas) statt sie nacheinander im Zeichen-Loop zu laden — bei
     // wenigen Fotos pro Pin ein kleinerer Effekt als beim Geschoss-Export, aber
     // dieselbe robuste Fehlerbehandlung: ein einzelnes fehlgeschlagenes Foto lässt
     // die übrigen Kacheln und den Rest des Berichts unberührt.
     const singlePinPhotoCache = await preloadPinPhotosForPdf([pin]);
-    const cols = 3;
-    const gap = 4;
-    const cellW = (contentWidth - gap * (cols - 1)) / cols;
-    const cellH = cellW * 0.75;
+    const cellW = (contentWidth - PDF_PHOTO_GRID_GAP_MM * (PDF_PHOTO_GRID_COLS - 1)) / PDF_PHOTO_GRID_COLS;
+    const cellH = PDF_PHOTO_GRID_ROW_HEIGHT_MM;
     let col = 0;
     for (const photo of photos) {
       if (col === 0) ensureSpace(cellH);
-      // EINHEITLICHE BILDGRÖSSEN: object-fit: cover-Äquivalent mit abgerundeten Ecken
-      // über die gemeinsame drawPdfPhotoBox (siehe oben) — dieselbe Behandlung wie im
-      // Geschoss- und Gesamtexport, jedes Foto füllt seine Kachel lückenlos aus.
-      const px = margin + col * (cellW + gap);
+      // GUARANTEED UNIFORM IMAGE RESIZING: dank der 4:3-Normalisierung beim Preload
+      // (siehe oben) und der gemeinsamen drawPdfPhotoBox füllt jedes Foto seine
+      // Kachel exakt gleich groß aus — dieselbe Behandlung wie im Geschoss- und
+      // Gesamtexport.
+      const px = margin + col * (cellW + PDF_PHOTO_GRID_GAP_MM);
       await drawPdfPhotoBox(doc, {
         url: photo.photo_url,
         photoCache: singlePinPhotoCache,
@@ -3804,12 +3837,12 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
         h: cellH,
       });
       col += 1;
-      if (col >= cols) {
+      if (col >= PDF_PHOTO_GRID_COLS) {
         col = 0;
-        sectionY += cellH + gap;
+        sectionY += cellH + PDF_PHOTO_GRID_GAP_MM;
       }
     }
-    if (col !== 0) sectionY += cellH + gap;
+    if (col !== 0) sectionY += cellH + PDF_PHOTO_GRID_GAP_MM;
   } else {
     doc.setFontSize(8.5);
     mutedColor();
