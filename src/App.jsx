@@ -2170,6 +2170,41 @@ function compressImageDataUrl(sourceDataUrl, maxWidth, maxHeight, quality) {
   });
 }
 
+// ---- ASYNCHRONES BILDER-PRELOADING (Promise.all) für den Geschoss-PDF-Export ------
+// Lädt JEDES Mängelfoto ALLER übergebenen Pins parallel als Base64/Data-URL vor,
+// BEVOR die eigentliche PDF-Generierung beginnt (statt wie zuvor sequentiell erst beim
+// Zeichnen jeder einzelnen Karte). Vorteile gegenüber dem sequentiellen Laden:
+// 1. Deutlich schnellerer Gesamt-Export bei vielen Pins/Fotos, da die Netzwerk-Ladezeit
+//    aller Bilder überlappt statt sich zu addieren.
+// 2. Ein einzelnes fehlschlagendes Foto (Netzwerk-Hänger, CORS, gelöschte Datei) bricht
+//    den Export NICHT ab — jeder Ladevorgang ist einzeln try/catch-abgesichert, ein
+//    Fehlschlag liefert lediglich { ok: false } für genau diese URL, alle anderen
+//    Fotos UND der restliche Bericht werden davon unberührt vollständig fertiggestellt
+//    (Graceful Fallback, siehe Verwendung in generateFloorPinsTablePdf).
+// Mehrfach verwendete Foto-URLs (kommt praktisch nicht vor, aber möglich) werden dank
+// des Sets nur einmal geladen. Rückgabe: Map<photo_url, { ok, dataUrl?, width?, height? }>.
+async function preloadPinPhotosForPdf(pins, { maxWidth = PDF_PHOTO_MAX_WIDTH, maxHeight = PDF_PHOTO_MAX_HEIGHT, quality = PDF_PHOTO_JPEG_QUALITY } = {}) {
+  const urls = new Set();
+  (pins || []).forEach((pin) => {
+    (pin.pin_photos || []).forEach((photo) => {
+      if (photo?.photo_url) urls.add(photo.photo_url);
+    });
+  });
+  const entries = await Promise.all(
+    [...urls].map(async (url) => {
+      try {
+        const raw = await loadImageAsDataUrl(url);
+        const compressed = await compressImageDataUrl(raw.dataUrl, maxWidth, maxHeight, quality);
+        return [url, { ok: true, ...compressed }];
+      } catch (err) {
+        console.warn(`Mängelfoto konnte nicht vorab in den PDF-Export geladen werden (${url}):`, err);
+        return [url, { ok: false }];
+      }
+    })
+  );
+  return new Map(entries);
+}
+
 // Schneidet aus einem bereits geladenen Grundriss-Bild (Data-URL) einen quadratischen
 // Ausschnitt zentriert auf eine relative Position (centerXRatio/centerYRatio, je 0–1,
 // entspricht pin.x/pin.y aus 0–100 umgerechnet) aus und liefert ihn — analog zu
@@ -2989,6 +3024,17 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
   // Ohne Pins wird bewusst KEINE zusätzliche leere Seite angehängt — Seite 1 trägt in
   // diesem Fall bereits den entsprechenden Hinweis (siehe Fallback-Text weiter oben).
   if (numberedPins.length > 0) {
+    // ASYNCHRONES BILDER-PRELOADING (Promise.all, siehe preloadPinPhotosForPdf oben):
+    // ALLE Mängelfotos ALLER Pins dieses Geschosses werden hier VOR dem Zeichnen der
+    // ersten Karte parallel geladen. Das Zeichnen selbst (weiter unten) greift danach
+    // nur noch lesend auf den bereits fertigen photoCache zu und löst keine weiteren
+    // Netzwerk-Requests mehr aus — ein einzelnes fehlschlagendes Foto (CORS,
+    // Netzwerkfehler, gelöschte Datei) verhindert dank des Graceful Fallbacks in
+    // preloadPinPhotosForPdf NICHT die vollständige Fertigstellung des restlichen
+    // Berichts (alle anderen Fotos, Texte, Aufgaben und Karten werden trotzdem
+    // vollständig gedruckt).
+    const photoCache = await preloadPinPhotosForPdf(numberedPins);
+
     doc.addPage("a4", "portrait");
     let pageWidth = doc.internal.pageSize.getWidth();
     let pageHeight = doc.internal.pageSize.getHeight();
@@ -3001,13 +3047,42 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
     const cardBottomGap = 9;
     // Feste, moderate Foto-Boxhöhe statt "füllt die restliche Seite" — im kompakten,
     // fließenden Layout braucht die Karte eine planbare, von der Seitenrestfläche
-    // unabhängige Höhe.
+    // unabhängige Höhe. Weitere Fotos (siehe unten) hängen sich als Raster darunter an.
     const photoBoxH = Math.min(58, rightW * 1.1);
+    // Rasterlayout für alle Fotos AB dem zweiten (das erste bekommt die große Box
+    // oben) — 3 Spalten quadratischer Kacheln, Größe ergibt sich aus rightW.
+    const thumbCols = 3;
+    const thumbGap = 2.5;
+    const thumbSize = (rightW - thumbGap * (thumbCols - 1)) / thumbCols;
+
+    // Zeichnet EIN Foto (oder einen Platzhalter, falls url fehlt/Preload
+    // fehlgeschlagen ist) in die angegebene Box — zentriert, seitenverhältnistreu,
+    // nie beschnitten. Zentrale Stelle, damit Haupt- und Rasterfotos exakt gleich
+    // behandelt werden.
+    const drawPhotoBox = (url, bx, by, bw, bh, placeholderText) => {
+      const cached = url ? photoCache.get(url) : null;
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(226, 232, 240);
+      doc.roundedRect(bx, by, bw, bh, 2, 2, "FD");
+      if (cached && cached.ok) {
+        const ratio = Math.min(bw / cached.width, bh / cached.height);
+        const w = cached.width * ratio;
+        const h = cached.height * ratio;
+        doc.addImage(cached.dataUrl, "JPEG", bx + (bw - w) / 2, by + (bh - h) / 2, w, h);
+      } else {
+        doc.setFontSize(bh >= 24 ? 9 : 6.3);
+        mutedColor();
+        doc.text(placeholderText, bx + bw / 2, by + bh / 2, { align: "center", maxWidth: Math.max(bw - 3, 6) });
+        inkColor();
+      }
+    };
 
     let y = margin;
 
     for (const pin of numberedPins) {
       const rowValues = buildFloorExportRowValues(pin, tradesById, floor.name);
+      const photos = pin.pin_photos || [];
+      const todos = pin.pin_todos || [];
 
       // ---- Höhe messen (nichts wird hier gezeichnet) ----------------------------
       doc.setFontSize(15);
@@ -3034,8 +3109,25 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       const commentLines = doc.splitTextToSize(rowValues.comment, leftW);
       const commentBlockHeight = 4.3 + commentLines.length * 4.6;
 
-      const contentHeight = Math.max(shortFieldsHeight + commentBlockHeight, photoBoxH);
-      const estimatedCardHeight = headerBottomOffset + 6 + contentHeight + cardBottomGap;
+      // Rechte Spalte: Hauptfoto + Raster ALLER weiteren Fotos (AUSNAHMSLOS alle,
+      // nicht mehr nur gezählt) — Höhe wächst mit der Fotoanzahl.
+      const extraPhotoCount = Math.max(0, photos.length - 1);
+      const thumbRows = Math.ceil(extraPhotoCount / thumbCols);
+      const photosExtraHeight = thumbRows > 0 ? thumbGap + thumbRows * (thumbSize + thumbGap) : 0;
+      const rightColumnHeight = photoBoxH + photosExtraHeight;
+
+      // Aufgaben/Checkliste — volle Kartenbreite, unterhalb beider Spalten, siehe
+      // Zeichnung weiter unten. Höhe wird hier nur GEMESSEN (splitTextToSize zeichnet
+      // nichts), damit die Seitenumbruch-Entscheidung der ganzen Karte sie korrekt
+      // mit einrechnet.
+      doc.setFontSize(9);
+      normal();
+      const todoLineSets = todos.map((todo) => doc.splitTextToSize(todo.text || "", contentWidth - 7));
+      const todosHeight =
+        todos.length > 0 ? 9.5 + todoLineSets.reduce((sum, lines) => sum + lines.length * 4.6 + 1.5, 0) : 0;
+
+      const contentHeight = Math.max(shortFieldsHeight + commentBlockHeight, rightColumnHeight);
+      const estimatedCardHeight = headerBottomOffset + 6 + contentHeight + todosHeight + cardBottomGap;
 
       // ---- Seitenumbruch-Entscheidung: Karte als Ganzes auf eine neue Seite, wenn sie
       // hier nicht mehr vollständig Platz findet (y > margin verhindert eine leere
@@ -3084,55 +3176,29 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       const columnsStartY = headerBottom + 6;
 
       // ---- Rechte Spalte — Foto-Nachweis: zuerst gezeichnet, damit sie sicher auf
-      // DIESER Karten-Seite landet, bevor ein eventueller Kommentar-Seitenumbruch weiter
-      // unten den aktuellen jsPDF-Seitenkontext wechselt. Eingebettetes Vorschaubild des
-      // ersten Fotos (weitere Fotos werden gezählt, nicht verworfen — vollständige Liste
-      // aller Foto-Links steht im Excel-Export), sonst ein dezenter Platzhalter. ----
-      const photos = pin.pin_photos || [];
-      doc.setDrawColor(226, 232, 240);
-      let photoNoteHeight = 0;
+      // DIESER Karten-Seite landet, bevor ein eventueller Kommentar-/Aufgaben-
+      // Seitenumbruch weiter unten den aktuellen jsPDF-Seitenkontext wechselt.
+      // AUSNAHMSLOS ALLE Fotos werden gedruckt (nicht mehr nur gezählt): das erste
+      // groß oben, alle weiteren als Raster darunter — dank photoCache (siehe
+      // preloadPinPhotosForPdf, oben vor der Schleife parallel geladen) ohne
+      // zusätzlichen Netzwerk-Request an dieser Stelle. ----
       if (photos.length > 0) {
-        try {
-          const rawImgData = await loadImageAsDataUrl(photos[0].photo_url);
-          // Downscaling & JPEG-Komprimierung vor dem Einbetten (siehe compressImageDataUrl)
-          // — Kamerafotos landen sonst in voller Originalauflösung im PDF.
-          const imgData = await compressImageDataUrl(rawImgData.dataUrl, PDF_PHOTO_MAX_WIDTH, PDF_PHOTO_MAX_HEIGHT, PDF_PHOTO_JPEG_QUALITY);
-          const ratio = Math.min(rightW / imgData.width, photoBoxH / imgData.height);
-          const w = imgData.width * ratio;
-          const h = imgData.height * ratio;
-          doc.setFillColor(248, 250, 252);
-          doc.roundedRect(rightX, columnsStartY, rightW, photoBoxH, 2, 2, "FD");
-          doc.addImage(imgData.dataUrl, "JPEG", rightX + (rightW - w) / 2, columnsStartY + (photoBoxH - h) / 2, w, h);
-        } catch (err) {
-          console.error("Foto konnte nicht in den PDF-Export geladen werden:", err);
-          doc.setFillColor(248, 250, 252);
-          doc.roundedRect(rightX, columnsStartY, rightW, photoBoxH, 2, 2, "FD");
-          doc.setFontSize(9);
-          mutedColor();
-          doc.text("Foto konnte nicht geladen werden", rightX + rightW / 2, columnsStartY + photoBoxH / 2, { align: "center" });
-          inkColor();
-        }
-        if (photos.length > 1) {
-          doc.setFontSize(7.5);
-          mutedColor();
-          doc.text(
-            `+ ${photos.length - 1} weitere(s) Foto(s) — vollständige Liste im Excel-Export.`,
-            rightX,
-            columnsStartY + photoBoxH + 5,
-            { maxWidth: rightW }
-          );
-          inkColor();
-          photoNoteHeight = 6;
+        drawPhotoBox(photos[0].photo_url, rightX, columnsStartY, rightW, photoBoxH, "Foto konnte nicht geladen werden");
+        if (extraPhotoCount > 0) {
+          const gridY = columnsStartY + photoBoxH + thumbGap;
+          photos.slice(1).forEach((photo, idx) => {
+            const col = idx % thumbCols;
+            const row = Math.floor(idx / thumbCols);
+            const tx = rightX + col * (thumbSize + thumbGap);
+            const ty = gridY + row * (thumbSize + thumbGap);
+            drawPhotoBox(photo.photo_url, tx, ty, thumbSize, thumbSize, "Fehler");
+          });
         }
       } else {
-        doc.setFillColor(248, 250, 252);
-        doc.roundedRect(rightX, columnsStartY, rightW, photoBoxH, 2, 2, "FD");
-        doc.setFontSize(9.5);
-        mutedColor();
-        doc.text("Kein Bild vorhanden", rightX + rightW / 2, columnsStartY + photoBoxH / 2, { align: "center" });
-        inkColor();
+        drawPhotoBox(null, rightX, columnsStartY, rightW, photoBoxH, "Kein Bild vorhanden");
       }
-      const photoColumnBottom = columnsStartY + photoBoxH + photoNoteHeight;
+      doc.setDrawColor(226, 232, 240);
+      const photoColumnBottom = columnsStartY + rightColumnHeight;
 
       // ---- Linke Spalte — Datenfakten (Anschlussbezeichnung, Gewerk, Bereich,
       // Erledigen durch — Status/Aufnahmedatum/Erledigt bis sitzen bereits kompakt im
@@ -3177,10 +3243,58 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
         commentY += 4.6;
       }
 
+      // ---- Aufgaben/Checkliste — volle Kartenbreite unterhalb beider Spalten, ALLE
+      // Einträge (offen wie erledigt) mit Erledigt-Kennzeichnung, analog zum
+      // projektweiten Gesamtexport (generateProjectReportPdf). Startet unterhalb des
+      // jeweils tieferen Punkts von Kommentar- und Fotospalte — zu diesem Zeitpunkt
+      // sind beide bereits vollständig gezeichnet, ein hier ausgelöster Seitenumbruch
+      // kann sie also nicht mehr betreffen. ----
+      let cardBottom = Math.max(commentY, photoColumnBottom);
+      if (todos.length > 0) {
+        let tdy = cardBottom + 4;
+        if (tdy + 8 > pageHeight - margin) {
+          doc.addPage("a4", "portrait");
+          pageWidth = doc.internal.pageSize.getWidth();
+          pageHeight = doc.internal.pageSize.getHeight();
+          tdy = margin;
+        }
+        doc.setFontSize(7.5);
+        bold();
+        mutedColor();
+        doc.text(`AUFGABEN (${todos.filter((t) => t.completed).length}/${todos.length} ERLEDIGT)`, margin, tdy);
+        inkColor();
+        tdy += 5.5;
+        doc.setFontSize(9);
+        normal();
+        todos.forEach((todo, idx) => {
+          const lines = todoLineSets[idx] && todoLineSets[idx].length ? todoLineSets[idx] : doc.splitTextToSize(todo.text || "", contentWidth - 7);
+          if (tdy + lines.length * 4.6 > pageHeight - margin) {
+            doc.addPage("a4", "portrait");
+            pageWidth = doc.internal.pageSize.getWidth();
+            pageHeight = doc.internal.pageSize.getHeight();
+            tdy = margin;
+          }
+          doc.setDrawColor(148, 163, 184);
+          if (todo.completed) {
+            doc.setFillColor(16, 185, 129);
+            doc.roundedRect(margin, tdy - 3, 3.2, 3.2, 0.6, 0.6, "F");
+            mutedColor();
+          } else {
+            doc.roundedRect(margin, tdy - 3, 3.2, 3.2, 0.6, 0.6, "S");
+            inkColor();
+          }
+          doc.text(lines, margin + 6.5, tdy, { maxWidth: contentWidth - 6.5 });
+          inkColor();
+          tdy += lines.length * 4.6 + 1.5;
+        });
+        doc.setDrawColor(226, 232, 240);
+        cardBottom = tdy;
+      }
+
       // Nächste Karte setzt direkt unterhalb des tiefsten Punkts dieser Karte fort
-      // (Kommentarende ODER Fotospalte, je nachdem was tiefer reicht) — daher der
-      // fließende, lückenlose Mehr-Pin-Fluss ohne erzwungene Seitenumbrüche.
-      y = Math.max(commentY, photoColumnBottom) + cardBottomGap;
+      // (Kommentar-/Aufgabenende ODER Fotospalte, je nachdem was tiefer reicht) —
+      // daher der fließende, lückenlose Mehr-Pin-Fluss ohne erzwungene Seitenumbrüche.
+      y = cardBottom + cardBottomGap;
     }
   }
 
@@ -3575,6 +3689,12 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
   sectionY += 5;
   normal();
   if (photos.length > 0) {
+    // Auch hier: alle Fotos dieses einen Pins parallel vorladen (Promise.all, siehe
+    // preloadPinPhotosForPdf) statt sie nacheinander im Zeichen-Loop zu laden — bei
+    // wenigen Fotos pro Pin ein kleinerer Effekt als beim Geschoss-Export, aber
+    // dieselbe robuste Fehlerbehandlung: ein einzelnes fehlgeschlagenes Foto lässt
+    // die übrigen Kacheln und den Rest des Berichts unberührt.
+    const singlePinPhotoCache = await preloadPinPhotosForPdf([pin]);
     const cols = 3;
     const gap = 4;
     const cellW = (contentWidth - gap * (cols - 1)) / cols;
@@ -3582,16 +3702,22 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
     let col = 0;
     for (const photo of photos) {
       if (col === 0) ensureSpace(cellH);
-      try {
-        const rawImgData = await loadImageAsDataUrl(photo.photo_url);
-        const imgData = await compressImageDataUrl(rawImgData.dataUrl, PDF_PHOTO_MAX_WIDTH, PDF_PHOTO_MAX_HEIGHT, PDF_PHOTO_JPEG_QUALITY);
+      const cached = singlePinPhotoCache.get(photo.photo_url);
+      if (cached && cached.ok) {
         const px = margin + col * (cellW + gap);
-        const ratio = Math.min(cellW / imgData.width, cellH / imgData.height);
-        const w = imgData.width * ratio;
-        const h = imgData.height * ratio;
-        doc.addImage(imgData.dataUrl, "JPEG", px + (cellW - w) / 2, sectionY + (cellH - h) / 2, w, h);
-      } catch (err) {
-        console.error("Foto konnte nicht in den Einzel-PDF-Export geladen werden:", err);
+        const ratio = Math.min(cellW / cached.width, cellH / cached.height);
+        const w = cached.width * ratio;
+        const h = cached.height * ratio;
+        doc.addImage(cached.dataUrl, "JPEG", px + (cellW - w) / 2, sectionY + (cellH - h) / 2, w, h);
+      } else {
+        console.error("Foto konnte nicht in den Einzel-PDF-Export geladen werden:", photo.photo_url);
+        const px = margin + col * (cellW + gap);
+        doc.setFillColor(248, 250, 252);
+        doc.roundedRect(px, sectionY, cellW, cellH, 2, 2, "FD");
+        doc.setFontSize(7);
+        mutedColor();
+        doc.text("Foto konnte nicht geladen werden", px + cellW / 2, sectionY + cellH / 2, { align: "center", maxWidth: cellW - 3 });
+        inkColor();
       }
       col += 1;
       if (col >= cols) {
