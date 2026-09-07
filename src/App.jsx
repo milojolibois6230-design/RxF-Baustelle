@@ -1052,9 +1052,25 @@ async function logPinActivity(pinId, action, detail, actor) {
   return data;
 }
 
-// Löscht einen Pin inkl. aller zugehörigen Fotos im Storage (best effort) — die
-// Datenbankzeilen in pin_todos/pin_photos entfernt Postgres selbst über
-// ON DELETE CASCADE.
+// Löscht einen Pin inkl. aller zugehörigen Fotos im Storage (best effort) sowie —
+// SAUBERES LÖSCHEN (FOREIGN KEY HANDLING) — der verknüpften Untereinträge in
+// pin_todos/pin_photos. Das aktuelle Schema setzt für beide Tabellen zwar bereits
+// "on delete cascade" auf pin_id, verlässt sich hier aber NICHT ausschließlich darauf:
+// bei diesem Projekt hat sich bereits einmal gezeigt (siehe die frühere
+// lph_status-Constraint-Problematik), dass ein Teil eines Migrationsskripts auf einer
+// Live-Datenbank stillschweigend nie ausgeführt wurde — ein explizites Vorab-Löschen
+// der Kindzeilen schützt zuverlässig vor einem Foreign-Key-Fehler beim Löschen des
+// Pins, auch falls die CASCADE-Regel auf der jeweiligen Datenbank-Instanz fehlen
+// sollte. Ist sie hingegen korrekt gesetzt, betreffen diese beiden Aufrufe schlicht
+// null Zeilen (der Pin selbst hat sie zu diesem Zeitpunkt noch, es sind einfach keine
+// verwaisten Reste vorhanden) und sind folgenlos.
+// pin_activity_log wird hier BEWUSST NICHT explizit gelöscht: das Schema erlaubt für
+// diese Tabelle absichtlich kein clientseitiges DELETE (append-only Audit-Trail, siehe
+// supabase_schema_current.sql — nur SELECT/INSERT-Policies), ein Löschversuch würde
+// dort wegen fehlender Policy ohnehin nur folgenlos null Zeilen betreffen. Ihre
+// Bereinigung passiert ausschließlich über die FK-CASCADE beim Löschen des Pins
+// selbst, die als reine Datenbank-interne Operation nicht von Row-Level-Security
+// betroffen ist.
 async function deletePin(pin) {
   const photos = pin?.pin_photos || [];
   if (photos.length > 0) {
@@ -1064,6 +1080,11 @@ async function deletePin(pin) {
       if (removeError) console.error("Fotos konnten nicht aus dem Storage entfernt werden:", removeError);
     }
   }
+  const { error: todosError } = await supabase.from("pin_todos").delete().eq("pin_id", pin.id);
+  if (todosError) console.error("Aufgaben des Pins konnten nicht vorab gelöscht werden:", todosError);
+  const { error: photoRowsError } = await supabase.from("pin_photos").delete().eq("pin_id", pin.id);
+  if (photoRowsError) console.error("Foto-Einträge des Pins konnten nicht vorab gelöscht werden:", photoRowsError);
+
   const { error } = await supabase.from("pins").delete().eq("id", pin.id);
   if (error) throw error;
 }
