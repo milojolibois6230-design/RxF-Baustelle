@@ -799,8 +799,12 @@ const FLOOR_PLAN_PDF_COMPRESS_JPEG_QUALITY = 0.75;
 async function compressPdfForUpload(file) {
   const pdfjsLib = await loadPdfJs();
   const objectUrl = URL.createObjectURL(file);
+  // sourceDoc außerhalb des try deklariert, damit finally weiter unten unabhängig vom
+  // genauen Fehlschlagpunkt darauf zugreifen und destroy() aufrufen kann (siehe
+  // Kommentar dort zum GEDÄCHTNIS-LECK-FIX).
+  let sourceDoc = null;
   try {
-    const sourceDoc = await loadPdfDocument(pdfjsLib, objectUrl);
+    sourceDoc = await loadPdfDocument(pdfjsLib, objectUrl);
     const JsPdfCtor = await loadJsPdf();
     let outputDoc = null;
     for (let pageNum = 1; pageNum <= sourceDoc.numPages; pageNum += 1) {
@@ -845,6 +849,21 @@ async function compressPdfForUpload(file) {
     return new File([blob], `${baseName}_komprimiert.pdf`, { type: "application/pdf", lastModified: Date.now() });
   } finally {
     URL.revokeObjectURL(objectUrl);
+    // GEDÄCHTNIS-LECK-FIX (siehe Einordnung in der Antwort): pdf.js' PDFDocumentProxy
+    // gibt seine internen Caches (Worker-seitige Font-/Seiten-Daten) NICHT automatisch
+    // frei, nur weil die JS-Variable außer Reichweite gerät — destroy() ist laut
+    // pdf.js-API der dafür vorgesehene, explizite Aufruf. Ohne ihn blieb bei JEDEM
+    // PDF-Grundriss-Upload über dieser Größenschwelle ein solches Dokument dauerhaft
+    // im Speicher der Seite hängen. try/catch hier bewusst defensiv: destroy() selbst
+    // sollte nie fehlschlagen, aber ein einzelner Aufräumfehler darf niemals den
+    // eigentlichen Upload-Vorgang zum Absturz bringen.
+    if (sourceDoc) {
+      try {
+        sourceDoc.destroy();
+      } catch (destroyErr) {
+        console.warn("PDF-Dokument (Upload-Komprimierung) konnte nicht sauber freigegeben werden:", destroyErr);
+      }
+    }
   }
 }
 
@@ -2529,13 +2548,30 @@ function loadImageAsDataUrl(url) {
 async function renderPdfPlanToDataUrl(url, scale = 3.75) {
   const pdfjsLib = await loadPdfJs();
   const pdf = await loadPdfDocument(pdfjsLib, url);
-  const page = await pdf.getPage(1);
-  const viewport = page.getViewport({ scale });
-  const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-  return { dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height };
+  try {
+    const page = await pdf.getPage(1);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    return { dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height };
+  } finally {
+    // GEDÄCHTNIS-LECK-FIX (siehe Einordnung in der Antwort): diese Funktion wird bei
+    // JEDEM PDF-Export EINMAL PRO PDF-GRUNDRISS aufgerufen (generateProjectReportPdf
+    // iteriert über alle Etagen) — ohne destroy() blieb bisher für jeden dabei
+    // geladenen PDF-Grundriss ein eigenes pdf.js-Dokument samt interner Font-/
+    // Seiten-Caches dauerhaft im Speicher der Seite liegen, auch lange nachdem der
+    // Export fertig war. Bei einem Projekt mit mehreren PDF-Grundrissen (z.B. eine
+    // Etage je Geschoss) addierte sich das über die Dauer einer Sitzung spürbar auf —
+    // ein plausibler Mitverursacher dafür, dass der Speicherdruck kurz danach beim
+    // Zoomen auf dem Grundriss eher an die iOS-Grenze stößt, siehe Einordnung.
+    try {
+      pdf.destroy();
+    } catch (destroyErr) {
+      console.warn("PDF-Dokument (Export-Rendering) konnte nicht sauber freigegeben werden:", destroyErr);
+    }
+  }
 }
 
 // GRUNDRISS-GARANTIE (Anforderung PDF-Export): der Grundriss soll unabhängig von
@@ -5029,27 +5065,53 @@ function getPdfSafeRenderDprCap() {
 // auf ausdrücklichen Wunsch von 8192px angehoben worden — genau das hat sich auf
 // Mobilgeräten als Ursache des weißen Bildschirms bestätigt. iOS Safari und mobile
 // Chrome-Varianten kappen ein <canvas> bei Überschreiten einer (je nach Gerät/
-// Arbeitsspeicher unterschiedlichen, aber verbreitet bei rund 4096×4096px bzw.
-// ~16,7 Megapixel Gesamtfläche liegenden) internen Grenze STILLSCHWEIGEND — ohne
-// JS-Fehler, ohne Exception, das <canvas>-Element bleibt einfach leer/weiß stehen.
-// Bei einem nicht-quadratischen A0/A1-Plan (Seitenverhältnis ca. 1,41:1) konnte die
-// bisherige einheitliche 16384px-Grenze auf einem Tablet/Smartphone durchaus
-// zusammen mit dem (seit der letzten Anforderung ohnehin schon auf max. 2.0
-// begrenzten) mobilen DPR-Cap eine Fläche jenseits dieser gerätetypischen Grenze
-// ergeben — genau das führt zum weißen Bildschirm. Die Grenze ist deshalb jetzt
-// GERÄTEABHÄNGIG (siehe getPdfSafeMaxCanvasDimPx unten, gleicher Breakpoint wie beim
-// DPR-Cap): am Desktop bleibt es bei 16384px (siehe PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP,
-// dort unproblematisch, siehe Speicherhinweis dort), auf Mobilgeräten strikt bei
-// 4096px (PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE) — exakt der von iOS Safari historisch
-// dokumentierten, sicheren Kantenlänge. Wird auf einem Mobilgerät über diese Grenze
+// Arbeitsspeicher unterschiedlichen) internen Grenze STILLSCHWEIGEND — ohne JS-Fehler,
+// ohne Exception, das <canvas>-Element bleibt einfach leer/weiß stehen. Bei einem
+// nicht-quadratischen A0/A1-Plan (Seitenverhältnis ca. 1,41:1) konnte die bisherige
+// einheitliche 16384px-Grenze auf einem Tablet/Smartphone durchaus zusammen mit dem
+// mobilen DPR-Cap eine Fläche jenseits dieser gerätetypischen Grenze ergeben — genau
+// das führt zum weißen Bildschirm. Die Grenze ist deshalb GERÄTEABHÄNGIG (siehe
+// getPdfSafeMaxCanvasDimPx unten, gleicher Breakpoint wie beim DPR-Cap): am Desktop
+// bleibt es bei 16384px (siehe PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP, dort unproblematisch,
+// siehe Speicherhinweis dort), auf Mobilgeräten strikt gedeckelt (siehe
+// PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE unten).
+//
+// NACHSCHÄRFUNG "iPad-Touch-Release-Absturz bleibt trotz 4096px-Grenze bestehen": in
+// der Praxis auf konkreter iPad-Hardware hat sich gezeigt, dass 4096px — obwohl in
+// WebKit-Bugreports verbreitet als "sichere" Kantenlänge zitiert — auf manchen Geräten
+// (insbesondere bei bereits durch andere DOM-Bilder/Canvasse belegtem Speicher, z.B.
+// viele bereits geladene Pin-Fotos derselben Sitzung) TROTZDEM zum weißen Bildschirm
+// führen kann, exakt beim Neu-Puffern der Fallback-Stufe unmittelbar nach dem Loslassen
+// der Zoom-Geste (siehe PDF_RASTER_RERENDER_DEBOUNCE_MS in PdfPlanCanvas — der
+// debounced Re-Render fällt zeitlich fast immer mit touchend/gestureend zusammen, weil
+// genau dann der Zoomfaktor zur Ruhe kommt). Die Grenze wird deshalb ein zweites Mal,
+// zusätzlich vorsichtiger, auf 2048px gesenkt — das reduziert die maximale
+// Pixelfläche dieses einen Re-Renders um 75% gegenüber 4096px (2048² statt 4096²
+// Pixel) und damit den GPU-/RAM-Bedarf genau in dem Moment, der laut Rückmeldung nach
+// wie vor zum Absturz führte. Bewusst NICHT per se ein Verzicht auf das Nachschärfen
+// beim Loslassen: eine explizite Sperre "kein Re-Rendering bei touchend/gestureend"
+// würde dem eigentlichen Zweck dieses Re-Renders (höhere Schärfe nach dem Zoomen)
+// direkt zuwiderlaufen. Stattdessen wird derselbe Re-Render beibehalten, aber auf eine
+// Zielgröße gedeckelt, die verlässlich innerhalb des tatsächlich verfügbaren
+// GPU-Speichers bleibt, statt sich auf eine einzelne, pauschal zitierte "sichere"
+// Kantenlänge zu verlassen, die sich auf realer Hardware als nicht ausreichend
+// konservativ erwiesen hat. Ehrlicher Hinweis: eine allgemeingültige, für jedes
+// iPad-Modell exakt zutreffende Zahl ist mir nicht bekannt (WebKit dokumentiert diese
+// Grenze nicht offiziell/verbindlich) — 2048px ist ein bewusst deutlich defensiverer
+// Wert als der zuvor verbreitet zitierte, aber falls der weiße Bildschirm auch danach
+// noch auftritt, wäre der nächste sinnvolle Schritt, das konkrete Gerät/iOS-Version zu
+// kennen und ggf. auch für PDF-Grundrisse auf eine echte Kachel-Pyramide umzustellen
+// (wie bereits für Raster-Bild-Grundrisse in TiledPlanImage vorhanden), statt die
+// Zahl ein drittes Mal zu senken. Wird auf einem Mobilgerät über die 2048px-Grenze
 // hinaus weitergezoomt, wird das Canvas NICHT weiter physisch vergrößert (siehe
 // lastRasterClampedRef in PdfPlanCanvas) — die weitere Vergrößerung übernimmt
 // ausschließlich die ohnehin schon vorhandene CSS-transform:scale(...) der äußeren
-// "Bühne" (siehe FloorPlanView/contentRef), die für JEDEN Zoomfaktor unabhängig von
-// der Canvas-Auflösung funktioniert. Der Plan wirkt jenseits dieser Schwelle beim
-// Weiterzoomen dadurch etwas weicher (reines CSS-Hochskalieren statt einer schärferen
-// Neuberechnung), bleibt aber sichtbar und stürzt nicht mehr auf Weiß ab — ein
-// bewusster, im Bug-Report explizit so verlangter Kompromiss.
+// "Bühne" (siehe FloorPlanView/contentRef, translate3d + will-change), die für JEDEN
+// Zoomfaktor unabhängig von der Canvas-Auflösung funktioniert. Der Plan wirkt jenseits
+// dieser (jetzt niedrigeren) Schwelle beim Weiterzoomen entsprechend etwas früher
+// weicher (reines CSS-Hochskalieren statt einer schärferen Neuberechnung), bleibt aber
+// sichtbar und stürzt nicht auf Weiß ab — ein bewusster, explizit so angeforderter
+// Kompromiss zugunsten von Stabilität.
 const PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP = 16384;
 // Ehrlicher Speicher-Hinweis nur für die Desktop-Grenze (auf Mobilgeräten greift ab
 // sofort ohnehin die deutlich niedrigere PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE, siehe
@@ -5058,7 +5120,7 @@ const PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP = 16384;
 // 16384 × 11585px zusammenkommen können, das sind rund 190 Megapixel bzw. ca. 760 MB
 // allein für den rohen RGBA-Pixelpuffer, zusätzlich zum GPU-Texturspeicher — auf
 // leistungsstarken Laptops/Desktops unproblematisch.
-const PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE = 4096;
+const PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE = 2048;
 
 // Liefert die für das aktuelle Gerät geltende maximale Canvas-Kantenlänge der
 // Raster-Fallback-Stufe — derselbe Breakpoint wie getPdfSafeRenderDprCap oben, aus
@@ -5337,6 +5399,17 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
   // (Zoom-Nachladen oder Komponenten-Unmount) es überholt, siehe
   // renderPdfPageToSafeCanvasElement.
   const renderTaskRef = useRef(null);
+  // GEDÄCHTNIS-LECK-FIX (siehe Einordnung in der Antwort): hält das aktuell geladene
+  // pdf.js-Dokument fest, damit es im Cleanup des Lade-Effekts unten IMMER per
+  // destroy() freigegeben wird — sowohl beim Wechsel auf einen anderen Plan (neuer
+  // resolvedUrl) als auch beim endgültigen Unmount dieser Komponente. Vorher blieb bei
+  // JEDEM Wechsel der Grundrissskizze das jeweils vorherige pdf.js-Dokument samt
+  // interner Font-/Seiten-Caches dauerhaft im Speicher der Seite liegen — auf einer
+  // Baustellen-Begehung mit mehreren nacheinander geöffneten PDF-Grundrissen summierte
+  // sich das über eine Sitzung spürbar auf und ist ein plausibler Mitverursacher dafür,
+  // dass der Speicherdruck ausgerechnet beim anschließenden Zoomen eher an die vom
+  // Betriebssystem gesetzte Grenze für die Web-App stößt.
+  const pdfDocRef = useRef(null);
 
   // Lädt Dokument + erste Seite bei jeder neuen PDF-URL neu, versucht zuerst die
   // Vektor-Stufe (mit Zeitlimit) und fällt bei Fehlschlag/Zeitüberschreitung/zu hoher
@@ -5357,6 +5430,13 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
       try {
         const pdfjsLib = await loadPdfJs();
         const pdf = await loadPdfDocument(pdfjsLib, resolvedUrl);
+        // Sofort in der Ref festhalten (siehe pdfDocRef-Deklaration oben) — auch wenn
+        // diese Ladeanfrage inzwischen schon "cancelled" ist (Nutzer hat währenddessen
+        // erneut die Grundrissskizze gewechselt), MUSS dieses Dokument trotzdem noch
+        // per destroy() freigegeben werden, statt einfach zu verwaisen. Das Cleanup
+        // unten übernimmt das zuverlässig, unabhängig davon, an welcher Stelle genau
+        // "cancelled" dazwischenkam.
+        pdfDocRef.current = pdf;
         if (cancelled) return;
         const page = await pdf.getPage(1);
         if (cancelled) return;
@@ -5408,6 +5488,20 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
           // siehe Kommentar an renderPdfPageToSafeCanvasElement — unkritisch.
         }
         renderTaskRef.current = null;
+      }
+      // GEDÄCHTNIS-LECK-FIX (siehe pdfDocRef-Deklaration/Einordnung oben): dieses
+      // Cleanup läuft sowohl beim Wechsel auf eine andere resolvedUrl (kurz bevor der
+      // Effekt erneut ausgeführt wird) als auch beim endgültigen Unmount der
+      // Komponente — in BEIDEN Fällen wird das bis dahin geladene pdf.js-Dokument ab
+      // sofort nicht mehr gebraucht und deshalb hier zuverlässig freigegeben, statt
+      // sich unkontrolliert im Speicher der Seite anzusammeln.
+      if (pdfDocRef.current) {
+        try {
+          pdfDocRef.current.destroy();
+        } catch (destroyErr) {
+          console.warn("PDF-Dokument (Grundriss-Ansicht) konnte nicht sauber freigegeben werden:", destroyErr);
+        }
+        pdfDocRef.current = null;
       }
     };
   }, [resolvedUrl]);
@@ -9777,6 +9871,75 @@ const FLOORPLAN_PAN_CLICK_THRESHOLD = 5; // px — ab hier zählt eine Interakti
 // clampTranslateForViewport in FloorPlanView).
 const FLOORPLAN_PAN_MIN_OVERLAP_PX = 72;
 
+// ----------------------------------------------------------------------------------
+// TEMPORÄRES ON-SCREEN-DEBUG-PROTOKOLL (siehe Einordnung in der Antwort)
+// ----------------------------------------------------------------------------------
+// Rein diagnostisches Hilfsmittel für die Fehlersuche zum weißen Bildschirm beim
+// Zoomen auf dem iPad: zwei bereits ausgelieferte Fixes (will-change entfernt,
+// Pinch-Loslassen-Bugfix) haben das Problem NICHT gelöst, die Ursache ist also noch
+// unklar. Ohne Mac/Remote-Debugging ist die Browser-Konsole auf dem iPad selbst nicht
+// einsehbar — dieses kleine, immer sichtbare Protokoll auf dem Bildschirm ersetzt sie
+// notdürftig: es zeigt JS-Fehler, unbehandelte Promise-Fehler sowie die tatsächlichen
+// Zoom-/Verschiebungswerte an genau den Stellen, an denen der weiße Bildschirm bisher
+// vermutet wurde. Rein additiv, ändert an der eigentlichen Funktion nichts und lässt
+// sich nach Abschluss der Fehlersuche gefahrlos wieder entfernen — deshalb bewusst
+// als eigener, klar abgegrenzter Block statt über den gesamten Code verstreut.
+const ZOOM_DEBUG_LOG_MAX_ENTRIES = 20;
+const zoomDebugLogListeners = new Set();
+let zoomDebugLogEntries = [];
+function pushZoomDebugLog(label, data) {
+  const time = new Date().toISOString().slice(11, 23);
+  let line = `${time} ${label}`;
+  if (data !== undefined) {
+    try {
+      line += ` ${JSON.stringify(data)}`;
+    } catch {
+      line += ` ${String(data)}`;
+    }
+  }
+  zoomDebugLogEntries = [...zoomDebugLogEntries.slice(-(ZOOM_DEBUG_LOG_MAX_ENTRIES - 1)), line];
+  zoomDebugLogListeners.forEach((fn) => fn(zoomDebugLogEntries));
+}
+// window.onerror/unhandledrejection global (nicht an eine Komponente gebunden) und nur
+// EINMAL registriert (__baudocZoomDebugInstalled-Flag), auch wenn FloorPlanView mehrfach
+// neu gemountet wird — sonst würden bei jedem Mount zusätzliche, doppelte Listener
+// entstehen.
+if (typeof window !== "undefined" && !window.__baudocZoomDebugInstalled) {
+  window.__baudocZoomDebugInstalled = true;
+  window.addEventListener("error", (e) => {
+    pushZoomDebugLog("JS-FEHLER", e?.message || String(e?.error || e));
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    pushZoomDebugLog("PROMISE-FEHLER", (e?.reason && (e.reason.message || String(e.reason))) || "unbekannt");
+  });
+}
+
+// Fest (nicht innerhalb der transformierten "Bühne") positioniert, damit das Protokoll
+// auch dann noch lesbar bleibt, wenn ausgerechnet der Grundriss-Bereich selbst weiß
+// wird — es hängt an keiner Stelle von contentRef/dessen CSS-Transform ab.
+// pointer-events-none, damit es Long-Press-/Pinch-Gesten auf dem Plan darunter nicht
+// stört.
+function ZoomDebugOverlay() {
+  const [entries, setEntries] = useState(() => zoomDebugLogEntries);
+  useEffect(() => {
+    const listener = (next) => setEntries(next);
+    zoomDebugLogListeners.add(listener);
+    return () => zoomDebugLogListeners.delete(listener);
+  }, []);
+  if (entries.length === 0) return null;
+  return (
+    <div
+      className="pointer-events-none fixed left-1 top-1 z-[999] max-h-48 w-72 overflow-hidden rounded-md bg-black/85 p-1.5 font-mono text-[9px] leading-tight text-lime-300 shadow-lg"
+      style={{ whiteSpace: "pre-wrap" }}
+    >
+      <div className="mb-0.5 font-bold text-amber-300">Zoom-Debug (temporär)</div>
+      {entries.map((line, i) => (
+        <div key={i}>{line}</div>
+      ))}
+    </div>
+  );
+}
+
 function FloorPlanView({
   floor,
   plan,
@@ -10194,6 +10357,7 @@ function FloorPlanView({
         startScale: scale,
         startTranslate: { ...translate },
       };
+      pushZoomDebugLog("pinch-start", { scale, startDistance: pinchGestureRef.current.startDistance });
       if (panGestureRef.current) panGestureRef.current.moved = true; // Pinch zählt nie als Tap/Long Press
       clearLongPressTimer();
     }
@@ -10266,13 +10430,44 @@ function FloorPlanView({
 
     panPointersRef.current.delete(e.pointerId);
 
+    if (pinchGestureRef.current) {
+      // Nur relevant, wenn gerade tatsächlich ein Pinch lief — loggt den Zustand
+      // GENAU an der Stelle, an der laut Praxis-Rückmeldung der weiße Bildschirm
+      // auftritt (siehe Einordnung in der Antwort).
+      pushZoomDebugLog("finger-drop", { remaining: panPointersRef.current.size, scale, translate });
+    }
+
     if (panPointersRef.current.size < 2) {
+      // BUGFIX "weißer Bildschirm beim Loslassen nach Pinch-Zoom" (Praxis-Rückmeldung
+      // vom iPad): die beiden Finger eines Pinch werden so gut wie nie exakt
+      // gleichzeitig losgelassen — hebt der erste ab, fällt panPointersRef.current.size
+      // von 2 auf 1, WÄHREND der zweite, noch aufliegende Finger jederzeit ein
+      // weiteres Pointermove-Event auslösen kann (schon eine minimale Restbewegung
+      // beim Abheben reicht). handleViewportPointerMove behandelt einen einzelnen
+      // aktiven Pointer dann als normales Verschieben (panGestureRef-Zweig) — bislang
+      // wurde panGestureRef aber NUR beim allerletzten Pointer (size === 0) neu
+      // gesetzt, blieb also während dieses Übergangs auf seinem VERALTETEN Stand von
+      // VOR Beginn des Pinch (Startposition + Start-Verschiebung des ursprünglichen
+      // Einzelfingers). Die daraus berechnete neue Verschiebung sprang dadurch um die
+      // gesamte, während des gesamten Pinch zurückgelegte Fingerdistanz — bei
+      // niedriger erreichter Zoomstufe (kleine Inhaltsfläche) reichte dieser Sprung
+      // aus, um den Grundriss bis auf einen winzigen, vom Boundary-Clamping in
+      // clampTranslateForViewport übrig gelassenen Rand aus dem sichtbaren Bereich zu
+      // schieben — optisch nicht von einem echten weißen Bildschirm zu unterscheiden.
+      // Bei hoher erreichter Zoomstufe (großer Inhaltsfläche) fällt derselbe absolute
+      // Sprung relativ kaum ins Gewicht, was erklärt, warum ein Loslassen bei höherer
+      // Zoomstufe unauffällig blieb. Fix: panGestureRef wird jetzt SOFORT mit
+      // pinchGestureRef zusammen zurückgesetzt, sobald weniger als zwei Finger aktiv
+      // sind — ein Pointermove des verbleibenden Fingers in diesem kurzen
+      // Übergangsfenster (if (!gesture) return; in handleViewportPointerMove) bewirkt
+      // dadurch schlicht nichts mehr, statt mit veralteten Referenzwerten zu rechnen.
       pinchGestureRef.current = null;
+      panGestureRef.current = null;
     }
 
     if (panPointersRef.current.size === 0) {
       setIsPanningActive(false);
-      panGestureRef.current = null;
+      pushZoomDebugLog("release-end", { scale, translate });
       // Ein Loslassen VOR Ablauf des Long-Press-Timers (siehe handleViewportPointerDown)
       // verwirft ihn ersatzlos — ein kurzer Tap/Klick auf freier Fläche setzt bewusst
       // KEINEN Pin mehr (dient nur noch dem Zoomen/Verschieben der Ansicht).
@@ -10563,22 +10758,32 @@ function FloorPlanView({
                 ref={contentRef}
                 className="relative w-full origin-top-left select-none"
                 style={{
-                  // TABLET CANVAS ZOOM FIX: translate3d(...) statt translate(...) zwingt den
-                  // Browser auf allen Geräten (insbesondere iPadOS/Android-Tablets) zuverlässig
-                  // auf einen eigenen, GPU-compositeten Layer für diese "Bühne" — dieselbe
-                  // 2D-Verschiebung, aber über die 3D-Transform-Pipeline gerendert, spürbar
-                  // flüssiger bei Pinch-Zoom/Pan auf schwächerer Tablet-Hardware. will-change:
-                  // transform kündigt dem Browser diese bevorstehenden Transform-Änderungen
-                  // vorab an, sodass der Compositor-Layer bereits VOR der ersten Geste bereitsteht
-                  // statt erst bei der ersten Berührung erzeugt zu werden (vermeidet einen
-                  // kurzen Ruckler beim allerersten Zoom/Pan nach dem Laden). Ändert NICHTS an
-                  // der eigentlichen Bugfix-Architektur weiter oben (eingefrorenes, geräteabhängig
-                  // gedeckeltes Raster-Canvas + reine CSS-Skalierung dieser Bühne, siehe
-                  // renderPdfPageToSafeCanvasElement/PdfPlanCanvas) — hier wird ausschließlich
-                  // WIE dieselbe Transformation an die GPU übergeben wird optimiert, nicht was
-                  // transformiert wird.
+                  // TABLET CANVAS ZOOM FIX: translate3d(...) statt translate(...) — dieselbe
+                  // 2D-Verschiebung, aber über die 3D-Transform-Pipeline gerendert.
+                  //
+                  // NACHTRAG nach Praxis-Rückmeldung vom iPad (Safari): will-change: transform
+                  // wurde hier bewusst WIEDER ENTFERNT, obwohl es ursprünglich als reine
+                  // Performance-Optimierung gedacht war (vorab einen Compositor-Layer für die
+                  // Bühne anlegen, um einen kurzen Ruckler beim allerersten Zoom/Pan zu
+                  // vermeiden). Ehrlicher Stand: der weiße Bildschirm bestand auf einem echten
+                  // iPad auch nach der Kachel-/Deep-Zoom-Umstellung weiter fort, obwohl die
+                  // eigentlich angezeigten Bilddaten (einzelne 512px-Kacheln) für sich genommen
+                  // längst unproblematisch klein sind. Das spricht dafür, dass die Ursache nicht
+                  // (nur) in der Pixelgröße der angezeigten Inhalte lag, sondern im von WebKit
+                  // für die per CSS transform:scale() stark vergrößerte Bühne selbst angelegten
+                  // Compositor-Backing-Store — und will-change: transform erzwingt genau diese
+                  // vorzeitige, dedizierte Layer-Promotion, noch bevor überhaupt gezoomt wird.
+                  // Diese Vermutung ist NICHT durch eine Konsolen-Fehlermeldung bestätigt
+                  // (auf dem betroffenen iPad war kein Remote-Debugging möglich) und wird
+                  // deshalb ausdrücklich als Hypothese behandelt, nicht als gesicherte Ursache.
+                  // Das Entfernen selbst ist risikolos (reiner Performance-Hinweis an den
+                  // Browser, keine Funktionsänderung) und wird zusammen mit einer gezielten
+                  // Nachfrage zur tatsächlichen Zoomstufe beim Auftreten des weißen Bildschirms
+                  // ausgeliefert (siehe Einordnung in der Antwort) — falls das allein nicht
+                  // reicht, ist die auf dem Bildschirm ohnehin bereits sichtbare Zoom-Prozentzahl
+                  // (siehe {Math.round(scale * 100)}% weiter unten) die nächste, diesmal
+                  // faktenbasierte Spur statt einer weiteren Vermutung.
                   transform: `translate3d(${translate.x}px, ${translate.y}px, 0) scale(${scale})`,
-                  willChange: "transform",
                   ...(isCad
                     ? {}
                     : {
@@ -14372,4 +14577,77 @@ function App() {
   );
 }
 
-export default App;
+// ----------------------------------------------------------------------------------
+// TEMPORÄRE REACT-ERROR-BOUNDARY (siehe Einordnung in der Antwort)
+// ----------------------------------------------------------------------------------
+// In der gesamten App existierte bislang KEINE Error Boundary. Ohne eine solche räumt
+// React bei einem unabgefangenen Fehler WÄHREND DES RENDERNS den kompletten
+// Komponentenbaum vollständig ab — die sichtbare Folge ist exakt ein vollständig
+// weißer, leerer Bildschirm, von einem GPU-/Speicher-bedingten Absturz der bisher
+// vermuteten Art nicht zu unterscheiden. Nach zwei erfolglosen Fixversuchen (will-
+// change entfernt, Pinch-Loslassen-Bugfix) ist ein tatsächlicher JavaScript-Fehler
+// beim Rendern, ausgelöst durch einen bestimmten Zoom-/Verschiebungszustand nach dem
+// Loslassen, jetzt der naheliegendste nächste Verdacht. Diese Boundary fängt einen
+// solchen Fehler ab, zeigt seine Meldung UND den React-Komponenten-Stack direkt auf
+// dem Bildschirm an (auch ohne Mac/Remote-Debugging lesbar, siehe auch
+// ZoomDebugOverlay/pushZoomDebugLog weiter oben) und bietet einen "Weiter"-Button, der
+// den betroffenen Bereich neu zu mounten versucht, statt dass die App bis zum
+// manuellen Neuladen komplett weiß und unbenutzbar bleibt. Behebt die eigentliche
+// Fehlerursache nicht selbst, verhindert aber ab sofort, dass sie sich weiterhin als
+// undurchsichtiger weißer Bildschirm ohne jede Fehlermeldung zeigt.
+class ZoomErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null, info: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    pushZoomDebugLog("REACT-RENDER-FEHLER", error?.message || String(error));
+    this.setState({ info });
+    console.error("Unabgefangener Rendering-Fehler (siehe ZoomErrorBoundary):", error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-slate-900 px-6 text-center text-white">
+          <AlertTriangle size={32} className="text-amber-400" />
+          <p className="text-sm font-semibold">Es ist ein unerwarteter Fehler aufgetreten.</p>
+          <p className="text-xs text-slate-300">
+            Bitte den Text unten (Foto/Screenshot reicht) weitergeben, das hilft bei der Fehlersuche.
+          </p>
+          <pre className="max-h-64 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-black/40 p-3 text-left text-[10px] text-lime-300">
+            {String(this.state.error?.message || this.state.error)}
+            {this.state.info?.componentStack ? `\n${this.state.info.componentStack}` : ""}
+          </pre>
+          <button
+            type="button"
+            onClick={() => this.setState({ error: null, info: null })}
+            className="rounded-md bg-[#FF2A00] px-4 py-2 text-sm font-semibold text-white"
+          >
+            Weiter
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// AppWithZoomDebug ersetzt den bisherigen direkten Export von App als Root-Komponente:
+// bettet App in die ZoomErrorBoundary ein (siehe oben) und rendert das
+// ZoomDebugOverlay EINMAL, global, außerhalb jeder transformierten "Bühne" — dadurch
+// bleibt das Protokoll auch dann lesbar, wenn ausgerechnet der Grundriss-Bereich
+// selbst weiß wird. Reine Diagnose-/Sicherheitsnetz-Hülle, App selbst ist inhaltlich
+// unverändert.
+function AppWithZoomDebug(props) {
+  return (
+    <ZoomErrorBoundary>
+      <ZoomDebugOverlay />
+      <App {...props} />
+    </ZoomErrorBoundary>
+  );
+}
+
+export default AppWithZoomDebug;
