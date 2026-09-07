@@ -848,6 +848,109 @@ async function compressPdfForUpload(file) {
   }
 }
 
+// ---- Client-seitige Vorab-Verkleinerung hochgeladener Raster-Grundrisse (PNG/JPG/WebP) --
+// TABLET CANVAS ZOOM FIX, Teil 2: ein direkt als PNG/JPG/WebP hochgeladener Grundriss
+// (kind "image" in getFileInfo, im Unterschied zu PDF/DWG/DXF) wird später einfach über
+// ein normales <img src={image_url}> angezeigt (siehe FloorPlanView) und durchläuft dabei
+// KEINE der bereits vorhandenen Rasterisierungs-Caps (PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE/
+// _DESKTOP, renderPdfPageToSafeCanvasElement) — die gelten ausschließlich für die PDF-
+// Rendering-Pipeline. Ein sehr hochauflösend gescannter oder direkt aus dem CAD-Programm
+// exportierter Plan (z. B. > 6000px Kantenlänge) würde also unverändert in voller Auflösung
+// ins DOM geladen und dort erst beim Zoomen auf schwächeren Tablets zum GPU-Speicher-Risiko.
+// Deshalb wird JEDES Raster-Bild vor dem Upload hier client-seitig über ein Offscreen-
+// Canvas auf maximal FLOOR_PLAN_IMAGE_MAX_DIM_PX an der LÄNGEREN Seite herunterskaliert,
+// bevor es an Supabase Storage geht — unter Beibehaltung der vollen Schärfe, wie
+// angefordert: 3000px an der längeren Seite liegt deutlich über der tatsächlich
+// wahrnehmbaren Detailauflösung selbst eines modernen Tablet-Displays bei voll
+// ausgereiztem FLOORPLAN_MAX_SCALE (400%), ein sichtbarer Schärfeverlust ist damit nicht zu
+// erwarten. PNG-Quellen bleiben bewusst PNG (verlustfrei, wichtig für gestochen scharfe
+// CAD-/Linienzeichnungen mit feinem Text), alle anderen Raster-Formate werden als
+// hochqualitatives JPEG (Qualität 0.92, deutlich über der 0.8 von compressImage für reine
+// Foto-Dokumentation) re-encodiert. Ein bereits kleinerer Plan bleibt unverändert die
+// Original-Datei (kein unnötiges Re-Encoding). Wirft absichtlich nie einen Fehler nach
+// außen — schlägt das Dekodieren fehl, wird unverändert die Original-Datei zurückgegeben
+// (dieselbe Fallback-Strategie wie bei compressImage für Pin-Fotos oben), damit ein
+// einzelnes exotisches Bildformat den Grundriss-Upload nicht blockiert.
+const FLOOR_PLAN_IMAGE_MAX_DIM_PX = 3000;
+const FLOOR_PLAN_IMAGE_JPEG_QUALITY = 0.92;
+function resizeFloorPlanImageForUpload(file, maxDim = FLOOR_PLAN_IMAGE_MAX_DIM_PX, quality = FLOOR_PLAN_IMAGE_JPEG_QUALITY) {
+  return new Promise((resolve) => {
+    if (!file || !file.type || !file.type.startsWith("image/") || file.type === "image/svg+xml") {
+      resolve(file);
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    const cleanup = () => URL.revokeObjectURL(objectUrl);
+    const fallbackToOriginal = (reason) => {
+      cleanup();
+      console.warn("Grundriss-Vorab-Verkleinerung übersprungen, Original wird verwendet:", reason);
+      resolve(file);
+    };
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const naturalWidth = img.naturalWidth || img.width;
+        const naturalHeight = img.naturalHeight || img.height;
+        if (!naturalWidth || !naturalHeight) {
+          fallbackToOriginal("Bildabmessungen konnten nicht ermittelt werden.");
+          return;
+        }
+        const largestDim = Math.max(naturalWidth, naturalHeight);
+        // Nur verkleinern, nie vergrößern — ein Plan unterhalb der Grenze bleibt
+        // unverändert die Original-Datei.
+        if (largestDim <= maxDim) {
+          cleanup();
+          resolve(file);
+          return;
+        }
+        const downscale = maxDim / largestDim;
+        const targetWidth = Math.max(1, Math.round(naturalWidth * downscale));
+        const targetHeight = Math.max(1, Math.round(naturalHeight * downscale));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        const isPng = file.type === "image/png";
+        const ctx = canvas.getContext("2d", { alpha: isPng });
+        if (!ctx) {
+          fallbackToOriginal("2D-Canvas-Context nicht verfügbar.");
+          return;
+        }
+        if (!isPng) {
+          // JPEG kennt keine Transparenz — weißer Hintergrund vor dem Zeichnen (siehe
+          // dieselbe Begründung bei compressImage für Pin-Fotos).
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, targetWidth, targetHeight);
+        }
+        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+        const outputType = isPng ? "image/png" : "image/jpeg";
+        canvas.toBlob(
+          (blob) => {
+            cleanup();
+            if (!blob) {
+              console.warn(
+                "Grundriss-Vorab-Verkleinerung übersprungen, Original wird verwendet: toBlob lieferte kein Ergebnis."
+              );
+              resolve(file);
+              return;
+            }
+            const baseName = (file.name || "grundriss").replace(/\.[a-zA-Z0-9]+$/, "");
+            const ext = isPng ? "png" : "jpg";
+            resolve(new File([blob], `${baseName}.${ext}`, { type: outputType, lastModified: Date.now() }));
+          },
+          outputType,
+          isPng ? undefined : quality
+        );
+      } catch (err) {
+        fallbackToOriginal(err);
+      }
+    };
+    img.onerror = () => fallbackToOriginal("Bild konnte nicht geladen werden.");
+    img.src = objectUrl;
+  });
+}
+
 // Lädt eine Grundriss-Datei in den Bucket "floor-plans" hoch und liefert die
 // öffentliche URL + den erkannten Dateityp zurück. onStatusMessage (optional) meldet
 // dem Aufrufer Fortschrittstexte für ein Toast/Hinweis-UI (siehe compressionNotice in
@@ -859,6 +962,13 @@ async function uploadFloorPlan(projectId, file, onStatusMessage) {
   if (!info) throw new Error("Nicht unterstützter Dateityp. Bitte PNG, JPG, WebP, PDF, DWG oder DXF verwenden.");
 
   let uploadFile = file;
+  // TABLET CANVAS ZOOM FIX, Teil 2: reine Raster-Grundrisse (PNG/JPG/WebP) vor dem Upload
+  // auf maximal FLOOR_PLAN_IMAGE_MAX_DIM_PX an der längeren Seite verkleinern, siehe
+  // resizeFloorPlanImageForUpload oben. Läuft VOR dem PDF-Zweig unten und schließt sich mit
+  // diesem gegenseitig aus (info.kind ist entweder "image" oder "pdf", nie beides).
+  if (info.kind === "image") {
+    uploadFile = await resizeFloorPlanImageForUpload(file);
+  }
   if (info.kind === "pdf" && file.size > FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_BYTES) {
     onStatusMessage?.(
       `Plan ist größer als ${FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_MB}MB. Wird automatisch für Mobilgeräte optimiert…`
@@ -4769,23 +4879,27 @@ function getPdfSafeMaxCanvasDimPx() {
 // position als reinen Prozentsatz relativ zu dessen Breite/Höhe um. Das ist von
 // Natur aus unabhängig davon, WIE der aktuelle Zoom zustande kommt (Canvas-Auflösung,
 // CSS-Skalierung oder eine Mischung aus beidem) und funktioniert bereits heute exakt
-// so auch bei sehr hohen Zoomstufen — die UI selbst ist mittlerweile zusätzlich hart
-// auf 200% gedeckelt (FLOORPLAN_MAX_SCALE = 2.0, siehe dortiger Kommentar), diese
-// Aussage zur Transform-Unabhängigkeit von posFromEvent bleibt davon unberührt und gilt
-// unverändert für den gesamten erlaubten Zoombereich. Das eingefrorene Canvas wird stattdessen ganz normal über
+// so auch bei sehr hohen Zoomstufen — die UI selbst ist zusätzlich hart auf aktuell 400%
+// gedeckelt (FLOORPLAN_MAX_SCALE = 4.0, siehe dortiger Kommentar), diese Aussage zur
+// Transform-Unabhängigkeit von posFromEvent bleibt davon unberührt und gilt unverändert
+// für den gesamten erlaubten Zoombereich. Das eingefrorene Canvas wird stattdessen ganz normal über
 // dieselbe, bereits vorhandene Bühnen-Skalierung mit hochskaliert (CSS-Auflösung,
 // keine neue Canvas-Pixelallokation) — dadurch bleiben Punkt 2 (0 zusätzlicher
 // Speicher ab hier) UND Punkt 3 (Pins bleiben exakt verankert) beide gleichzeitig
 // erfüllt.
 const PDF_RASTER_RENDER_SCALE_CAP_MOBILE = 2.0; // entspricht RENDER_CAP aus der Anforderung
-// Hinweis seit dem UI-weiten Zoom-Stopp bei 200% (FLOORPLAN_MAX_SCALE = 2.0): scale
-// kann jetzt ohnehin nie mehr über 2.0 hinaus angefordert werden, wodurch dieser
-// mobile Cap in der Praxis kaum noch selbst greifen dürfte. Bewusst NICHT entfernt —
-// bleibt als zusätzliches Sicherheitsnetz direkt vor pdf.js aktiv (z. B. bei künftigen
-// Änderungen an FLOORPLAN_MAX_SCALE oder DPR-Werten > 1.0, die die kombinierte
-// safeScale trotz gedeckeltem scale wieder über 2.0 treiben könnten) und entspricht
-// damit unverändert "Render-Canceling ... bleiben zu 100% vollständig erhalten" aus
-// der aktuellen Anforderung.
+// TABLET CANVAS ZOOM FIX: seit der Anhebung von FLOORPLAN_MAX_SCALE auf 4.0 kann scale
+// diesen mobilen Render-Cap (2.0) jetzt tatsächlich überschreiten — anders als zuvor, als
+// beide Werte identisch bei 2.0 lagen und dieser Cap kaum noch selbst griff. Das ist
+// gewollt und unverändert sicher: der Cap greift dann auf Mobilgeräten bereits bei
+// effektiv 200% (statt erst bei 400%), das Raster friert an diesem Punkt ein
+// (lastRasterClampedRef = true, siehe PdfPlanCanvas) und jeder weitere Zoom bis 400%
+// läuft von dort ausschließlich über die reine CSS-Skalierung der Bühne — exakt dasselbe
+// bereits bestehende Verhalten, nur dass die Einfrier-Grenze auf Mobilgeräten jetzt schon
+// früher im Zoombereich erreicht wird als auf dem Desktop (wo PDF_RASTER_RENDER_SCALE_CAP_MOBILE
+// gar nicht greift, siehe getPdfRasterRenderScaleCap). Bleibt daher weiterhin als
+// aktives, nicht nur theoretisches Sicherheitsnetz direkt vor pdf.js bestehen und
+// entspricht unverändert "Render-Canceling ... bleiben zu 100% vollständig erhalten".
 
 function getPdfRasterRenderScaleCap() {
   if (typeof window === "undefined") return Infinity;
@@ -9215,23 +9329,35 @@ function PinsAndNotesLayer({
 // ----------------------------------------------------------------------------------
 // STUFENLOSES ZOOM & PAN — Konfiguration für die interaktive Grundriss-Ansicht
 // ----------------------------------------------------------------------------------
-// Harter Zoom-Stopp bei exakt 200% (MAX_ZOOM = 2.0) bzw. 50% (MIN_ZOOM = 0.5), wie
-// angefordert. Bewusst NICHT als zusätzliche, separate MAX_ZOOM/MIN_ZOOM-Konstante
-// neben FLOORPLAN_MAX_SCALE/FLOORPLAN_MIN_SCALE eingeführt: ALLE drei Zoom-Einstiegspunkte
-// (Zoom-Buttons über zoomByFactor, Mausrad/Touchpad über handleWheelNative, Pinch-Geste
-// über handleViewportPointerMove) laufen bereits heute ausnahmslos über clampScale(...)
+// Harter Zoom-Stopp bei aktuell 400% (MAX_ZOOM = 4.0) bzw. 50% (MIN_ZOOM = 0.5). Bewusst
+// NICHT als zusätzliche, separate MAX_ZOOM/MIN_ZOOM-Konstante neben FLOORPLAN_MAX_SCALE/
+// FLOORPLAN_MIN_SCALE eingeführt: ALLE drei Zoom-Einstiegspunkte (Zoom-Buttons über
+// zoomByFactor, Mausrad/Touchpad über handleWheelNative, Pinch-Geste über
+// handleViewportPointerMove) laufen bereits heute ausnahmslos über clampScale(...)
 // unten, die wiederum ausschließlich diese beiden Konstanten liest. Der Zoom-Stopp greift
 // dadurch mit einer einzigen Wertänderung an einer einzigen Stelle an allen drei Stellen
 // gleichzeitig und kann nie einzeln auseinanderlaufen — eine zusätzliche, in jedem
-// Handler separat wiederholte Math.min/Math.max-Kappung (wie im Auftrag skizziert) wäre
-// hier reine Duplizierung derselben Grenze und potenzielle künftige Fehlerquelle, falls
-// beide Kappungen einmal auseinanderdriften. FLOORPLAN_MIN_SCALE = 0.5 entsprach bereits
-// vor dieser Änderung dem geforderten MIN_ZOOM und musste nicht angepasst werden.
-// Zuvor erlaubte die App bis zu 2500% (FLOORPLAN_MAX_SCALE = 25.0); das ist mit diesem
-// harten 200%-Stopp jetzt nicht mehr möglich — auf Wunsch reversibel durch reines
-// Zurücksetzen dieses einen Werts.
+// Handler separat wiederholte Math.min/Math.max-Kappung wäre hier reine Duplizierung
+// derselben Grenze und potenzielle künftige Fehlerquelle, falls beide Kappungen einmal
+// auseinanderdriften. FLOORPLAN_MIN_SCALE = 0.5 bleibt unverändert.
+// TABLET CANVAS ZOOM FIX: MAX_SCALE war zuvor auf 2.0 (200%) gedeckelt, wird hier auf
+// 4.0 (400%) angehoben, wie angefordert ("maxScale = 4.0 oder 5.0"). Das ist mit der
+// bestehenden Bugfix-Architektur GEFAHRLOS möglich, weil die tatsächliche Pixelauflösung
+// des darunterliegenden Grundriss-Rasters unabhängig vom hier erlaubten CSS-Skalierungs-
+// Höchstwert bleibt: renderPdfPageToSafeCanvasElement/PdfPlanCanvas rendern das Canvas
+// bereits GERÄTEABHÄNGIG GEDECKELT (PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE/_DESKTOP) und frieren
+// es endgültig ein, sobald lastRasterClampedRef true ist — jeder Zoom über diesen Punkt
+// hinaus (ob bis 200% oder bis 400%) läuft ohnehin bereits ausschließlich über die reine
+// CSS-transform-scale(...) dieser "Bühne" (siehe contentRef-Style weiter unten), OHNE dass
+// dabei je erneut Canvas-Breite/-Höhe im DOM verändert oder neuer GPU-Speicher alloziert
+// wird. Eine höhere FLOORPLAN_MAX_SCALE verändert also einzig, wie weit ein bereits
+// eingefrorenes Bild optisch vergrößert werden darf (irgendwann sichtbar unschärfer,
+// aber nie speicher- oder abschusskritisch) — nicht, WIE VIEL tatsächlich zusätzlich
+// gerendert/alloziert wird. Der frühere Wert 2.0 selbst war zuvor schon von einem
+// ursprünglichen 25.0 (2500%) abgesenkt worden; auf Wunsch ist auch dieser 4.0-Wert
+// jederzeit durch reines Zurücksetzen dieser einen Konstante reversibel.
 const FLOORPLAN_MIN_SCALE = 0.5;
-const FLOORPLAN_MAX_SCALE = 2.0;
+const FLOORPLAN_MAX_SCALE = 4.0;
 // Dämpfungsfaktor für den Mausrad-/Touchpad-Zoom (siehe handleWheelNative): pro
 // Wheel-Event wird der Zoomfaktor aus der tatsächlichen deltaY-Größe abgeleitet
 // (newScale = currentScale * (1 - deltaY * FLOORPLAN_WHEEL_DAMPING)) statt eines
@@ -10022,11 +10148,11 @@ function FloorPlanView({
             {/* touch-none (touch-action: none) unterbindet das native Pinch-to-Zoom/
                 Scrollen des Browsers auf diesem Element bereits UNBEDINGT, unabhängig
                 vom aktuellen Zoomstand — Safari/Chrome übernehmen dadurch nie selbst
-                das Zoomen der Seite, auch nicht beim Erreichen von MAX_ZOOM = 2.0.
+                das Zoomen der Seite, auch nicht beim Erreichen von MAX_ZOOM = 4.0.
                 Das deckt Punkt 2 der Zoom-Stopp-Anforderung bereits vollständig und
                 zuverlässiger ab als ein bedingtes preventDefault() erst am Cap (touch-
                 action ist dafür der vom Browser vorgesehene Mechanismus). Der eigentliche
-                Zoom-Stopp bei genau 200% erfolgt zentral in clampScale via
+                Zoom-Stopp bei aktuell 400% erfolgt zentral in clampScale via
                 FLOORPLAN_MAX_SCALE, siehe Kommentar dort. */}
             <div
               ref={viewportRef}
@@ -10042,7 +10168,22 @@ function FloorPlanView({
                 ref={contentRef}
                 className="relative w-full origin-top-left select-none"
                 style={{
-                  transform: `translate(${translate.x}px, ${translate.y}px) scale(${scale})`,
+                  // TABLET CANVAS ZOOM FIX: translate3d(...) statt translate(...) zwingt den
+                  // Browser auf allen Geräten (insbesondere iPadOS/Android-Tablets) zuverlässig
+                  // auf einen eigenen, GPU-compositeten Layer für diese "Bühne" — dieselbe
+                  // 2D-Verschiebung, aber über die 3D-Transform-Pipeline gerendert, spürbar
+                  // flüssiger bei Pinch-Zoom/Pan auf schwächerer Tablet-Hardware. will-change:
+                  // transform kündigt dem Browser diese bevorstehenden Transform-Änderungen
+                  // vorab an, sodass der Compositor-Layer bereits VOR der ersten Geste bereitsteht
+                  // statt erst bei der ersten Berührung erzeugt zu werden (vermeidet einen
+                  // kurzen Ruckler beim allerersten Zoom/Pan nach dem Laden). Ändert NICHTS an
+                  // der eigentlichen Bugfix-Architektur weiter oben (eingefrorenes, geräteabhängig
+                  // gedeckeltes Raster-Canvas + reine CSS-Skalierung dieser Bühne, siehe
+                  // renderPdfPageToSafeCanvasElement/PdfPlanCanvas) — hier wird ausschließlich
+                  // WIE dieselbe Transformation an die GPU übergeben wird optimiert, nicht was
+                  // transformiert wird.
+                  transform: `translate3d(${translate.x}px, ${translate.y}px, 0) scale(${scale})`,
+                  willChange: "transform",
                   ...(isCad
                     ? {}
                     : {
