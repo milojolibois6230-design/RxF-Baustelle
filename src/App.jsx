@@ -951,6 +951,198 @@ function resizeFloorPlanImageForUpload(file, maxDim = FLOOR_PLAN_IMAGE_MAX_DIM_P
   });
 }
 
+// ---- TABLET CANVAS ZOOM FIX, Teil 3: Kachel-/Deep-Zoom-Pyramide für Raster-Grundrisse --
+// Architektur-Entscheidung (siehe Einordnung in der Antwort): statt einer fertigen
+// Deep-Zoom-Bibliothek (z.B. OpenSeadragon) wird hier eine eigene, bewusst einfach
+// gehaltene Kachel-Engine gebaut, die sich in die bereits bestehende "Bühne"
+// (contentRef-Transform, Long-Press-Gesten, prozentuale Pin-Koordinaten, siehe
+// FloorPlanView) einfügt, statt diese komplett zu ersetzen — dadurch bleiben Pin-
+// Interaktionen, Zoom-/Pan-Gesten und PDF-Export unverändert funktionsfähig, ohne
+// deren Koordinatensystem oder Event-Modell auf ein fremdes Bibliotheks-Konzept
+// umstellen zu müssen (siehe TiledPlanImage weiter unten für die Anzeige-Seite).
+//
+// Prinzip (klassische Bild-Pyramide, wie bei Google Maps/IIIF/Deep-Zoom-Viewern):
+// das Quellbild wird in mehrere Auflösungsstufen zerlegt (Stufe 0 = ganzes Bild passt
+// in eine einzige kleine Kachel, jede folgende Stufe verdoppelt die Auflösung bis zur
+// nativen Größe), jede Stufe wiederum in einzelne, kleine Kacheln von
+// FLOOR_PLAN_TILE_SIZE_PX Kantenlänge. Beim Anzeigen wird IMMER nur die für den
+// aktuellen Zoom passende Stufe geladen (siehe TiledPlanImage), nie das gesamte Bild
+// in voller Auflösung auf einmal — jede einzelne Kachel bleibt dabei weit unter jedem
+// bekannten Canvas-/Bild-Größenlimit mobiler Browser, wodurch der weiße Bildschirm bei
+// hohem Zoom strukturell ausgeschlossen ist, unabhängig davon, wie hoch die native
+// Auflösung der Quelle tatsächlich ist.
+//
+// FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX ist bewusst EIGENSTÄNDIG von
+// FLOOR_PLAN_IMAGE_MAX_DIM_PX (siehe oben) und liegt deutlich höher: Letzteres deckelt
+// das flache, einzelne Fallback-/Export-Bild (image_url) auf 3000px, weil DIESES als
+// EIN EINZIGES Bild angezeigt bzw. in den PDF-Export geladen wird und deshalb an das
+// bisherige, konservative Sicherheitsmaß gebunden bleibt. Die Kachel-Pyramide dagegen
+// wird NIE als ein einziges großes Bild gerendert, sondern immer nur kachelweise —
+// deshalb ist es hier sicher, für die Pyramide selbst von einer höheren nativen
+// Quellauflösung auszugehen, ohne das ursprüngliche Weißbildschirm-Risiko
+// zurückzuholen. 6000px ist dabei ein bewusst gewählter, aber nicht absolut
+// unbegrenzter Wert (siehe Einordnung: Kompromiss aus "spürbar mehr Schärfe als
+// bisher" und vertretbarer Kachel-Anzahl/Speicherbedarf pro Grundriss).
+const FLOOR_PLAN_TILE_SIZE_PX = 512;
+const FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX = 6000;
+const FLOOR_PLAN_TILE_JPEG_QUALITY = 0.85;
+const FLOOR_PLAN_TILE_UPLOAD_CONCURRENCY = 6;
+const FLOOR_PLAN_TILES_BUCKET = "floor-plan-tiles";
+
+// Berechnet ausschließlich die GEOMETRIE der Pyramiden-Stufen (Breite/Höhe/Anzahl
+// Kacheln je Stufe), unabhängig vom eigentlichen Rendern — wird sowohl bei der
+// Erzeugung (generateAndUploadTilePyramid) als auch beim Anzeigen (buildTileList in
+// TiledPlanImage, über das gespeicherte Manifest) mit denselben Eingabewerten
+// aufgerufen und liefert dadurch garantiert dieselbe Aufteilung.
+function buildTilePyramidLevels(naturalWidth, naturalHeight, tileSize) {
+  const maxDim = Math.max(naturalWidth, naturalHeight);
+  const maxLevel = Math.max(0, Math.ceil(Math.log2(Math.max(1, maxDim / tileSize))));
+  const levels = [];
+  for (let level = 0; level <= maxLevel; level += 1) {
+    // Stufe maxLevel entspricht IMMER exakt der nativen Auflösung (kein gerundeter
+    // Zweierpotenz-Faktor, um Rundungsabweichungen an der schärfsten Stufe zu
+    // vermeiden), alle Stufen darunter halbieren die Auflösung schrittweise.
+    const isNativeLevel = level === maxLevel;
+    const factor = isNativeLevel ? 1 : Math.pow(2, level - maxLevel);
+    const width = isNativeLevel ? naturalWidth : Math.max(1, Math.round(naturalWidth * factor));
+    const height = isNativeLevel ? naturalHeight : Math.max(1, Math.round(naturalHeight * factor));
+    const cols = Math.max(1, Math.ceil(width / tileSize));
+    const rows = Math.max(1, Math.ceil(height / tileSize));
+    levels.push({ level, width, height, cols, rows });
+  }
+  return { maxLevel, levels };
+}
+
+// Erzeugt aus der ORIGINAL hochgeladenen Bilddatei (bewusst NICHT aus der bereits auf
+// FLOOR_PLAN_IMAGE_MAX_DIM_PX verkleinerten uploadFile-Variante, siehe Kommentar oben
+// bei FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX) eine vollständige Kachel-Pyramide und lädt
+// alle Kacheln in den eigenen Storage-Bucket "floor-plan-tiles" hoch. Liefert bei
+// Erfolg das Manifest (Geometrie + öffentliche Basis-URL) zurück, das unverändert als
+// jsonb in floor_plans.tile_manifest gespeichert wird. Wirft absichtlich einen Fehler
+// nach außen (anders als resizeFloorPlanImageForUpload) — der EINZIGE Aufrufer
+// (uploadFloorPlan) fängt ihn gezielt ab und behandelt eine fehlgeschlagene
+// Kachel-Erzeugung als reine, nicht-blockierende Zusatzfunktion: der eigentliche
+// Grundriss-Upload (flaches Fallback-Bild) darf davon niemals abhängen.
+async function generateAndUploadTilePyramid(projectId, originalFile, onStatusMessage) {
+  if (!originalFile || !originalFile.type || !originalFile.type.startsWith("image/") || originalFile.type === "image/svg+xml") {
+    return null;
+  }
+  const objectUrl = URL.createObjectURL(originalFile);
+  let img;
+  try {
+    img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("Bild konnte für die Kachel-Erzeugung nicht geladen werden."));
+      el.src = objectUrl;
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+  const rawWidth = img.naturalWidth || img.width;
+  const rawHeight = img.naturalHeight || img.height;
+  if (!rawWidth || !rawHeight) return null;
+
+  // Nur verkleinern, nie vergrößern — ein bereits kleineres Original bleibt in seiner
+  // tatsächlichen Auflösung, es wird also nie künstlich "hochgerechnet".
+  const sourceDownscale = Math.min(1, FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX / Math.max(rawWidth, rawHeight));
+  const naturalWidth = Math.max(1, Math.round(rawWidth * sourceDownscale));
+  const naturalHeight = Math.max(1, Math.round(rawHeight * sourceDownscale));
+
+  const isPng = originalFile.type === "image/png";
+  const tileExt = isPng ? "png" : "jpg";
+  const tileSize = FLOOR_PLAN_TILE_SIZE_PX;
+  const { maxLevel, levels } = buildTilePyramidLevels(naturalWidth, naturalHeight, tileSize);
+
+  const tileSetId = crypto.randomUUID();
+  const basePath = `${projectId}/${tileSetId}`;
+  const tiles = [];
+
+  for (const levelInfo of levels) {
+    // Jede Stufe wird EINMAL vollständig auf ein Zwischen-Canvas in ihrer eigenen,
+    // bereits durch FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX gedeckelten Auflösung gerendert
+    // und danach ausschließlich in kleine TILE_SIZE-Kacheln zerschnitten — dieses
+    // Zwischen-Canvas wird NIE selbst angezeigt oder dauerhaft gehalten, dient nur als
+    // Quelle für drawImage beim Zuschneiden und wird direkt danach wieder freigegeben
+    // (canvas.width = 0), bleibt also zu keinem Zeitpunkt im Speicher hängen.
+    const levelCanvas = document.createElement("canvas");
+    levelCanvas.width = levelInfo.width;
+    levelCanvas.height = levelInfo.height;
+    const levelCtx = levelCanvas.getContext("2d", { alpha: isPng });
+    if (!isPng) {
+      levelCtx.fillStyle = "#ffffff";
+      levelCtx.fillRect(0, 0, levelInfo.width, levelInfo.height);
+    }
+    levelCtx.drawImage(img, 0, 0, levelInfo.width, levelInfo.height);
+
+    for (let row = 0; row < levelInfo.rows; row += 1) {
+      for (let col = 0; col < levelInfo.cols; col += 1) {
+        const tileX = col * tileSize;
+        const tileY = row * tileSize;
+        const tileW = Math.min(tileSize, levelInfo.width - tileX);
+        const tileH = Math.min(tileSize, levelInfo.height - tileY);
+        const tileCanvas = document.createElement("canvas");
+        tileCanvas.width = tileW;
+        tileCanvas.height = tileH;
+        const tileCtx = tileCanvas.getContext("2d", { alpha: isPng });
+        tileCtx.drawImage(levelCanvas, tileX, tileY, tileW, tileH, 0, 0, tileW, tileH);
+        // eslint-disable-next-line no-await-in-loop
+        const blob = await new Promise((resolve) =>
+          tileCanvas.toBlob((b) => resolve(b), isPng ? "image/png" : "image/jpeg", isPng ? undefined : FLOOR_PLAN_TILE_JPEG_QUALITY)
+        );
+        tileCanvas.width = 0;
+        tileCanvas.height = 0;
+        if (blob) {
+          tiles.push({ path: `${basePath}/${levelInfo.level}/${col}_${row}.${tileExt}`, blob });
+        }
+      }
+    }
+    levelCanvas.width = 0;
+    levelCanvas.height = 0;
+  }
+
+  // Hochladen in begrenzt parallelen Batches statt aller Kacheln gleichzeitig —
+  // vermeidet zu viele gleichzeitige Verbindungen bei schwachem Baustellen-WLAN/
+  // Mobilfunk und hält den Fortschritt über onStatusMessage nachvollziehbar. Bricht
+  // beim ersten fehlgeschlagenen Batch sofort ab (throw) — der Aufrufer fängt das ab
+  // und verwirft die gesamte, dann ohnehin unvollständige Pyramide zugunsten des
+  // garantiert vorhandenen Fallback-Bilds, statt eine Pyramide mit Lücken zu
+  // speichern.
+  let uploaded = 0;
+  for (let i = 0; i < tiles.length; i += FLOOR_PLAN_TILE_UPLOAD_CONCURRENCY) {
+    const batch = tiles.slice(i, i + FLOOR_PLAN_TILE_UPLOAD_CONCURRENCY);
+    // eslint-disable-next-line no-await-in-loop
+    const results = await Promise.allSettled(
+      batch.map((tile) =>
+        supabase.storage.from(FLOOR_PLAN_TILES_BUCKET).upload(tile.path, tile.blob, {
+          cacheControl: "31536000",
+          upsert: false,
+          contentType: isPng ? "image/png" : "image/jpeg",
+        })
+      )
+    );
+    const failedResult = results.find((r) => r.status === "fulfilled" && r.value?.error);
+    if (failedResult) throw failedResult.value.error;
+    const rejectedResult = results.find((r) => r.status === "rejected");
+    if (rejectedResult) throw rejectedResult.reason;
+    uploaded += batch.length;
+    onStatusMessage?.(`Kachel-Ansicht für scharfes Zoomen wird vorbereitet… (${uploaded}/${tiles.length})`);
+  }
+
+  const { data: baseUrlData } = supabase.storage.from(FLOOR_PLAN_TILES_BUCKET).getPublicUrl(basePath);
+
+  return {
+    version: 1,
+    tileSize,
+    ext: tileExt,
+    naturalWidth,
+    naturalHeight,
+    maxLevel,
+    levels: levels.map(({ level, width, height, cols, rows }) => ({ level, width, height, cols, rows })),
+    baseUrl: baseUrlData.publicUrl,
+  };
+}
+
 // Lädt eine Grundriss-Datei in den Bucket "floor-plans" hoch und liefert die
 // öffentliche URL + den erkannten Dateityp zurück. onStatusMessage (optional) meldet
 // dem Aufrufer Fortschrittstexte für ein Toast/Hinweis-UI (siehe compressionNotice in
@@ -994,7 +1186,33 @@ async function uploadFloorPlan(projectId, file, onStatusMessage) {
   if (uploadError) throw uploadError;
 
   const { data: publicUrlData } = supabase.storage.from(FLOOR_PLANS_BUCKET).getPublicUrl(path);
-  return { publicUrl: publicUrlData.publicUrl, fileType: info.kind };
+
+  // TABLET CANVAS ZOOM FIX, Teil 3: zusätzlich zum immer vorhandenen flachen Fallback-
+  // Bild oben (image_url) eine Kachel-Pyramide erzeugen und hochladen (siehe
+  // generateAndUploadTilePyramid) — ausschließlich für Raster-Grundrisse (info.kind
+  // "image"), NICHT für PDF/CAD/SVG (die haben bereits eigene, vektor- bzw.
+  // geräteabhängig gedeckelte Rendering-Pfade, siehe PdfPlanCanvas/SvgPlanCanvas/
+  // CadBlueprintPlan). Schlägt die Kachel-Erzeugung fehl (z.B. Netzwerkabbruch mitten
+  // im Kachel-Upload, exotisches Bildformat), wird das bewusst NICHT zum Abbruch des
+  // gesamten Grundriss-Uploads — tileManifest bleibt dann einfach null, und die
+  // Ansicht fällt zuverlässig auf das bereits erfolgreich hochgeladene Fallback-Bild
+  // zurück (siehe TiledPlanImage). Ein einzelner Kachel-Fehler darf niemals dazu
+  // führen, dass der Nutzer gar keinen Grundriss hochladen kann.
+  let tileManifest = null;
+  if (info.kind === "image") {
+    try {
+      tileManifest = await generateAndUploadTilePyramid(projectId, file, onStatusMessage);
+    } catch (err) {
+      console.error(
+        "Kachel-Pyramide für scharfes Zoomen konnte nicht erzeugt werden, Grundriss bleibt trotzdem über das Fallback-Bild nutzbar:",
+        err
+      );
+      tileManifest = null;
+    }
+    onStatusMessage?.(null);
+  }
+
+  return { publicUrl: publicUrlData.publicUrl, fileType: info.kind, tileManifest };
 }
 
 // Lädt ein Projekt-Titelbild (Gebäudeansicht für die Kachel in der Projektübersicht,
@@ -1066,10 +1284,13 @@ async function reorderFloors(orderedFloors) {
 // createFloorPlanSketch benötigt zwingend eine Datei (eine Skizze ohne Plan wäre
 // nutzlos), updateFloorPlanSketch lässt die Datei wie zuvor bei Etagen optional.
 async function createFloorPlanSketch(floorId, projectId, name, file, onStatusMessage) {
-  const { publicUrl, fileType } = await uploadFloorPlan(projectId, file, onStatusMessage);
+  const { publicUrl, fileType, tileManifest } = await uploadFloorPlan(projectId, file, onStatusMessage);
   const { data, error } = await supabase
     .from("floor_plans")
-    .insert({ floor_id: floorId, name, image_url: publicUrl, file_type: fileType })
+    // tile_manifest (siehe supabase_schema_v18_floor_plan_tiles.sql) bleibt bei PDF/
+    // CAD/SVG bzw. bei fehlgeschlagener Kachel-Erzeugung schlicht null — TiledPlanImage
+    // fällt dann zuverlässig auf image_url als reines Fallback-Bild zurück.
+    .insert({ floor_id: floorId, name, image_url: publicUrl, file_type: fileType, tile_manifest: tileManifest })
     .select()
     .single();
   if (error) throw error;
@@ -1077,15 +1298,17 @@ async function createFloorPlanSketch(floorId, projectId, name, file, onStatusMes
 }
 
 // Aktualisiert Name und/oder Datei einer bestehenden Grundrisskizze. Die Datei ist
-// optional: wird keine neue Datei übergeben, bleiben image_url/file_type unverändert
-// und nur der Name wird aktualisiert. Die alte Datei im Storage bleibt beim
-// Austausch technisch bedingt liegen (analog zu deleteProject() oben).
+// optional: wird keine neue Datei übergeben, bleiben image_url/file_type/tile_manifest
+// unverändert und nur der Name wird aktualisiert. Die alte Datei im Storage bleibt beim
+// Austausch technisch bedingt liegen (analog zu deleteProject() oben) — dasselbe gilt
+// für eine dabei verwaiste alte Kachel-Pyramide im Bucket "floor-plan-tiles".
 async function updateFloorPlanSketch(planId, projectId, name, file, onStatusMessage) {
   const fields = { name };
   if (file) {
-    const { publicUrl, fileType } = await uploadFloorPlan(projectId, file, onStatusMessage);
+    const { publicUrl, fileType, tileManifest } = await uploadFloorPlan(projectId, file, onStatusMessage);
     fields.image_url = publicUrl;
     fields.file_type = fileType;
+    fields.tile_manifest = tileManifest;
   }
   const { data, error } = await supabase.from("floor_plans").update(fields).eq("id", planId).select().single();
   if (error) throw error;
@@ -5417,6 +5640,178 @@ const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, zoomScale
             <div className="relative h-full w-full">{children}</div>
           </foreignObject>
         </svg>
+      )}
+    </div>
+  );
+});
+
+// ----------------------------------------------------------------------------------
+// TABLET CANVAS ZOOM FIX, Teil 3: KACHEL-/DEEP-ZOOM-ANSICHT FÜR RASTER-GRUNDRISSE
+// ----------------------------------------------------------------------------------
+// Zeigt einen Raster-Grundriss (PNG/JPG/WebP) über die Kachel-Pyramide aus
+// floor_plans.tile_manifest (siehe generateAndUploadTilePyramid weiter oben) an,
+// statt eines einzelnen, bei hohem Zoom potenziell zu großen <img>/<canvas>-Elements.
+// Ersetzt in FloorPlanView ausschließlich das bisherige einzelne <img ref={imgRef}
+// src={plan.image_url} .../> für reine Raster-Grundrisse — PDF/CAD/SVG-Grundrisse
+// laufen unverändert über PdfPlanCanvas/CadBlueprintPlan/SvgPlanCanvas.
+//
+// Wichtigste Absicherung: das bereits bestehende, flache Fallback-Bild (image_url,
+// siehe FLOOR_PLAN_IMAGE_MAX_DIM_PX) bleibt IMMER als unterste Ebene sichtbar,
+// unabhängig vom Kachel-Status. Ältere, vor diesem Update hochgeladene Grundrisse
+// haben schlicht kein tile_manifest (null) und zeigen dadurch automatisch nur dieses
+// Fallback-Bild — exakt das bisherige Verhalten, keine Regression. Auch wenn die
+// Kachel-Erzeugung beim Upload fehlschlug oder einzelne Kacheln zur Laufzeit nicht
+// laden, bleibt darunter jederzeit ein vollständiges Bild sichtbar, nie eine Lücke
+// oder ein weißer Bereich.
+//
+// Bewusste Vereinfachung (siehe Einordnung in der Antwort): es werden IMMER alle
+// Kacheln der aktuell gewählten Stufe gemeinsam geladen, keine Viewport-Virtualisierung
+// (nur die gerade sichtbaren Kacheln laden). Das hält die Logik überschaubar und ohne
+// Live-Test auf echter Tablet-Hardware nachvollziehbar korrekt, kostet bei sehr hohem
+// Zoom etwas mehr Bandbreite als eine vollständige Deep-Zoom-Bibliothek, löst aber das
+// eigentliche Problem (kein einzelnes übergroßes Canvas/Bild) bereits vollständig, da
+// jede Kachel unabhängig als kleines <img> geladen/dekodiert wird.
+function buildTileList(manifest, levelIndex) {
+  if (!manifest || !manifest.levels?.length) return [];
+  const levelInfo = manifest.levels.find((l) => l.level === levelIndex) || manifest.levels[manifest.levels.length - 1];
+  if (!levelInfo) return [];
+  const tiles = [];
+  for (let row = 0; row < levelInfo.rows; row += 1) {
+    for (let col = 0; col < levelInfo.cols; col += 1) {
+      const tileX = col * manifest.tileSize;
+      const tileY = row * manifest.tileSize;
+      const tileWidthPx = Math.min(manifest.tileSize, levelInfo.width - tileX);
+      const tileHeightPx = Math.min(manifest.tileSize, levelInfo.height - tileY);
+      tiles.push({
+        level: levelInfo.level,
+        col,
+        row,
+        leftPct: (tileX / levelInfo.width) * 100,
+        topPct: (tileY / levelInfo.height) * 100,
+        widthPct: (tileWidthPx / levelInfo.width) * 100,
+        heightPct: (tileHeightPx / levelInfo.height) * 100,
+        url: `${manifest.baseUrl}/${levelInfo.level}/${col}_${row}.${manifest.ext}`,
+      });
+    }
+  }
+  return tiles;
+}
+
+// Wählt die NIEDRIGSTE Pyramiden-Stufe, deren native Breite die aktuell tatsächlich
+// benötigte Bildschirm-Pixelbreite bereits abdeckt (nie unnötig die höchste Stufe
+// laden, wenn eine kleinere bereits ausreicht) — fällt auf die höchste vorhandene
+// Stufe zurück, falls selbst die nicht ausreicht (native Auflösungsgrenze der Pyramide
+// erreicht, mehr Schärfe ist dann nicht verfügbar).
+function pickTileLevelForWidth(manifest, requiredWidthPx) {
+  if (!manifest || !manifest.levels?.length) return null;
+  const sorted = [...manifest.levels].sort((a, b) => a.level - b.level);
+  const fit = sorted.find((l) => l.width >= requiredWidthPx);
+  return (fit || sorted[sorted.length - 1]).level;
+}
+
+const FLOOR_PLAN_TILE_LEVEL_SWITCH_DEBOUNCE_MS = 180;
+
+const TiledPlanImage = forwardRef(function TiledPlanImage({ plan, scale = 1 }, ref) {
+  const rootRef = useRef(null);
+  const manifest = plan?.tile_manifest || null;
+  const [level, setLevel] = useState(() => (manifest ? manifest.maxLevel : null));
+  const [failedTileKeys, setFailedTileKeys] = useState(() => new Set());
+
+  const setRefs = (node) => {
+    rootRef.current = node;
+    if (typeof ref === "function") ref(node);
+    else if (ref) ref.current = node;
+  };
+
+  // Setzt Stufe/Fehlerliste bei einem Planwechsel zurück (neue plan.id bzw. neues
+  // Manifest) — sonst könnte beim Wechsel auf eine andere Skizze kurzzeitig die zuvor
+  // gewählte Kachel-Stufe eines völlig anderen Bildes angezeigt werden, bevor der
+  // Effekt unten neu greift.
+  useEffect(() => {
+    setLevel(manifest ? manifest.maxLevel : null);
+    setFailedTileKeys(new Set());
+  }, [plan?.id, manifest?.baseUrl, manifest?.maxLevel]);
+
+  // Dieselbe Debounce-Logik wie beim PDF-Raster-Nachladen (siehe PdfPlanCanvas/
+  // PDF_RASTER_RERENDER_DEBOUNCE_MS): erst nach einer kurzen Zoom-Ruhepause wird die
+  // tatsächlich benötigte Kachel-Stufe neu bestimmt, nie während einer laufenden
+  // Pinch-Geste selbst. Die benötigte Auflösung wird aus der TATSÄCHLICHEN, bereits
+  // durch die Bühnen-CSS-Skalierung vergrößerten Bildschirmbreite abgeleitet:
+  // getBoundingClientRect() reflektiert (anders als offsetWidth, siehe abweichender
+  // Kommentar bei PlanSvgStage/measureRef, wo bewusst offsetWidth gebraucht wird) JEDE
+  // Vorfahren-CSS-Transformation — hier ist genau das richtig, weil wir exakt die
+  // aktuelle Bildschirm-Pixelzahl treffen wollen, die die Kacheln abdecken müssen.
+  // getPdfSafeRenderDprCap() ist trotz des Namens rein geräteabhängig (Bildschirmbreite-
+  // Breakpoint), keine PDF-spezifische Logik — wird hier bewusst wiederverwendet statt
+  // dupliziert, siehe dortiger Kommentar.
+  useEffect(() => {
+    if (!manifest) return undefined;
+    const timer = setTimeout(() => {
+      const el = rootRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (!rect.width) return;
+      const dprCap = getPdfSafeRenderDprCap();
+      const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, dprCap) : 1;
+      const requiredWidthPx = rect.width * dpr;
+      const nextLevel = pickTileLevelForWidth(manifest, requiredWidthPx);
+      if (nextLevel !== null) {
+        setLevel((prev) => (prev === nextLevel ? prev : nextLevel));
+      }
+    }, FLOOR_PLAN_TILE_LEVEL_SWITCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [manifest, scale]);
+
+  const tiles = useMemo(() => {
+    if (!manifest || level === null) return [];
+    return buildTileList(manifest, level).filter((t) => !failedTileKeys.has(`${t.level}-${t.col}-${t.row}`));
+  }, [manifest, level, failedTileKeys]);
+
+  const handleTileError = (tileKey) => {
+    // Eine einzelne fehlgeschlagene Kachel (z.B. kurzzeitiger Netzwerkfehler auf der
+    // Baustelle) blendet NUR diese eine Kachel aus — darunter bleibt an genau dieser
+    // Stelle weiterhin das vollständige Fallback-Bild sichtbar, nie eine Lücke oder ein
+    // kaputtes Bild-Icon.
+    setFailedTileKeys((prev) => {
+      if (prev.has(tileKey)) return prev;
+      const next = new Set(prev);
+      next.add(tileKey);
+      return next;
+    });
+  };
+
+  return (
+    <div ref={setRefs} className="relative block w-full select-none opacity-90" draggable={false}>
+      {/* Fallback-/Basis-Bild: dieselbe, bereits vorhandene, auf FLOOR_PLAN_IMAGE_MAX_DIM_PX
+          begrenzte, geflachte Grundriss-Datei (plan.image_url) — bleibt UNABHÄNGIG vom
+          Kachel-Status immer sichtbar im Hintergrund. Das ist die entscheidende
+          Absicherung gegen jede Form von weißem Bildschirm: selbst ohne Kachel-Pyramide
+          (ältere Grundrisse, fehlgeschlagene Erzeugung) oder bei einzelnen nicht
+          ladenden Kacheln zeigt die Ansicht immer mindestens dieses eine, garantiert
+          vorhandene Bild. */}
+      <img
+        src={plan.image_url}
+        alt={plan.name}
+        className="pointer-events-none block w-full select-none"
+        draggable={false}
+      />
+      {tiles.length > 0 && (
+        <div className="pointer-events-none absolute inset-0">
+          {tiles.map((t) => {
+            const tileKey = `${t.level}-${t.col}-${t.row}`;
+            return (
+              <img
+                key={tileKey}
+                src={t.url}
+                alt=""
+                draggable={false}
+                onError={() => handleTileError(tileKey)}
+                className="pointer-events-none absolute select-none"
+                style={{ left: `${t.leftPct}%`, top: `${t.topPct}%`, width: `${t.widthPct}%`, height: `${t.heightPct}%` }}
+              />
+            );
+          })}
+        </div>
       )}
     </div>
   );
@@ -10252,13 +10647,15 @@ function FloorPlanView({
                 )}
                 {!isCad && !isPdf && !isSvg && (
                   <>
-                    <img
-                      ref={imgRef}
-                      src={plan.image_url}
-                      alt={plan.name}
-                      className="pointer-events-none block w-full select-none opacity-90"
-                      draggable={false}
-                    />
+                    {/* TABLET CANVAS ZOOM FIX, Teil 3: Kachel-/Deep-Zoom-Ansicht statt eines
+                        einzelnen <img> — siehe TiledPlanImage weiter oben. imgRef zeigt
+                        unverändert auf den äußeren Wrapper-<div>, posFromEvent funktioniert
+                        dadurch exakt wie zuvor (getBoundingClientRect() liefert für ein <img>
+                        und ein <div> gleichermaßen die tatsächliche, bereits skalierte
+                        Bildschirmfläche). Ältere Grundrisse ohne tile_manifest sowie ein
+                        eventuell fehlgeschlagener Kachel-Upload zeigen automatisch weiterhin
+                        nur das bisherige Fallback-Bild — keine Regression. */}
+                    <TiledPlanImage ref={imgRef} plan={plan} scale={scale} />
                     <PinsAndNotesLayer
                       visiblePins={visiblePins}
                       pinNumberById={pinNumberById}
