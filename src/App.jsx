@@ -2175,17 +2175,21 @@ const PDF_PHOTO_NORMALIZE_WIDTH = 800;
 const PDF_PHOTO_NORMALIZE_HEIGHT = 600;
 const PDF_PHOTO_NORMALIZE_BG = "#f8fafc";
 
-// ---- BILDER-GRID IM PDF-LAYOUT: 2-Spalten-Raster mit fester Boxhöhe ---------------
-// Einheitliches 2-Spalten-Foto-Raster für ALLE DREI PDF-Export-Funktionen — jede Box
-// bekommt dieselbe feste Höhe (rechnerisches Äquivalent zu CSS height: 220px bei
-// ~96dpi: 220 / 96 * 25.4 ≈ 58.2mm, auf 58mm gerundet) und die volle verfügbare
-// Spaltenbreite (width: 100% der Spalte), unabhängig von der Fotoanzahl je Pin. In
-// Kombination mit der 4:3-Bildnormalisierung beim Preload (siehe
-// normalizeImageTo4x3Canvas) ergibt das für JEDES Foto im gesamten Bericht exakt
-// dieselbe Darstellungsgröße auf den Millimeter genau.
+// ---- BILDER-GRID IM PDF-LAYOUT: 2-Spalten-Raster, GLEICHBERECHTIGT (kein Haupt-/
+// Vorschaubild mehr) ------------------------------------------------------------------
+// Einheitliches 2-Spalten-Foto-Raster (entspricht display:grid; grid-template-columns:
+// repeat(2,1fr); gap:12px) für ALLE DREI PDF-Export-Funktionen — JEDE Bild-Box erhält
+// exakt dieselbe feste Höhe (rechnerisches Äquivalent zu CSS height: 250px bei ~96dpi:
+// 250 / 96 * 25.4 ≈ 66.15mm, auf 66mm gerundet) und dieselbe volle verfügbare
+// Spaltenbreite (width: 100% der Spalte), unabhängig von Fotoanzahl UND Position in der
+// Liste — es gibt bewusst KEINE Sonderbehandlung für das erste Foto mehr (kein
+// "Hauptbild" + kleinere "Vorschaubilder"), Bild 1, 2 und 3 stehen exakt gleich groß
+// nebeneinander/untereinander. In Kombination mit der 4:3-Bildnormalisierung beim
+// Preload (siehe normalizeImageTo4x3Canvas) ergibt das für JEDES Foto im gesamten
+// Bericht exakt dieselbe Darstellungsgröße auf den Millimeter genau.
 const PDF_PHOTO_GRID_COLS = 2;
-const PDF_PHOTO_GRID_GAP_MM = 6;
-const PDF_PHOTO_GRID_ROW_HEIGHT_MM = 58;
+const PDF_PHOTO_GRID_GAP_MM = 3.2; // ≈ CSS gap: 12px bei ~96dpi (12 / 96 * 25.4 ≈ 3.175mm)
+const PDF_PHOTO_GRID_ROW_HEIGHT_MM = 66; // ≈ CSS height: 250px bei ~96dpi
 // Bild-Box-Optik (entspricht der Vorgabe background:#f8fafc, border:1px solid #e2e8f0,
 // border-radius:8px — hier als jsPDF-RGB/mm-Äquivalente): dieselben Werte wie
 // PDF_PHOTO_NORMALIZE_BG oben, damit der Normalisierungs-Rand nahtlos in die Box
