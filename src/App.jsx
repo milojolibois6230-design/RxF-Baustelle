@@ -11230,21 +11230,38 @@ function PinModal({
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            {/* DIREKTES LÖSCHEN VON PINS: gut sichtbarer Löschen-Button direkt oben im
-                Modalkopf, neben dem Schließen-Button — sofort erreichbar, ohne erst durch
-                das gesamte Formular scrollen zu müssen. Öffnet dieselbe kurze
-                Sicherheitsabfrage wie der Löschen-Button im Footer (siehe
-                handleDeleteClick/deleteConfirmOpen/ConfirmDialog unten) — ein
-                versehentlich gesetzter Pin lässt sich dadurch in zwei schnellen Klicks
-                wieder entfernen. */}
+            {/* EINZEL-PDF-EXPORT & MANGEL DUPLIZIEREN: als schlanke Icon-Buttons im
+                Modalkopf statt im Footer — der Footer ist bewusst für exakt drei
+                Buttons reserviert (Löschen | Abbrechen | Speichern, siehe unten), damit
+                "Löschen" dort bei JEDEM Pin, auch direkt nach dem Anlegen per Long
+                Press, sofort auffindbar ist. Beide Aktionen bleiben unverändert nur bei
+                bereits bestehenden, gespeicherten Pins sinnvoll (Export/Duplikat eines
+                noch leeren Entwurfs wäre wenig hilfreich), daher weiterhin an !isNew
+                gebunden. */}
             {!isNew && !readOnly && (
+              <div className="relative">
+                <button
+                  onClick={handleExportSinglePin}
+                  disabled={exportingPdf}
+                  title="Diesen Pin als schnelles 1-Seiten-PDF exportieren — inkl. Foto und Lageplan-Ausschnitt"
+                  className="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {exportingPdf ? <Loader2 size={18} className="animate-spin" /> : <Crosshair size={18} />}
+                </button>
+                {exportPdfError && (
+                  <p className="absolute right-0 top-full z-10 mt-1.5 w-48 rounded-md bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 ring-1 ring-inset ring-rose-200">
+                    {exportPdfError}
+                  </p>
+                )}
+              </div>
+            )}
+            {!isNew && !readOnly && onDuplicate && (
               <button
-                onClick={handleDeleteClick}
-                disabled={deleting}
-                title="Pin löschen"
-                className="rounded-lg p-1.5 text-rose-500 transition hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+                onClick={handleDuplicateClick}
+                title="Gewerk, Titel, Beschreibung und Priorität in die Zwischenablage übernehmen, um an anderer Stelle einen neuen Pin damit anzulegen"
+                className="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
               >
-                {deleting ? <Loader2 size={20} className="animate-spin" /> : <Trash2 size={20} />}
+                <Copy size={18} />
               </button>
             )}
             <button onClick={onClose} className={MODAL_CLOSE_BTN}>
@@ -11501,42 +11518,33 @@ function PinModal({
           )}
         </div>
 
-        {/* Footer */}
+        {/* Footer: exakt drei Buttons nebeneinander — Löschen (rot) | Abbrechen (grau) |
+            Speichern (rot/Markenfarbe) — siehe ANFORDERUNG "ADD DIRECT LÖSCHEN BUTTON IN
+            PIN MODAL FOOTER". "Löschen" ist ab sofort bei JEDEM Öffnen des Modals
+            sichtbar und funktionsfähig, ausdrücklich auch direkt nach einem Long Press
+            bei einem frisch angelegten (isNew) Pin: der Pin existiert zu diesem
+            Zeitpunkt bereits real in pins/Supabase bzw. — offline — als lokal
+            angelegter Pin mit eigener Offline-ID in der Sync-Warteschlange (siehe
+            handlePlanClick weiter oben in App). handleDeletePin behandelt isNew- und
+            bestehende Pins deshalb ohnehin bereits vollkommen identisch: Klick auf
+            "Löschen" -> kurze Sicherheitsabfrage (ConfirmDialog unten, verhindert
+            versehentliches Löschen) -> bei Bestätigung entweder direktes
+            supabase.from('pins').delete().eq('id', pin.id) inkl. vorherigem Aufräumen
+            von pin_todos/pin_photos (siehe deletePin) oder, offline, das entsprechende
+            Warteschlangen-Handling — in beiden Fällen sofortiges Filtern aus setPins,
+            sofortiges Entfernen des Markers vom Grundriss ohne Reload und sofortiges
+            Schließen des Modals (setModalState(null) in handleDeletePin). Einzel-PDF-
+            Export und "Mangel duplizieren" sind dafür in den Modal-Header gewandert
+            (siehe oben) statt hier im Footer Platz wegzunehmen. */}
         <div className="flex items-center justify-between gap-3 border-t border-slate-100 px-5 py-3.5">
-          {!isNew ? (
-            <div className="relative flex items-center gap-1">
-              <button
-                onClick={handleExportSinglePin}
-                disabled={exportingPdf}
-                title="Diesen Pin als schnelles 1-Seiten-PDF exportieren — inkl. Foto und Lageplan-Ausschnitt"
-                className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {exportingPdf ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />} Einzel-PDF
-              </button>
-              {!readOnly && onDuplicate && (
-                <button
-                  onClick={handleDuplicateClick}
-                  title="Gewerk, Titel, Beschreibung und Priorität in die Zwischenablage übernehmen, um an anderer Stelle einen neuen Pin damit anzulegen"
-                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100"
-                >
-                  <Copy size={16} /> Mangel duplizieren
-                </button>
-              )}
-              {!readOnly && (
-                <button
-                  onClick={handleDeleteClick}
-                  disabled={deleting}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {deleting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />} Löschen
-                </button>
-              )}
-              {exportPdfError && (
-                <p className="absolute bottom-full left-0 mb-1.5 w-52 rounded-md bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 ring-1 ring-inset ring-rose-200">
-                  {exportPdfError}
-                </p>
-              )}
-            </div>
+          {!readOnly ? (
+            <button
+              onClick={handleDeleteClick}
+              disabled={deleting}
+              className="inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {deleting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />} Löschen
+            </button>
           ) : (
             <span />
           )}
