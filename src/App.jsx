@@ -722,15 +722,19 @@ async function fetchFloorPlansWithPinSummary(floorId) {
   return data ?? [];
 }
 
-// Pins einer konkreten Grundrissskizze (Ebene 4) inkl. aller zugehörigen To-dos und
-// Fotos in einem einzigen Request laden (verschachtelter Supabase-Select über die
+// Pins einer konkreten Grundrissskizze (Ebene 4) inkl. aller zugehörigen Fotos in
+// einem einzigen Request laden (verschachtelter Supabase-Select über die
 // Fremdschlüssel). Strikte Datentrennung: gefiltert wird über plan_id, nicht mehr
 // über floor_id — Pins tauchen dadurch garantiert nur auf genau der Grundrissskizze
-// auf, der sie zugeordnet wurden.
+// auf, der sie zugeordnet wurden. Lädt bewusst KEINE pin_todos mehr mit (die
+// Aufgaben-/To-do-Funktion wurde vollständig aus der App entfernt, siehe
+// PinModal/generateFloorPinsTablePdf/generateSinglePinPdf) — eventuell noch aus der
+// Zeit davor in der Datenbank vorhandene pin_todos-Zeilen bleiben dadurch einfach
+// ungenutzt liegen, statt weiterhin mitgeladen zu werden.
 async function fetchPinsWithDetails(planId) {
   const { data, error } = await supabase
     .from("pins")
-    .select("*, pin_todos(*), pin_photos(*), pin_activity_log(*)")
+    .select("*, pin_photos(*), pin_activity_log(*)")
     .eq("plan_id", planId)
     .order("created_at", { ascending: true });
   if (error) throw error;
@@ -738,13 +742,13 @@ async function fetchPinsWithDetails(planId) {
 }
 
 // Sämtliche Pins EINES Geschosses über ALLE seine Grundrisskizzen hinweg laden
-// (inkl. To-dos/Fotos) — bewusst über floor_id statt plan_id gefiltert, für den
+// (inkl. Fotos) — bewusst über floor_id statt plan_id gefiltert, für den
 // projektweiten PDF-Export (Abschnitt 5, siehe fetchAllPinsForProject unten), der
 // geschossweise aggregiert und keine Skizzen-Ebene kennt.
 async function fetchPinsForFloor(floorId) {
   const { data, error } = await supabase
     .from("pins")
-    .select("*, pin_todos(*), pin_photos(*), pin_activity_log(*)")
+    .select("*, pin_photos(*), pin_activity_log(*)")
     .eq("floor_id", floorId)
     .order("created_at", { ascending: true });
   if (error) throw error;
@@ -998,8 +1002,8 @@ async function deleteFloorPlanSketch(plan) {
 // Erweiterung mit Default {} statt einer neuen, parallelen Funktion. Das direkte
 // Duplizieren eines bestehenden Pins (siehe "Mangel duplizieren" im PinModal-Kopf)
 // läuft NICHT über diesen Parameter, sondern über die eigenständige duplicatePin-
-// Funktion weiter unten (kopiert zusätzlich Status, Bereich, Frist und Aufgaben und
-// vergibt die Wurzel-/Unter-Nummerierung, siehe dort).
+// Funktion weiter unten (kopiert zusätzlich Status, Bereich und Frist und vergibt die
+// Wurzel-/Unter-Nummerierung, siehe dort).
 async function createPin(planId, floorId, x, y, actor, overrides = {}) {
   const { data, error } = await supabase
     .from("pins")
@@ -1021,7 +1025,7 @@ async function createPin(planId, floorId, x, y, actor, overrides = {}) {
     .select()
     .single();
   if (error) throw error;
-  return { ...data, pin_todos: [], pin_photos: [], pin_activity_log: [] };
+  return { ...data, pin_photos: [], pin_activity_log: [] };
 }
 
 async function updatePin(pinId, fields, actor) {
@@ -1054,16 +1058,22 @@ async function logPinActivity(pinId, action, detail, actor) {
 
 // Löscht einen Pin inkl. aller zugehörigen Fotos im Storage (best effort) sowie —
 // SAUBERES LÖSCHEN (FOREIGN KEY HANDLING) — der verknüpften Untereinträge in
-// pin_todos/pin_photos. Das aktuelle Schema setzt für beide Tabellen zwar bereits
+// pin_photos. Das aktuelle Schema setzt für diese Tabelle zwar bereits
 // "on delete cascade" auf pin_id, verlässt sich hier aber NICHT ausschließlich darauf:
 // bei diesem Projekt hat sich bereits einmal gezeigt (siehe die frühere
 // lph_status-Constraint-Problematik), dass ein Teil eines Migrationsskripts auf einer
 // Live-Datenbank stillschweigend nie ausgeführt wurde — ein explizites Vorab-Löschen
 // der Kindzeilen schützt zuverlässig vor einem Foreign-Key-Fehler beim Löschen des
 // Pins, auch falls die CASCADE-Regel auf der jeweiligen Datenbank-Instanz fehlen
-// sollte. Ist sie hingegen korrekt gesetzt, betreffen diese beiden Aufrufe schlicht
-// null Zeilen (der Pin selbst hat sie zu diesem Zeitpunkt noch, es sind einfach keine
-// verwaisten Reste vorhanden) und sind folgenlos.
+// sollte. Ist sie hingegen korrekt gesetzt, betrifft dieser Aufruf schlicht null
+// Zeilen (der Pin selbst hat sie zu diesem Zeitpunkt noch, es sind einfach keine
+// verwaisten Reste vorhanden) und ist folgenlos.
+// pin_todos wird hier NICHT mehr explizit vorab gelöscht — die Aufgaben-/To-do-
+// Funktion wurde vollständig aus der App entfernt (siehe PinModal/generateFloor-
+// PinsTablePdf/generateSinglePinPdf), eventuell noch aus der Zeit davor vorhandene
+// pin_todos-Zeilen werden beim Löschen des Pins weiterhin zuverlässig über die
+// FK-CASCADE der Tabelle entfernt (eine reine Datenbank-interne Operation, unabhängig
+// von der App-Logik).
 // pin_activity_log wird hier BEWUSST NICHT explizit gelöscht: das Schema erlaubt für
 // diese Tabelle absichtlich kein clientseitiges DELETE (append-only Audit-Trail, siehe
 // supabase_schema_current.sql — nur SELECT/INSERT-Policies), ein Löschversuch würde
@@ -1080,8 +1090,6 @@ async function deletePin(pin) {
       if (removeError) console.error("Fotos konnten nicht aus dem Storage entfernt werden:", removeError);
     }
   }
-  const { error: todosError } = await supabase.from("pin_todos").delete().eq("pin_id", pin.id);
-  if (todosError) console.error("Aufgaben des Pins konnten nicht vorab gelöscht werden:", todosError);
   const { error: photoRowsError } = await supabase.from("pin_photos").delete().eq("pin_id", pin.id);
   if (photoRowsError) console.error("Foto-Einträge des Pins konnten nicht vorab gelöscht werden:", photoRowsError);
 
@@ -1091,13 +1099,14 @@ async function deletePin(pin) {
 
 // "Mangel duplizieren" (siehe Duplizieren-Button im PinModal-Kopf, handleDuplicatePin
 // in App): legt SOFORT eine vollständige Kopie des übergebenen Pins an — Titel,
-// Beschreibung, Status, Priorität, Gewerk, Bereich, Frist, Blickrichtung und alle
-// offenen wie erledigten Aufgaben werden 1:1 übernommen. Fotos werden BEWUSST NICHT
-// mitkopiert: eine Kopie dokumentiert typischerweise einen ähnlichen, aber
-// eigenständigen Mangel an anderer Stelle — die Fotos des Originals würden dort den
-// falschen Ort zeigen. Die Kopie erscheint minimal versetzt (+2 %/+2 %, an den
-// Plan-Rand geklammert wie jede reguläre Pin-Platzierung, siehe posFromEvent in
-// FloorPlanView) neben dem Original, damit sich beide Marker nicht exakt überdecken.
+// Beschreibung, Status, Priorität, Gewerk, Bereich, Frist und Blickrichtung werden 1:1
+// übernommen. Fotos werden BEWUSST NICHT mitkopiert: eine Kopie dokumentiert
+// typischerweise einen ähnlichen, aber eigenständigen Mangel an anderer Stelle — die
+// Fotos des Originals würden dort den falschen Ort zeigen. Die Kopie erscheint minimal
+// versetzt (+2 %/+2 %, an den Plan-Rand geklammert wie jede reguläre Pin-Platzierung,
+// siehe posFromEvent in FloorPlanView) neben dem Original, damit sich beide Marker
+// nicht exakt überdecken. Aufgaben werden NICHT mitkopiert — die Aufgaben-/To-do-
+// Funktion wurde vollständig aus der App entfernt.
 //
 // parent_pin_id verweist auf den unmittelbaren Quell-Pin (reine Audit-Spur).
 // root_pin_id verweist auf den ursprünglichen, selbst NICHT duplizierten Wurzel-Pin
@@ -1134,32 +1143,7 @@ async function duplicatePin(sourcePin, actor) {
     .single();
   if (error) throw error;
 
-  // Aufgaben separat, aber im selben Zug mitkopieren — ein Fehlschlag hierbei bricht
-  // die Duplikation selbst NICHT ab (der Pin ist zu diesem Zeitpunkt bereits
-  // angelegt), wird aber protokolliert, analog zum Umgang mit einzelnen fehlgeschla-
-  // genen Bildern beim PDF-Export.
-  const sourceTodos = sourcePin.pin_todos || [];
-  let copiedTodos = [];
-  if (sourceTodos.length > 0) {
-    const { data: todoRows, error: todosError } = await supabase
-      .from("pin_todos")
-      .insert(
-        sourceTodos.map((t) => ({
-          pin_id: data.id,
-          text: t.text,
-          completed: t.completed,
-          created_by: actor?.email || null,
-        }))
-      )
-      .select();
-    if (todosError) {
-      console.error("Aufgaben konnten beim Duplizieren nicht mitkopiert werden:", todosError);
-    } else {
-      copiedTodos = todoRows || [];
-    }
-  }
-
-  return { ...data, pin_todos: copiedTodos, pin_photos: [], pin_activity_log: [] };
+  return { ...data, pin_photos: [], pin_activity_log: [] };
 }
 
 // Berechnet für eine Menge von Pins die anzuzeigende Pin-Nummer inklusive der
@@ -1224,8 +1208,8 @@ function comparePinNumberEntries(a, b) {
 // ----------------------------------------------------------------------------------
 // SKIZZEN-NOTIZEN (PLAN ANNOTATIONS) — reine Text-Marker auf dem Grundriss, ergänzend
 // zu den nummerierten Mängel-Pins (siehe supabase_schema_v9_site_onboarding_and_plan_notes.sql).
-// Bewusst schlanker gehalten als die Pin-Datenschicht: kein Foto-/Aufgaben-/
-// Verlaufs-Anhang, keine Offline-Anlage-Warteschlange (siehe requireOnline-Guards in
+// Bewusst schlanker gehalten als die Pin-Datenschicht: kein Foto-/Verlaufs-Anhang,
+// keine Offline-Anlage-Warteschlange (siehe requireOnline-Guards in
 // App() bei den zugehörigen Handlern) — Notizen sind ein reines Vor-Ort-
 // Orientierungswerkzeug, keine dokumentationspflichtige Mängelerfassung.
 // ----------------------------------------------------------------------------------
@@ -1266,27 +1250,6 @@ async function updatePlanNote(noteId, fields, actor) {
 
 async function deletePlanNote(noteId) {
   const { error } = await supabase.from("plan_notes").delete().eq("id", noteId);
-  if (error) throw error;
-}
-
-async function addPinTodo(pinId, text, actor) {
-  const { data, error } = await supabase
-    .from("pin_todos")
-    .insert({ pin_id: pinId, text, completed: false, created_by: actor?.email || null })
-    .select()
-    .single();
-  if (error) throw error;
-  return data;
-}
-
-async function togglePinTodo(todoId, completed) {
-  const { data, error } = await supabase.from("pin_todos").update({ completed }).eq("id", todoId).select().single();
-  if (error) throw error;
-  return data;
-}
-
-async function deletePinTodo(todoId) {
-  const { error } = await supabase.from("pin_todos").delete().eq("id", todoId);
   if (error) throw error;
 }
 
@@ -1376,11 +1339,11 @@ async function updatePinPhotoUrl(photo, newDataUrl, actor) {
 // um das reine ANZEIGEN bereits vorhandener Dateien offline, hier um das SCHREIBEN
 // neuer/geänderter Daten.
 //
-// Bewusste Begrenzung des Umfangs: die Aufgabenverwaltung (Pin-Teilaufgaben/Todos)
-// sowie das Löschen/Bearbeiten einzelner Fotos bleiben an eine bestehende Verbindung
-// gebunden (siehe requireOnline-Guards in den jeweiligen Handlern in App()) — das
-// sind seltenere, weniger zeitkritische Baustellen-Aktionen, und ihr Wegfall im
-// Offline-Fall hält die Synchronisationslogik überschaubar und nachvollziehbar.
+// Bewusste Begrenzung des Umfangs: das Löschen/Bearbeiten einzelner Fotos bleibt an
+// eine bestehende Verbindung gebunden (siehe requireOnline-Guards in den jeweiligen
+// Handlern in App()) — das sind seltenere, weniger zeitkritische Baustellen-Aktionen,
+// und ihr Wegfall im Offline-Fall hält die Synchronisationslogik überschaubar und
+// nachvollziehbar.
 //
 // Bekannte, bewusst in Kauf genommene Grenzen (siehe Einordnung in der Auslieferung):
 // - localStorage ist auf wenige MB pro Origin begrenzt. Offline aufgenommene Fotos
@@ -2547,7 +2510,7 @@ function cropImageDataUrl(sourceDataUrl, centerXRatio, centerYRatio, cropRatio, 
   });
 }
 
-// Lädt für eine Liste von Etagen jeweils alle Pins inkl. Fotos/Aufgaben/Verlauf
+// Lädt für eine Liste von Etagen jeweils alle Pins inkl. Fotos/Verlauf
 // (siehe fetchPinsForFloor) und hängt sowohl eine Referenz auf die jeweilige Etage
 // als auch auf die konkrete Grundrissskizze (via pin.plan_id) an jeden Pin an —
 // vereinfacht Filtern/Sortieren über alle Etagen eines Projekts hinweg UND liefert
@@ -2995,40 +2958,6 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     doc.text(descLines, margin, dy);
     dy += descLines.length * 5 + 4;
 
-    // Aufgaben/Checkliste — bislang in KEINEM PDF-Export enthalten (Anforderung:
-    // "allen To-do-Aufgaben/Checklisten" im Gesamtexport). Erledigte Einträge in
-    // Graustufe statt Tintenfarbe, offene Einträge als leeres Kästchen — dieselbe
-    // Formsprache wie im Einzel-Pin-Export (siehe generateSinglePinPdf).
-    const todos = pin.pin_todos || [];
-    if (todos.length > 0) {
-      bold();
-      doc.text(`Aufgaben (${todos.filter((t) => t.completed).length}/${todos.length} erledigt):`, margin, dy);
-      dy += 6;
-      normal();
-      doc.setFontSize(9);
-      todos.forEach((todo) => {
-        const lines = doc.splitTextToSize(todo.text || "", contentWidth - 7);
-        if (dy + lines.length * 4.6 > pageHeight - margin) {
-          doc.addPage();
-          dy = margin;
-        }
-        doc.setDrawColor(148, 163, 184);
-        if (todo.completed) {
-          doc.setFillColor(16, 185, 129);
-          doc.roundedRect(margin, dy - 3, 3.2, 3.2, 0.6, 0.6, "F");
-          doc.setTextColor(100, 116, 139);
-        } else {
-          doc.roundedRect(margin, dy - 3, 3.2, 3.2, 0.6, 0.6, "S");
-          doc.setTextColor(0, 0, 0);
-        }
-        doc.text(lines, margin + 6.5, dy, { maxWidth: contentWidth - 6.5 });
-        doc.setTextColor(0, 0, 0);
-        dy += lines.length * 4.6 + 1.5;
-      });
-      doc.setFontSize(10);
-      dy += 3;
-    }
-
     // GUARANTEED UNIFORM IMAGE RESIZING: 2-Spalten-Raster mit fester Zeilenhöhe (siehe
     // PDF_PHOTO_GRID_COLS/PDF_PHOTO_GRID_ROW_HEIGHT_MM), seitenübergreifend falls nötig.
     // Fotos DIESES Pins werden vorab parallel geladen und auf ein einheitliches
@@ -3305,8 +3234,8 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
     // Netzwerk-Requests mehr aus — ein einzelnes fehlschlagendes Foto (CORS,
     // Netzwerkfehler, gelöschte Datei) verhindert dank des Graceful Fallbacks in
     // preloadPinPhotosForPdf NICHT die vollständige Fertigstellung des restlichen
-    // Berichts (alle anderen Fotos, Texte, Aufgaben und Karten werden trotzdem
-    // vollständig gedruckt).
+    // Berichts (alle anderen Fotos, Texte und Karten werden trotzdem vollständig
+    // gedruckt).
     const photoCache = await preloadPinPhotosForPdf(numberedPins);
 
     doc.addPage("a4", "portrait");
@@ -3334,7 +3263,6 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
     for (const pin of numberedPins) {
       const rowValues = buildFloorExportRowValues(pin, tradesById, floor.name);
       const photos = pin.pin_photos || [];
-      const todos = pin.pin_todos || [];
 
       // ---- Höhe messen (nichts wird hier gezeichnet) ----------------------------
       doc.setFontSize(15);
@@ -3371,23 +3299,13 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       const photoRows = Math.max(1, Math.ceil(photos.length / PDF_PHOTO_GRID_COLS));
       const photoSectionHeight = 9.5 + photoRows * PDF_PHOTO_GRID_ROW_HEIGHT_MM + (photoRows - 1) * PDF_PHOTO_GRID_GAP_MM;
 
-      // Aufgaben/Checkliste — volle Kartenbreite, unterhalb des Fotorasters, siehe
-      // Zeichnung weiter unten. Höhe wird hier nur GEMESSEN (splitTextToSize zeichnet
-      // nichts), damit die Seitenumbruch-Entscheidung der ganzen Karte sie korrekt
-      // mit einrechnet.
-      doc.setFontSize(9);
-      normal();
-      const todoLineSets = todos.map((todo) => doc.splitTextToSize(todo.text || "", contentWidth - 7));
-      const todosHeight =
-        todos.length > 0 ? 9.5 + todoLineSets.reduce((sum, lines) => sum + lines.length * 4.6 + 1.5, 0) : 0;
-
       const estimatedCardHeight =
-        headerBottomOffset + 6 + shortFieldsHeight + commentBlockHeight + 4 + photoSectionHeight + todosHeight + cardBottomGap;
+        headerBottomOffset + 6 + shortFieldsHeight + commentBlockHeight + 4 + photoSectionHeight + cardBottomGap;
 
       // ---- Seitenumbruch-Entscheidung: Karte als Ganzes auf eine neue Seite, wenn sie
       // hier nicht mehr vollständig Platz findet (y > margin verhindert eine leere
       // Endlosschleife, falls eine einzelne Karte selbst eine ganze Seite sprengt — in
-      // dem seltenen Fall greifen die Fortsetzungslogiken für Kommentar/Fotos/Aufgaben
+      // dem seltenen Fall greifen die Fortsetzungslogiken für Kommentar/Fotos
       // weiter unten). ----
       if (y + estimatedCardHeight > pageHeight - margin && y > margin) {
         doc.addPage("a4", "portrait");
@@ -3515,50 +3433,6 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
         photoY += PDF_PHOTO_GRID_ROW_HEIGHT_MM + PDF_PHOTO_GRID_GAP_MM;
       }
       let cardBottom = photoY - PDF_PHOTO_GRID_GAP_MM;
-
-      // ---- Aufgaben/Checkliste — volle Kartenbreite unterhalb des Fotorasters, ALLE
-      // Einträge (offen wie erledigt) mit Erledigt-Kennzeichnung, analog zum
-      // projektweiten Gesamtexport (generateProjectReportPdf). ----
-      if (todos.length > 0) {
-        let tdy = cardBottom + 4;
-        if (tdy + 8 > pageHeight - margin) {
-          doc.addPage("a4", "portrait");
-          pageWidth = doc.internal.pageSize.getWidth();
-          pageHeight = doc.internal.pageSize.getHeight();
-          tdy = margin;
-        }
-        doc.setFontSize(7.5);
-        bold();
-        mutedColor();
-        doc.text(`AUFGABEN (${todos.filter((t) => t.completed).length}/${todos.length} ERLEDIGT)`, margin, tdy);
-        inkColor();
-        tdy += 5.5;
-        doc.setFontSize(9);
-        normal();
-        todos.forEach((todo, idx) => {
-          const lines = todoLineSets[idx] && todoLineSets[idx].length ? todoLineSets[idx] : doc.splitTextToSize(todo.text || "", contentWidth - 7);
-          if (tdy + lines.length * 4.6 > pageHeight - margin) {
-            doc.addPage("a4", "portrait");
-            pageWidth = doc.internal.pageSize.getWidth();
-            pageHeight = doc.internal.pageSize.getHeight();
-            tdy = margin;
-          }
-          doc.setDrawColor(148, 163, 184);
-          if (todo.completed) {
-            doc.setFillColor(16, 185, 129);
-            doc.roundedRect(margin, tdy - 3, 3.2, 3.2, 0.6, 0.6, "F");
-            mutedColor();
-          } else {
-            doc.roundedRect(margin, tdy - 3, 3.2, 3.2, 0.6, 0.6, "S");
-            inkColor();
-          }
-          doc.text(lines, margin + 6.5, tdy, { maxWidth: contentWidth - 6.5 });
-          inkColor();
-          tdy += lines.length * 4.6 + 1.5;
-        });
-        doc.setDrawColor(226, 232, 240);
-        cardBottom = tdy;
-      }
 
       // Nächste Karte setzt direkt unterhalb des tiefsten Punkts dieser Karte fort —
       // daher der fließende, lückenlose Mehr-Pin-Fluss ohne erzwungene Seitenumbrüche.
@@ -3900,13 +3774,12 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
     commentY += 4.6;
   }
 
-  // ---- Ab hier volle Seitenbreite (nicht mehr zweispaltig): Aufgaben/Checkliste und
-  // ALLE Fotos, vollständig — die Anforderung an den Einzel-Pin-Export verlangt
-  // ausdrücklich "alle vollständigen Detaildaten (Fotos, To-dos, Beschreibungen)",
-  // nicht mehr nur ein einzelnes Vorschaufoto wie zuvor. sectionY startet unterhalb
-  // BEIDER Kopfspalten (Kommentar links, Minimap+Detail-Zoom rechts) — rightColumnBottom
-  // fließt nur ein, solange der Kommentar keinen Seitenumbruch ausgelöst hat (siehe
-  // pagedBroke), sonst bezieht es sich auf eine bereits verlassene Seite 1. ----
+  // ---- Ab hier volle Seitenbreite (nicht mehr zweispaltig): ALLE Fotos, vollständig,
+  // im selben 2-Spalten-Raster wie der Gesamt- und Geschoss-Export. sectionY startet
+  // unterhalb BEIDER Kopfspalten (Kommentar links, Minimap+Detail-Zoom rechts) —
+  // rightColumnBottom fließt nur ein, solange der Kommentar keinen Seitenumbruch
+  // ausgelöst hat (siehe pagedBroke), sonst bezieht es sich auf eine bereits
+  // verlassene Seite 1. ----
   let sectionY = (pagedBroke ? commentY : Math.max(commentY, rightColumnBottom)) + 6;
   const ensureSpace = (neededH) => {
     if (sectionY + neededH > activePageHeight - margin) {
@@ -3917,39 +3790,6 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
       pagedBroke = true;
     }
   };
-
-  // ---- Aufgaben / Checkliste — vollständig, wie im Pin-Modal geführt (offen/erledigt
-  // je eigenes Kästchen-Symbol, erledigte Einträge blass/durchgestrichen-ähnlich in
-  // Grauton statt Tintenfarbe, analog zur Lesbarkeit im Modal). ----
-  const todos = pin.pin_todos || [];
-  if (todos.length > 0) {
-    ensureSpace(10);
-    doc.setFontSize(7.5);
-    bold();
-    mutedColor();
-    doc.text(`AUFGABEN / CHECKLISTE (${todos.filter((t) => t.completed).length}/${todos.length} erledigt)`, margin, sectionY);
-    inkColor();
-    sectionY += 5;
-    normal();
-    doc.setFontSize(9.5);
-    todos.forEach((todo) => {
-      const lines = doc.splitTextToSize(todo.text || "", contentWidth - 7);
-      ensureSpace(lines.length * 4.6 + 1.5);
-      doc.setDrawColor(148, 163, 184);
-      if (todo.completed) {
-        doc.setFillColor(16, 185, 129);
-        doc.roundedRect(margin, sectionY - 3, 3.2, 3.2, 0.6, 0.6, "F");
-      } else {
-        doc.roundedRect(margin, sectionY - 3, 3.2, 3.2, 0.6, 0.6, "S");
-      }
-      if (todo.completed) mutedColor();
-      else inkColor();
-      doc.text(lines, margin + 6.5, sectionY, { maxWidth: contentWidth - 6.5 });
-      inkColor();
-      sectionY += lines.length * 4.6 + 1.5;
-    });
-    sectionY += 3;
-  }
 
   // ---- Fotos — vollständig, im selben 2-Spalten-Raster mit fester Zeilenhöhe wie der
   // Gesamt- und Geschoss-Export (siehe generateProjectReportPdf/
@@ -10359,7 +10199,7 @@ function FloorPlanView({
       </div>
 
       {/* Kompakte Pin-Liste unter dem Grundriss (Anforderung: Pin-Nummer, Titel/Gewerk,
-          Status, Anzahl To-dos — bewusst OHNE Fotos). Zeigt dieselbe, ggf. gefilterte
+          Status — bewusst OHNE Fotos). Zeigt dieselbe, ggf. gefilterte
           Teilmenge wie die Marker auf dem Plan direkt darüber (visiblePins) und bleibt
           damit konsistent mit der Filter-/Suchleiste; Klick auf eine Zeile öffnet
           denselben Pin wie ein Klick auf den Marker. Innerhalb einer eigenen,
@@ -10382,8 +10222,6 @@ function FloorPlanView({
           <div className="max-h-72 divide-y divide-slate-100 overflow-y-auto">
             {sortedListPins.map((pin) => {
               const s = STATUS[pin.status];
-              const todos = pin.pin_todos || [];
-              const todosDone = todos.filter((t) => t.completed).length;
               return (
                 <button
                   key={pin.id}
@@ -10404,9 +10242,6 @@ function FloorPlanView({
                     className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${s.bg} ${s.text}`}
                   >
                     <span className={`h-1.5 w-1.5 rounded-full ${s.dot}`} /> {s.label}
-                  </span>
-                  <span className="w-16 shrink-0 text-right text-[11px] font-medium text-slate-400">
-                    {todos.length > 0 ? `${todosDone}/${todos.length} To-do` : "–"}
                   </span>
                 </button>
               );
@@ -10458,7 +10293,7 @@ function FloorPlanHelpModal({ session, noteMode, onClose }) {
     {
       icon: Crosshair,
       title: "Kurzer Klick/Tipp auf einen Pin",
-      text: "= Details öffnen und bearbeiten (Fotos, Aufgaben, Status, Verlauf).",
+      text: "= Details öffnen und bearbeiten (Fotos, Status, Verlauf).",
     },
     {
       icon: Navigation,
@@ -11193,9 +11028,6 @@ function PinModal({
   onSaveFields,
   onDuplicate,
   onDelete,
-  onAddTodo,
-  onToggleTodo,
-  onRemoveTodo,
   onUploadPhotos,
   onRemovePhoto,
   onSaveMarkup,
@@ -11210,17 +11042,15 @@ function PinModal({
     dueDate: pin.due_date || "",
     area: pin.area || "",
   });
-  const [todoInput, setTodoInput] = useState("");
   const [lightboxSrc, setLightboxSrc] = useState(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   // Sicherheitsabfrage vor dem endgültigen Löschen eines Pins (siehe handleDeleteClick
   // unten) — vorher gab es einen "Löschen"-Button ohne jede Bestätigung, ein
-  // versehentlicher Klick hätte den Pin samt aller Fotos/To-dos/Verlauf sofort und
+  // versehentlicher Klick hätte den Pin samt aller Fotos und des Verlaufs sofort und
   // unwiderruflich entfernt.
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [uploadingPhotos, setUploadingPhotos] = useState(false);
-  const [todoBusy, setTodoBusy] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
   const [exportPdfError, setExportPdfError] = useState("");
   const [duplicating, setDuplicating] = useState(false); // siehe handleDuplicateClick
@@ -11234,9 +11064,9 @@ function PinModal({
 
   // "Mangel duplizieren" (siehe onDuplicate/handleDuplicatePin in App): übergibt den
   // vollständigen, GESPEICHERTEN Pin (nicht den ggf. noch unspeicherten draft) — App
-  // legt daraus sofort eine vollständige Kopie inkl. Aufgaben an (siehe duplicatePin)
-  // und öffnet direkt im Anschluss deren Bearbeitungs-Modal (siehe key={activePin.id}
-  // an der PinModal-Einbindung in App, sorgt für einen sauberen Formular-Reset beim
+  // legt daraus sofort eine vollständige Kopie an (siehe duplicatePin) und öffnet
+  // direkt im Anschluss deren Bearbeitungs-Modal (siehe key={activePin.id} an der
+  // PinModal-Einbindung in App, sorgt für einen sauberen Formular-Reset beim
   // Umspringen auf die neue Kopie).
   const handleDuplicateClick = async () => {
     if (readOnly || isNew || !onDuplicate || duplicating) return;
@@ -11253,7 +11083,6 @@ function PinModal({
   const titleDictation = useDictation({ getBaseText: () => draft.title, setText: (v) => update("title", v) });
   const descriptionDictation = useDictation({ getBaseText: () => draft.description, setText: (v) => update("description", v) });
 
-  const todos = pin.pin_todos || [];
   const photos = pin.pin_photos || [];
 
   const handleSave = async () => {
@@ -11318,18 +11147,6 @@ function PinModal({
       setExportPdfError("Export fehlgeschlagen.");
     } finally {
       setExportingPdf(false);
-    }
-  };
-
-  const addTodo = async () => {
-    if (readOnly || !todoInput.trim() || todoBusy) return;
-    const text = todoInput.trim();
-    setTodoInput("");
-    setTodoBusy(true);
-    try {
-      await onAddTodo(text);
-    } finally {
-      setTodoBusy(false);
     }
   };
 
@@ -11453,7 +11270,7 @@ function PinModal({
                 onChange={(e) => update("description", e.target.value)}
                 disabled={readOnly}
                 rows={3}
-                placeholder="Details zum Mangel oder zur Aufgabe…"
+                placeholder="Details zum Mangel…"
                 className="w-full resize-none rounded-lg border border-slate-200 px-3 py-2 pr-10 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
               />
               {!readOnly && (
@@ -11519,48 +11336,6 @@ function PinModal({
                 className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
               />
             </div>
-          </div>
-
-          {/* Todos */}
-          <div>
-            <label className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-              <ListChecks size={14} /> Aufgaben
-            </label>
-            <div className="space-y-1.5">
-              {todos.map((t) => (
-                <div key={t.id} className="group flex items-center gap-2 rounded-lg border border-slate-100 bg-slate-50 px-2.5 py-1.5">
-                  <button onClick={() => !readOnly && onToggleTodo(t)} disabled={readOnly} className="shrink-0 text-[#FF2A00] disabled:cursor-not-allowed">
-                    {t.completed ? <CheckSquare size={17} /> : <Square size={17} className="text-slate-400" />}
-                  </button>
-                  <span className={`flex-1 text-sm ${t.completed ? "text-slate-400 line-through" : "text-slate-700"}`}>{t.text}</span>
-                  {!readOnly && (
-                    <button onClick={() => onRemoveTodo(t.id)} className="text-slate-300 opacity-0 transition hover:text-rose-500 group-hover:opacity-100">
-                      <X size={14} />
-                    </button>
-                  )}
-                </div>
-              ))}
-              {todos.length === 0 && <p className="text-xs text-slate-400">Noch keine Aufgaben erfasst.</p>}
-            </div>
-            {!readOnly && (
-              <div className="mt-2 flex gap-2">
-                <input
-                  value={todoInput}
-                  onChange={(e) => setTodoInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && addTodo()}
-                  disabled={todoBusy}
-                  placeholder="Neue Aufgabe hinzufügen…"
-                  className="flex-1 rounded-lg border border-slate-200 px-3 py-1.5 text-sm outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
-                />
-                <button
-                  onClick={addTodo}
-                  disabled={todoBusy}
-                  className="flex items-center gap-1 rounded-lg bg-slate-100 px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {todoBusy ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
-                </button>
-              </div>
-            )}
           </div>
 
           {/* Photos */}
@@ -11675,7 +11450,7 @@ function PinModal({
                   title={
                     isNew
                       ? "Für einen gerade erst angelegten, noch leeren Pin nicht verfügbar"
-                      : "Sofort eine vollständige Kopie dieses Pins anlegen (inkl. aller Aufgaben), leicht versetzt daneben auf dem Plan"
+                      : "Sofort eine vollständige Kopie dieses Pins anlegen, leicht versetzt daneben auf dem Plan"
                   }
                   className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
                 >
@@ -11733,7 +11508,7 @@ function PinModal({
       {deleteConfirmOpen && (
         <ConfirmDialog
           title="Pin löschen"
-          message={`„${pin.title || "Ohne Titel"}" wird endgültig gelöscht — inklusive aller Fotos, Aufgaben und der Bearbeitungshistorie. Das kann nicht rückgängig gemacht werden.`}
+          message={`„${pin.title || "Ohne Titel"}" wird endgültig gelöscht — inklusive aller Fotos und der Bearbeitungshistorie. Das kann nicht rückgängig gemacht werden.`}
           confirmLabel="Endgültig löschen"
           busy={deleting}
           onCancel={() => setDeleteConfirmOpen(false)}
@@ -11747,7 +11522,7 @@ function PinModal({
 // ----------------------------------------------------------------------------------
 // SKIZZEN-NOTIZ BEARBEITEN — schlankes Modal für Text, Kategorie (Farbe) und
 // Verschieben/Löschen einer Plan-Notiz. Bewusst deutlich einfacher als PinModal
-// (kein Status, keine Priorität, keine Fotos/Aufgaben/Verlauf) — eine Notiz ist ein
+// (kein Status, keine Priorität, keine Fotos/Verlauf) — eine Notiz ist ein
 // reiner Vor-Ort-Hinweis, keine dokumentationspflichtige Mängelerfassung.
 // ----------------------------------------------------------------------------------
 function PlanNoteModal({ note, isNew, readOnly, onRequestLogin, onClose, onSave, onDelete }) {
@@ -12098,7 +11873,7 @@ function App() {
   const [floorPlans, setFloorPlans] = useState([]); // Grundrisskizzen der aktuell geöffneten Etage (inkl. leichter Pin-Zusammenfassung)
   const [loadingFloorPlans, setLoadingFloorPlans] = useState(false);
 
-  const [pins, setPins] = useState([]); // Pins der aktuell geöffneten Grundrissskizze, inkl. pin_todos & pin_photos
+  const [pins, setPins] = useState([]); // Pins der aktuell geöffneten Grundrissskizze, inkl. pin_photos
   const [loadingPins, setLoadingPins] = useState(false);
 
   // Skizzen-Notizen (Plan Annotations) der aktuell geöffneten Grundrissskizze — werden
@@ -13185,7 +12960,6 @@ function App() {
           updated_at: nowIso,
           created_by: currentActor?.email || null,
           updated_by: currentActor?.email || null,
-          pin_todos: [],
           pin_photos: [],
           pin_activity_log: [
             {
@@ -13227,16 +13001,14 @@ function App() {
 
   // "Mangel duplizieren" (siehe Button im PinModal-Kopf, nur bei bestehenden Pins
   // sichtbar): legt SOFORT eine vollständige Kopie des betrachteten Pins an (Gewerk,
-  // Bereich, Beschreibung, Status, Priorität, Frist und alle Aufgaben, siehe
-  // duplicatePin) minimal versetzt daneben und öffnet direkt im Anschluss das
-  // Bearbeitungs-Modal der neuen Kopie — kein Zwischenschritt über ein Klemmbrett und
-  // einen weiteren Klick auf den Plan mehr nötig. Bewusst die GESPEICHERTEN Pin-Felder
-  // (der volle pin-Prop aus PinModal, nicht der evtl. noch unspeicherte Modal-Entwurf)
-  // — "einen bestehenden, dokumentierten Mangel duplizieren", nicht "einen halb
-  // ausgefüllten Entwurf klonen". Wie das Anlegen/Ändern von Aufgaben (siehe
-  // handleAddTodo/handleToggleTodo/handleRemoveTodo, die hier ja mitkopiert werden)
-  // bewusst an eine bestehende Verbindung gebunden (requireOnline) statt zusätzlich
-  // eine eigene Offline-Warteschlangen-Variante einzuführen.
+  // Bereich, Beschreibung, Status, Priorität, Frist, siehe duplicatePin) minimal
+  // versetzt daneben und öffnet direkt im Anschluss das Bearbeitungs-Modal der neuen
+  // Kopie — kein Zwischenschritt über ein Klemmbrett und einen weiteren Klick auf den
+  // Plan mehr nötig. Bewusst die GESPEICHERTEN Pin-Felder (der volle pin-Prop aus
+  // PinModal, nicht der evtl. noch unspeicherte Modal-Entwurf) — "einen bestehenden,
+  // dokumentierten Mangel duplizieren", nicht "einen halb ausgefüllten Entwurf
+  // klonen". Bewusst an eine bestehende Verbindung gebunden (requireOnline) statt
+  // zusätzlich eine eigene Offline-Warteschlangen-Variante einzuführen.
   const handleDuplicatePin = async (sourcePin) => {
     if (!requireOnline("Ein Mangel kann")) return;
     try {
@@ -13379,12 +13151,12 @@ function App() {
     }
   };
 
-  // Die gesamte Aufgabenverwaltung (unten) bleibt bewusst an eine bestehende
-  // Verbindung gebunden (siehe Kommentar am Anfang des Offline-Moduls in der
-  // Datenschicht) — requireOnline gibt dafür eine klare, sofortige Rückmeldung statt
-  // eines rohen Netzwerkfehlers. Das Löschen eines Pins selbst ist seit der
-  // Erweiterung der Offline-Synchronisation um Löschungen (siehe handleDeletePin/
-  // "delete_pin" in flushSyncQueue) NICHT mehr an requireOnline gebunden.
+  // requireOnline gibt eine klare, sofortige Rückmeldung statt eines rohen
+  // Netzwerkfehlers, für alle Aktionen, die bewusst an eine bestehende Verbindung
+  // gebunden bleiben (siehe Kommentar am Anfang des Offline-Moduls in der
+  // Datenschicht). Das Löschen eines Pins selbst ist seit der Erweiterung der
+  // Offline-Synchronisation um Löschungen (siehe handleDeletePin/"delete_pin" in
+  // flushSyncQueue) NICHT mehr an requireOnline gebunden.
   const requireOnline = (actionLabel) => {
     if (online) return true;
     setGlobalError(`${actionLabel} ist offline nicht möglich. Bitte bei bestehender Internetverbindung erneut versuchen.`);
@@ -13497,78 +13269,6 @@ function App() {
       console.error("Notiz konnte nicht gelöscht werden:", err);
       setGlobalError("Die Notiz konnte nicht gelöscht werden. Bitte erneut versuchen.");
       throw err;
-    }
-  };
-
-  // -------------------------------------------------------------------------------
-  // TODOS
-  // -------------------------------------------------------------------------------
-
-  const handleAddTodo = async (pinId, text) => {
-    if (!requireOnline("Eine Aufgabe kann")) return;
-    try {
-      const todo = await addPinTodo(pinId, text, currentActor);
-      const activity = await logPinActivity(pinId, "todo_added", `Aufgabe hinzugefügt: „${text}"`, currentActor);
-      setPins((prev) =>
-        prev.map((p) =>
-          p.id === pinId
-            ? { ...p, pin_todos: [...(p.pin_todos || []), todo], pin_activity_log: [...(p.pin_activity_log || []), activity] }
-            : p
-        )
-      );
-    } catch (err) {
-      console.error("Aufgabe konnte nicht hinzugefügt werden:", err);
-      setGlobalError("Die Aufgabe konnte nicht gespeichert werden.");
-    }
-  };
-
-  const handleToggleTodo = async (pinId, todo) => {
-    if (!requireOnline("Der Status einer Aufgabe kann")) return;
-    try {
-      const updated = await togglePinTodo(todo.id, !todo.completed);
-      const activity = await logPinActivity(
-        pinId,
-        updated.completed ? "todo_completed" : "todo_reopened",
-        `Aufgabe „${todo.text}" ${updated.completed ? "erledigt" : "wieder geöffnet"}`,
-        currentActor
-      );
-      setPins((prev) =>
-        prev.map((p) =>
-          p.id === pinId
-            ? {
-                ...p,
-                pin_todos: (p.pin_todos || []).map((t) => (t.id === todo.id ? updated : t)),
-                pin_activity_log: [...(p.pin_activity_log || []), activity],
-              }
-            : p
-        )
-      );
-    } catch (err) {
-      console.error("Aufgabe konnte nicht aktualisiert werden:", err);
-      setGlobalError("Der Status der Aufgabe konnte nicht aktualisiert werden.");
-    }
-  };
-
-  const handleRemoveTodo = async (pinId, todoId) => {
-    if (!requireOnline("Eine Aufgabe kann")) return;
-    const todo = pins.find((p) => p.id === pinId)?.pin_todos?.find((t) => t.id === todoId);
-    try {
-      await deletePinTodo(todoId);
-      const activity = await logPinActivity(pinId, "todo_removed", `Aufgabe entfernt: „${todo?.text || ""}"`, currentActor);
-      setPins((prev) =>
-        prev.map((p) =>
-          p.id === pinId
-            ? {
-                ...p,
-                pin_todos: (p.pin_todos || []).filter((t) => t.id !== todoId),
-                pin_activity_log: [...(p.pin_activity_log || []), activity],
-              }
-            : p
-        )
-      );
-    } catch (err) {
-      console.error("Aufgabe konnte nicht gelöscht werden:", err);
-      setGlobalError("Die Aufgabe konnte nicht gelöscht werden.");
     }
   };
 
@@ -13971,8 +13671,8 @@ function App() {
           // direkt auf newPin.id, ohne das Modal zwischendurch zu schließen). Ohne diesen
           // Key würde React dieselbe Komponenten-Instanz weiterverwenden und der interne
           // draft-Formzustand (Titel, Beschreibung, Status, …) bliebe fälschlich auf den
-          // Werten des vorherigen Pins stehen, obwohl Kopfzeile, Fotos und Aufgaben
-          // bereits korrekt die neue Kopie zeigen.
+          // Werten des vorherigen Pins stehen, obwohl Kopfzeile und Fotos bereits
+          // korrekt die neue Kopie zeigen.
           key={activePin.id}
           pin={activePin}
           pins={pins}
@@ -13990,9 +13690,6 @@ function App() {
           onSaveFields={(fields) => handleSaveFields(activePin.id, fields)}
           onDuplicate={handleDuplicatePin}
           onDelete={() => handleDeletePin(activePin.id)}
-          onAddTodo={(text) => handleAddTodo(activePin.id, text)}
-          onToggleTodo={(todo) => handleToggleTodo(activePin.id, todo)}
-          onRemoveTodo={(todoId) => handleRemoveTodo(activePin.id, todoId)}
           onUploadPhotos={(files) => handleUploadPhotos(activePin.id, files)}
           onRemovePhoto={(photo) => handleRemovePhoto(activePin.id, photo)}
           onSaveMarkup={(photo, dataUrl) => handleSavePhotoMarkup(activePin.id, photo, dataUrl)}
@@ -14067,7 +13764,7 @@ function App() {
       {deleteConfirm && (
         <ConfirmDialog
           title="Projekt wirklich löschen?"
-          message={`„${deleteConfirm.target.name}" wird inklusive aller Etagen, Pins, Aufgaben und Fotos unwiderruflich gelöscht.`}
+          message={`„${deleteConfirm.target.name}" wird inklusive aller Etagen, Pins und Fotos unwiderruflich gelöscht.`}
           onConfirm={confirmDeleteProject}
           onCancel={() => setDeleteConfirm(null)}
           busy={deleteBusy}
