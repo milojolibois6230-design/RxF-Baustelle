@@ -8650,12 +8650,31 @@ function EditFloorModal({ floor, onClose, onSave }) {
 // Haustechnik").
 // ----------------------------------------------------------------------------------
 
+// Kleines Icon je erkannter Dateiart, ausschließlich für die Mehrfachauswahl-Liste
+// unten (siehe files.length > 1 -Zweig) — die Einzeldatei-Vorschau direkt in der
+// Dropzone (Bild/PDF/CAD-Karte) bleibt davon unberührt und unverändert.
+function FloorUploadFileTypeIcon({ kind, size = 15 }) {
+  if (kind === "pdf") return <FileText size={size} className="shrink-0 text-rose-500" />;
+  if (kind === "cad") return <Ruler size={size} className="shrink-0 text-sky-500" />;
+  return <ImagePlus size={size} className="shrink-0 text-slate-400" />;
+}
+
+// MULTI-FILE UPLOAD FÜR GRUNDRISSSKIZZEN: der Datei-Input erlaubt jetzt Mehrfach-
+// auswahl (multiple) sowohl über den Datei-Browser als auch per Drag & Drop mehrerer
+// Dateien gleichzeitig. Bei genau EINER ausgewählten Datei verhält sich das Modal exakt
+// wie zuvor (editierbares Namensfeld, Einzeldatei-Vorschau in der Dropzone). Bei
+// MEHREREN Dateien entfällt das Namensfeld (jede Skizze bekommt automatisch den
+// jeweiligen Dateinamen als Titel, siehe handleSubmit) und die Dropzone zeigt
+// stattdessen eine Liste aller ausgewählten Dateien mit der Möglichkeit, einzelne
+// davon vor dem Speichern wieder zu entfernen. Der Upload selbst läuft sequenziell
+// (siehe App -> handleAddFloorPlanSketch), mit einem fortlaufenden "Lade Skizze X von
+// Y hoch…"-Fortschrittshinweis.
 function NewFloorPlanModal({ floor, onClose, onSave }) {
   const [name, setName] = useState("");
-  const [file, setFile] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState(null);
-  const [fileKind, setFileKind] = useState(null); // "image" | "pdf" | "cad"
-  const [fileExt, setFileExt] = useState(null);
+  const [files, setFiles] = useState([]); // File[]
+  const [previewUrl, setPreviewUrl] = useState(null); // nur relevant bei genau einer Datei
+  const [fileKind, setFileKind] = useState(null); // "image" | "pdf" | "cad" — nur bei einer Datei
+  const [fileExt, setFileExt] = useState(null); // nur bei einer Datei
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -8664,56 +8683,121 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
   // wird. Bewusst als eigener, informativer Status statt über error angezeigt: kein
   // Fehler, sondern ein "läuft gerade"-Hinweis, während der Upload weiterläuft.
   const [compressionNotice, setCompressionNotice] = useState(null);
+  // Fortschritt über die gesamte Batch hinweg (nur bei mehreren Dateien sichtbar, siehe
+  // unten) — { current, total }, current ist 1-basiert und bezeichnet die gerade
+  // hochladende Datei.
+  const [uploadProgress, setUploadProgress] = useState(null);
   const inputRef = useRef(null);
 
-  const acceptFile = (f) => {
-    if (!f || submitting) return;
-    const info = getFileInfo(f);
-    if (!info) {
-      setError("Bitte nur PNG, JPG, WebP, PDF, DWG oder DXF hochladen.");
+  // Aktualisiert die Einzeldatei-Vorschau (Bild/PDF/CAD-Karte), sobald genau eine Datei
+  // in der Auswahl liegt — bei mehreren Dateien wird stattdessen die Liste weiter unten
+  // gerendert und diese Vorschau bleibt leer.
+  useEffect(() => {
+    if (files.length !== 1) {
+      setPreviewUrl(null);
+      setFileKind(null);
+      setFileExt(null);
       return;
     }
-    setError("");
+    const f = files[0];
+    const info = getFileInfo(f);
     // Lokale Vorschau ausschließlich für die Anzeige in diesem Modal. Die tatsächlich
     // persistierte URL kommt erst nach dem Upload aus Supabase Storage (onSave -> createFloorPlanSketch).
     const objectUrl = URL.createObjectURL(f);
-    setFile(f);
     setPreviewUrl(objectUrl);
-    setFileKind(info.kind);
-    setFileExt(info.ext);
-    if (!name) {
-      setName(f.name.replace(/\.[^/.]+$/, ""));
+    setFileKind(info?.kind || null);
+    setFileExt(info?.ext || null);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [files]);
+
+  const acceptFiles = (fileList) => {
+    if (!fileList || fileList.length === 0 || submitting) return;
+    const incoming = Array.from(fileList);
+    const valid = [];
+    let skipped = 0;
+    for (const f of incoming) {
+      if (getFileInfo(f)) valid.push(f);
+      else skipped += 1;
     }
+    if (valid.length === 0) {
+      setError("Bitte nur PNG, JPG, WebP, SVG, PDF, DWG oder DXF hochladen.");
+      return;
+    }
+    setError(skipped > 0 ? `${skipped} Datei${skipped === 1 ? "" : "en"} mit nicht unterstütztem Format wurde${skipped === 1 ? "" : "n"} übersprungen.` : "");
+    setFiles((prev) => {
+      const next = [...prev, ...valid];
+      // Beim allerersten Hinzufügen einer einzelnen Datei den Namen wie bisher aus dem
+      // Dateinamen vorbefüllen. Kommen dadurch mehrere Dateien zusammen, spielt der Name
+      // hier keine Rolle mehr (siehe handleSubmit — jede Datei bekommt dann ihren
+      // eigenen Dateinamen als Titel).
+      if (prev.length === 0 && valid.length === 1 && !name) {
+        setName(valid[0].name.replace(/\.[^/.]+$/, ""));
+      }
+      return next;
+    });
+  };
+
+  const removeFileAt = (idx) => {
+    if (submitting) return;
+    setFiles((prev) => prev.filter((_, i) => i !== idx));
   };
 
   const handleDrop = (e) => {
     e.preventDefault();
     setIsDragging(false);
     if (submitting) return;
-    acceptFile(e.dataTransfer.files?.[0]);
+    acceptFiles(e.dataTransfer.files);
   };
 
   const handleSubmit = async () => {
-    if (!name.trim()) {
-      setError("Bitte einen Namen für die Grundrissskizze vergeben.");
+    if (files.length === 0) {
+      setError("Bitte mindestens eine Grundriss-Datei hochladen.");
       return;
     }
-    if (!file) {
-      setError("Bitte eine Grundriss-Datei hochladen.");
+    if (files.length === 1 && !name.trim()) {
+      setError("Bitte einen Namen für die Grundrissskizze vergeben.");
       return;
     }
     setError("");
     setCompressionNotice(null);
     setSubmitting(true);
+    const total = files.length;
+    setUploadProgress({ current: 0, total });
+    // Bei genau einer Datei bleibt der Titel frei editierbar (wie bisher). Bei mehreren
+    // Dateien wird pro Datei automatisch deren ursprünglicher Dateiname (ohne Endung)
+    // als Titel verwendet (siehe ANFORDERUNG "Multi-File Upload für Grundrissskizzen").
+    const entries =
+      files.length === 1
+        ? [{ name: name.trim(), file: files[0] }]
+        : files.map((f) => ({ name: f.name.replace(/\.[^/.]+$/, "") || f.name, file: f }));
+    // Lokal (nicht als State) mitgeführt, damit im catch-Block unten synchron feststeht,
+    // wie viele Dateien vor einem Fehlschlag bereits erfolgreich gespeichert wurden —
+    // State-Updates aus onProgress unten sind für diesen Zweck zu asynchron.
+    let lastCompletedIndex = 0;
     try {
-      await onSave(name.trim(), file, setCompressionNotice);
+      await onSave(entries, (current, totalCount, statusMessage) => {
+        lastCompletedIndex = current;
+        setUploadProgress({ current, total: totalCount });
+        setCompressionNotice(statusMessage || null);
+      });
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
-      console.error("Grundrissskizze konnte nicht gespeichert werden:", err);
-      setError(err?.message || "Die Grundrissskizze konnte nicht gespeichert werden. Bitte erneut versuchen.");
+      console.error("Grundrissskizze(n) konnte(n) nicht gespeichert werden:", err);
+      setError(
+        total > 1
+          ? `${err?.message || "Ein Fehler ist aufgetreten."} (${Math.max(lastCompletedIndex - 1, 0)} von ${total} Skizzen wurden bereits gespeichert.)`
+          : err?.message || "Die Grundrissskizze konnte nicht gespeichert werden. Bitte erneut versuchen."
+      );
+      // Bereits erfolgreich hochgeladene Dateien aus der lokalen Auswahl entfernen, damit
+      // ein erneutes Speichern nicht versehentlich Duplikate anlegt — nur die ab der
+      // fehlgeschlagenen Datei verbleiben zum erneuten Versuch.
+      if (total > 1) {
+        setFiles((prev) => prev.slice(Math.max(lastCompletedIndex - 1, 0)));
+      }
     } finally {
       setSubmitting(false);
       setCompressionNotice(null);
+      setUploadProgress(null);
     }
   };
 
@@ -8735,26 +8819,37 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
         </div>
 
         <div className={MODAL_BODY_SCROLL}>
-          <div>
-            <FieldLabel>Name der Grundrissskizze</FieldLabel>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              disabled={submitting}
-              placeholder="z.B. Grundriss Gesamt / Bereich A Nord"
-              className={TEXT_INPUT_CLASS}
-            />
-          </div>
+          {files.length <= 1 && (
+            <div>
+              <FieldLabel>Name der Grundrissskizze</FieldLabel>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={submitting}
+                placeholder="z.B. Grundriss Gesamt / Bereich A Nord"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+          )}
+          {files.length > 1 && (
+            <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-xs text-slate-500 ring-1 ring-inset ring-slate-200">
+              {files.length} Dateien ausgewählt — jede Skizze wird automatisch mit ihrem Dateinamen als Titel angelegt.
+            </p>
+          )}
 
           <div>
             <FieldLabel>{FLOOR_UPLOAD_HINT}</FieldLabel>
             <input
               ref={inputRef}
               type="file"
+              multiple
               accept={FLOOR_UPLOAD_ACCEPT}
               className="hidden"
               disabled={submitting}
-              onChange={(e) => acceptFile(e.target.files?.[0])}
+              onChange={(e) => {
+                acceptFiles(e.target.files);
+                e.target.value = ""; // erlaubt erneutes Auswählen derselben Datei(en)
+              }}
             />
             <div
               onClick={() => !submitting && inputRef.current?.click()}
@@ -8768,39 +8863,86 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
                 submitting ? "cursor-not-allowed opacity-60" : ""
               } ${isDragging ? "border-[#FF2A00] bg-red-50" : "border-slate-300 bg-slate-50 hover:border-[#FF2A00] hover:bg-red-50/50"}`}
             >
-              {!previewUrl && (
+              {files.length === 0 && (
                 <>
                   <UploadCloud size={28} className={isDragging ? "text-[#FF2A00]" : "text-slate-400"} />
-                  <p className="mt-2 text-sm font-medium text-slate-600">Datei hierher ziehen oder klicken</p>
-                  <p className="mt-0.5 text-xs text-slate-400">PNG, JPG, WebP, PDF, DWG oder DXF</p>
+                  <p className="mt-2 text-sm font-medium text-slate-600">Datei(en) hierher ziehen oder klicken</p>
+                  <p className="mt-0.5 text-xs text-slate-400">PNG, JPG, WebP, PDF, DWG oder DXF — Mehrfachauswahl möglich</p>
                 </>
               )}
-              {previewUrl && fileKind === "image" && (
+              {files.length === 1 && previewUrl && fileKind === "image" && (
                 <div className="w-full">
                   <img src={previewUrl} alt="Vorschau" className="mx-auto max-h-40 rounded-lg object-contain shadow-sm" />
-                  <p className="mt-2 text-xs font-medium text-slate-500">{file?.name} — klicken zum Ändern</p>
+                  <p className="mt-2 text-xs font-medium text-slate-500">{files[0]?.name} — klicken zum Ändern oder Ergänzen</p>
                 </div>
               )}
-              {previewUrl && fileKind === "pdf" && (
+              {files.length === 1 && previewUrl && fileKind === "pdf" && (
                 <div className="w-full">
                   <div className="mx-auto flex h-24 w-20 flex-col items-center justify-center rounded-lg bg-white shadow-sm ring-1 ring-slate-200">
                     <FileText size={26} className="text-rose-500" />
                     <span className="mt-1 text-[10px] font-semibold text-slate-500">PDF</span>
                   </div>
-                  <p className="mt-2 text-xs font-medium text-slate-500">{file?.name} — klicken zum Ändern</p>
+                  <p className="mt-2 text-xs font-medium text-slate-500">{files[0]?.name} — klicken zum Ändern oder Ergänzen</p>
                 </div>
               )}
-              {previewUrl && fileKind === "cad" && (
+              {files.length === 1 && previewUrl && fileKind === "cad" && (
                 <div className="w-full">
                   <div className="mx-auto flex h-24 w-24 flex-col items-center justify-center rounded-lg bg-[#0b1220] shadow-sm ring-1 ring-sky-400/30">
                     <Ruler size={24} className="text-sky-300" />
                     <span className="mt-1 text-[10px] font-bold uppercase tracking-wider text-sky-300">{fileExt}</span>
                   </div>
-                  <p className="mt-2 text-xs font-medium text-slate-500">{file?.name} — klicken zum Ändern</p>
+                  <p className="mt-2 text-xs font-medium text-slate-500">{files[0]?.name} — klicken zum Ändern oder Ergänzen</p>
                   <p className="mt-0.5 text-[11px] text-slate-400">CAD-Datei erkannt — wird als Blueprint-Vorschau dargestellt.</p>
                 </div>
               )}
+              {files.length > 1 && (
+                <div className="w-full">
+                  <UploadCloud size={22} className="mx-auto text-slate-400" />
+                  <p className="mt-1.5 text-xs font-medium text-slate-500">Weitere Dateien hierher ziehen oder klicken</p>
+                </div>
+              )}
             </div>
+
+            {/* Liste der ausgewählten Dateien mit Entfernen-Möglichkeit — nur bei
+                mehreren Dateien sichtbar, die Einzeldatei-Vorschau oben deckt den
+                Ein-Datei-Fall bereits vollständig ab. */}
+            {files.length > 1 && (
+              <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-lg ring-1 ring-inset ring-slate-200">
+                {files.map((f, idx) => {
+                  const info = getFileInfo(f);
+                  return (
+                    <li
+                      key={`${f.name}-${f.size}-${f.lastModified}-${idx}`}
+                      className="flex items-center gap-2 border-b border-slate-100 px-2.5 py-1.5 text-xs last:border-b-0"
+                    >
+                      <FloorUploadFileTypeIcon kind={info?.kind} />
+                      <span className="min-w-0 flex-1 truncate text-slate-600">{f.name}</span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeFileAt(idx);
+                        }}
+                        disabled={submitting}
+                        className="shrink-0 rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-rose-600 disabled:opacity-50"
+                        aria-label={`${f.name} entfernen`}
+                      >
+                        <X size={13} />
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            {/* Fortschritt über die gesamte Batch — nur bei mehreren Dateien relevant,
+                bei einer einzelnen Datei bleibt die bisherige Button-Beschriftung
+                (siehe Speichern-Button unten) ausreichend. */}
+            {submitting && uploadProgress && uploadProgress.total > 1 && (
+              <p className="mt-1.5 text-xs font-semibold text-slate-600">
+                Lade Skizze {uploadProgress.current} von {uploadProgress.total} hoch…
+              </p>
+            )}
             {/* Toast-Hinweis der automatischen PDF-Vorab-Komprimierung (siehe
                 uploadFloorPlan/compressPdfForUpload) — bewusst amber/informativ statt
                 rot, ist kein Fehler, sondern ein "läuft gerade"-Status. */}
@@ -8827,7 +8969,15 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
             className={BTN_PRIMARY}
           >
             {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-            {submitting ? (compressionNotice ? "Wird optimiert…" : "Wird hochgeladen…") : "Grundrissskizze speichern"}
+            {submitting
+              ? uploadProgress && uploadProgress.total > 1
+                ? `Lade Skizze ${uploadProgress.current} von ${uploadProgress.total} hoch…`
+                : compressionNotice
+                  ? "Wird optimiert…"
+                  : "Wird hochgeladen…"
+              : files.length > 1
+                ? `${files.length} Grundrissskizzen speichern`
+                : "Grundrissskizze speichern"}
           </button>
         </div>
       </div>
@@ -13495,13 +13645,41 @@ function App() {
     setFloorPlanModalOpen(true);
   };
 
-  const handleAddFloorPlanSketch = async (name, file, onStatusMessage) => {
+  // MULTI-FILE UPLOAD FÜR GRUNDRISSSKIZZEN: entries ist ein Array aus { name, file }
+  // (siehe NewFloorPlanModal — bei genau einer Datei ein Array mit einem Eintrag, bei
+  // mehreren Dateien ein Eintrag je ausgewählter Datei mit deren Dateinamen als Titel).
+  // Die Dateien werden bewusst SEQUENZIELL (nicht per Promise.all) hochgeladen: jede
+  // Grundrissdatei löst bereits für sich genommen einen mehrstufigen Vorgang aus
+  // (optionale PDF-Komprimierung, Kachel-Pyramiden-Erzeugung für Raster-Bilder, siehe
+  // uploadFloorPlan) — mehrere davon gleichzeitig würden die Bandbreite und den
+  // Hauptthread auf genau den Tablets unnötig belasten, für die die Kachel-Pyramide
+  // ursprünglich eingeführt wurde. Sequenziell lässt sich außerdem der geforderte "Lade
+  // Skizze X von Y hoch…"-Fortschritt exakt abbilden. onProgress(current, total,
+  // statusMessage) wird vor jeder Datei mit dem laufenden Index aufgerufen und danach
+  // erneut für Zwischenstatus-Meldungen (z.B. PDF-Komprimierung) durchgereicht.
+  const handleAddFloorPlanSketch = async (entries, onProgress) => {
     if (!selectedFloorId || !selectedProjectId) return;
-    const newPlan = await createFloorPlanSketch(selectedFloorId, selectedProjectId, name, file, onStatusMessage);
-    setFloorPlans((prev) => [...prev, { ...newPlan, pins: [] }]);
+    for (let i = 0; i < entries.length; i++) {
+      const { name, file } = entries[i];
+      onProgress?.(i + 1, entries.length, null);
+      const newPlan = await createFloorPlanSketch(
+        selectedFloorId,
+        selectedProjectId,
+        name,
+        file,
+        (statusMessage) => onProgress?.(i + 1, entries.length, statusMessage)
+      );
+      // Jede erfolgreich gespeicherte Skizze wird SOFORT übernommen (nicht erst nach
+      // der gesamten Batch) — schlägt eine spätere Datei fehl, bleiben die bereits
+      // hochgeladenen Skizzen dadurch korrekt sichtbar und konsistent mit der
+      // Datenbank, statt durch einen einzigen Fehlschlag am Ende verworfen zu werden.
+      setFloorPlans((prev) => [...prev, { ...newPlan, pins: [] }]);
+    }
     setFloorPlanModalOpen(false);
     // Fehler werden NICHT hier gefangen: NewFloorPlanModal wartet auf dieses Promise
-    // und zeigt einen Fehlertext direkt im Modal, falls Upload oder Insert scheitern.
+    // und zeigt einen Fehlertext direkt im Modal, falls Upload oder Insert scheitern —
+    // das Modal bleibt in diesem Fall offen, bereits erfolgreich hochgeladene Dateien
+    // sind zu diesem Zeitpunkt aber schon oben in floorPlans übernommen.
   };
 
   const openEditFloorPlanModal = (plan) => {
