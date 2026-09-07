@@ -5194,10 +5194,28 @@ function getPdfRasterRenderScaleCap() {
 // Re-Rendering, siehe renderPdfPageToSvgElement-Kommentar oben): erst ab dieser
 // zusätzlichen Zoomstufe gegenüber der zuletzt gerenderten Auflösung wird die
 // Bühne mit höherer Auflösung neu gerendert — verhindert unnötige Neu-Renderings
-// bei jeder minimalen Mausrad-/Pinch-Bewegung. 180ms Debounce liegt in der vom
-// Auftrag vorgegebenen Spanne von 150-200ms.
+// bei jeder minimalen Mausrad-/Pinch-Bewegung.
+//
+// IPAD-TOUCH-RELEASE-FIX (siehe Einordnung in der Antwort): auf Basis eines echten
+// Debug-Protokolls vom iPad, das eine finger-drop → release-end-Abfolge in sehr kurzem
+// zeitlichem Abstand zeigte, wurde der Debounce von zuvor 180ms auf jetzt 350ms
+// angehoben — innerhalb der angeforderten Spanne von 300-500ms. Der bisherige Wert
+// (180ms) war ursprünglich für eine frühere, andere Anforderung mit einer Spanne von
+// 150-200ms festgelegt worden; diese neue, höhere Untergrenze ersetzt sie bewusst.
+// Wichtig: dieser Timer läuft bereits seit jeher NUR an, nachdem sich zoomScale/scale
+// eine gewisse Zeit NICHT mehr geändert hat (jede weitere Änderung setzt ihn zurück,
+// siehe useEffect-Dependency unten) — während einer laufenden, durchgehenden Pinch-
+// Geste feuert er dadurch nie. Zusätzlich NEU: touchReleaseTick (siehe FloorPlanView)
+// wird als weiterer Auslöser ergänzt, der GENAU dann hochzählt, wenn der letzte Finger
+// abhebt — dadurch startet die Debounce-Uhr zuverlässig auch dann neu ab dem
+// tatsächlichen Loslass-Zeitpunkt, wenn kurz zuvor zufällig keine Skalierungsänderung
+// mehr registriert wurde. Und als zusätzliches Sicherheitsnetz prüft der Timer bei
+// seinem Ablauf über activePointersRef (siehe unten) erneut, ob wirklich kein Finger
+// mehr aufliegt — läuft in der seltenen Zwischenzeit doch schon wieder eine neue Geste,
+// wird das teure Neu-Rendern übersprungen, statt ausgerechnet in dieses neue
+// Touch-Ereignis hinein zu rendern.
 const PDF_RASTER_RERENDER_ZOOM_FACTOR = 1.15;
-const PDF_RASTER_RERENDER_DEBOUNCE_MS = 180;
+const PDF_RASTER_RERENDER_DEBOUNCE_MS = 350;
 
 // Wartet auf `promise`, bricht aber nach `ms` mit einer Ablehnung ab, falls sie bis
 // dahin nicht abgeschlossen ist — verhindert, dass ein hängendes (nicht fehlschlagendes,
@@ -5360,7 +5378,10 @@ function isRenderCancelledError(err) {
   return err?.name === "RenderingCancelledException";
 }
 
-const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, ref) {
+const PdfPlanCanvas = forwardRef(function PdfPlanCanvas(
+  { url, zoomScale = 1, touchReleaseTick = 0, activePointersRef = null },
+  ref
+) {
   const hostRef = useRef(null); // DOM-Container, in den je nach Rendering-Stufe entweder das SVG- oder das Canvas-Element eingehängt wird
   const [status, setStatus] = useState("loading"); // "loading" | "ready" | "error"
   // Offline-Asset-Cache (siehe useOfflineCapableAssetUrl oben): online identisch mit
@@ -5536,6 +5557,15 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
     const myGeneration = loadGenerationRef.current;
     const timer = setTimeout(async () => {
       if (loadGenerationRef.current !== myGeneration) return; // zwischenzeitlich neuer Plan geladen
+      // IPAD-TOUCH-RELEASE-FIX: zusätzliches Sicherheitsnetz direkt vor dem eigentlich
+      // teuren Neu-Rendern — liegt trotz der bereits verlängerten Debounce-Zeit
+      // ausnahmsweise noch ein Finger auf (neue Geste hat in der Zwischenzeit
+      // begonnen), wird dieser Durchlauf ersatzlos übersprungen, statt ausgerechnet
+      // während einer neuen Touch-Interaktion ein neues Canvas anzufordern. Ändert sich
+      // zoomScale durch diese neue Geste weiter, setzt das ohnehin schon die gesamte
+      // Debounce-Uhr über die Dependency oben zurück; endet die neue Geste, stößt
+      // touchReleaseTick einen neuen, dann wieder sicheren Durchlauf an.
+      if (activePointersRef?.current && activePointersRef.current.size > 0) return;
       const page = pageRef.current;
       const host = hostRef.current;
       if (!page || !host) return;
@@ -5559,7 +5589,11 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, zoomScale = 1 }, 
     }, PDF_RASTER_RERENDER_DEBOUNCE_MS);
 
     return () => clearTimeout(timer);
-  }, [zoomScale]);
+    // touchReleaseTick (siehe FloorPlanView/IPAD-TOUCH-RELEASE-FIX) zusätzlich in der
+    // Dependency-Liste: stößt die Debounce-Uhr auch dann verlässlich ab dem
+    // tatsächlichen Loslass-Zeitpunkt neu an, wenn kurz zuvor zufällig keine
+    // Skalierungsänderung mehr registriert wurde.
+  }, [zoomScale, touchReleaseTick]);
 
   return (
     <div ref={ref} className="relative aspect-[4/3] w-full overflow-hidden bg-white">
@@ -5692,7 +5726,10 @@ const SvgPlanCanvas = forwardRef(function SvgPlanCanvas({ url }, ref) {
 // vereinzelt dokumentierte Darstellungs-Eigenheiten bei komplexem HTML-Inhalt — sollte
 // es auf einem Baustellen-Tablet Auffälligkeiten geben, bitte melden, dann prüfen wir
 // gezielt nach.
-const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, zoomScale = 1, children }, ref) {
+const PlanSvgStage = forwardRef(function PlanSvgStage(
+  { planKind, url, zoomScale = 1, touchReleaseTick = 0, activePointersRef = null, children },
+  ref
+) {
   const measureRef = useRef(null);
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 
@@ -5723,7 +5760,16 @@ const PlanSvgStage = forwardRef(function PlanSvgStage({ planKind, url, zoomScale
 
   return (
     <div ref={setRefs} className="relative w-full">
-      {planKind === "pdf" ? <PdfPlanCanvas url={url} zoomScale={zoomScale} /> : <SvgPlanCanvas url={url} />}
+      {planKind === "pdf" ? (
+        <PdfPlanCanvas
+          url={url}
+          zoomScale={zoomScale}
+          touchReleaseTick={touchReleaseTick}
+          activePointersRef={activePointersRef}
+        />
+      ) : (
+        <SvgPlanCanvas url={url} />
+      )}
       {hasSize && (
         <svg
           viewBox={`0 0 ${stageSize.width} ${stageSize.height}`}
@@ -5803,9 +5849,15 @@ function pickTileLevelForWidth(manifest, requiredWidthPx) {
   return (fit || sorted[sorted.length - 1]).level;
 }
 
-const FLOOR_PLAN_TILE_LEVEL_SWITCH_DEBOUNCE_MS = 180;
+// IPAD-TOUCH-RELEASE-FIX (siehe PDF_RASTER_RERENDER_DEBOUNCE_MS/Einordnung in der
+// Antwort): auf 350ms angehoben, dieselbe Begründung und dieselbe angeforderte Spanne
+// von 300-500ms wie beim PDF-Raster-Nachladen.
+const FLOOR_PLAN_TILE_LEVEL_SWITCH_DEBOUNCE_MS = 350;
 
-const TiledPlanImage = forwardRef(function TiledPlanImage({ plan, scale = 1 }, ref) {
+const TiledPlanImage = forwardRef(function TiledPlanImage(
+  { plan, scale = 1, touchReleaseTick = 0, activePointersRef = null },
+  ref
+) {
   const rootRef = useRef(null);
   const manifest = plan?.tile_manifest || null;
   const [level, setLevel] = useState(() => (manifest ? manifest.maxLevel : null));
@@ -5841,6 +5893,11 @@ const TiledPlanImage = forwardRef(function TiledPlanImage({ plan, scale = 1 }, r
   useEffect(() => {
     if (!manifest) return undefined;
     const timer = setTimeout(() => {
+      // IPAD-TOUCH-RELEASE-FIX: liegt trotz der bereits verlängerten Debounce-Zeit
+      // ausnahmsweise noch ein Finger auf, wird dieser Durchlauf übersprungen statt
+      // ausgerechnet während einer neuen Touch-Interaktion die Kachel-Stufe zu
+      // wechseln — siehe identische Begründung bei PdfPlanCanvas.
+      if (activePointersRef?.current && activePointersRef.current.size > 0) return;
       const el = rootRef.current;
       if (!el) return;
       const rect = el.getBoundingClientRect();
@@ -5854,7 +5911,10 @@ const TiledPlanImage = forwardRef(function TiledPlanImage({ plan, scale = 1 }, r
       }
     }, FLOOR_PLAN_TILE_LEVEL_SWITCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [manifest, scale]);
+    // touchReleaseTick (siehe FloorPlanView/IPAD-TOUCH-RELEASE-FIX): stößt die
+    // Debounce-Uhr zusätzlich ab dem tatsächlichen Loslass-Zeitpunkt neu an, siehe
+    // identische Begründung bei PdfPlanCanvas.
+  }, [manifest, scale, touchReleaseTick]);
 
   const tiles = useMemo(() => {
     if (!manifest || level === null) return [];
@@ -10030,10 +10090,23 @@ function FloorPlanView({
   }, [translate]);
 
   // Hintergrund-Pointer für Pan/Pinch — bewusst getrennt von draggingPinId/dragPos,
-  // die ausschließlich das Verschieben eines bestehenden Pins abbilden.
+  // die ausschließlich das Verschieben eines bestehenden Pins abbilden. Wird zusätzlich
+  // (siehe IPAD-TOUCH-RELEASE-FIX) als activePointersRef an PdfPlanCanvas/
+  // TiledPlanImage durchgereicht, damit deren verzögertes Nachschärfen beim Timer-
+  // Ablauf noch einmal prüfen kann, ob wirklich kein Finger mehr aufliegt.
   const panPointersRef = useRef(new Map());
   const panGestureRef = useRef(null); // { startX, startY, startTranslate, moved }
   const pinchGestureRef = useRef(null); // { startDistance, startScale, startTranslate }
+  // IPAD-TOUCH-RELEASE-FIX (siehe Einordnung in der Antwort): zählt hoch, sobald der
+  // LETZTE Finger abhebt (panPointersRef.current.size erreicht 0, siehe
+  // handleViewportPointerUp unten) — als zusätzlicher Auslöser für die Debounce-Timer
+  // in PdfPlanCanvas/TiledPlanImage, damit deren Nachschärfen zuverlässig auch dann
+  // erst ab dem TATSÄCHLICHEN Loslass-Zeitpunkt neu zu zählen beginnt, wenn kurz zuvor
+  // zufällig keine Skalierungsänderung mehr registriert wurde (reines Halten am Ende
+  // einer Pinch-Geste, ohne dass sich scale in den letzten Millisekunden noch geändert
+  // hätte). Ein einfacher Zähler statt eines Timestamps genügt, da er nur als
+  // useEffect-Dependency dient, nicht selbst ausgewertet wird.
+  const [touchReleaseTick, setTouchReleaseTick] = useState(0);
   // Long-Press-Timer für die Pin-/Notiz-Erstellung auf freier Fläche (siehe
   // handleViewportPointerDown/-Move/-Up unten) sowie der zugehörige, kurz aufblitzende
   // Fortschritts-Indikator an der Druckposition (viewport-lokale Pixel, NICHT die
@@ -10472,6 +10545,12 @@ function FloorPlanView({
       // verwirft ihn ersatzlos — ein kurzer Tap/Klick auf freier Fläche setzt bewusst
       // KEINEN Pin mehr (dient nur noch dem Zoomen/Verschieben der Ansicht).
       clearLongPressTimer();
+      // IPAD-TOUCH-RELEASE-FIX (siehe Einordnung in der Antwort, touchReleaseTick-
+      // Deklaration oben): stößt in PdfPlanCanvas/TiledPlanImage einen neuen,
+      // verzögerten Nachschärf-Durchlauf GENAU ab diesem tatsächlichen Loslass-
+      // Zeitpunkt an, unabhängig davon, ob sich scale in den letzten Millisekunden
+      // davor noch geändert hat.
+      setTouchReleaseTick((t) => t + 1);
     }
   };
 
@@ -10829,7 +10908,14 @@ function FloorPlanView({
                   // eingebettet sind — beide skalieren dadurch über dieselbe SVG-Geometrie,
                   // nicht nur über eine daneben liegende, lediglich synchron transformierte
                   // HTML-Ebene. Details und Abwägungen siehe Kommentar bei PlanSvgStage.
-                  <PlanSvgStage ref={imgRef} planKind={isPdf ? "pdf" : "svg"} url={plan.image_url} zoomScale={scale}>
+                  <PlanSvgStage
+                    ref={imgRef}
+                    planKind={isPdf ? "pdf" : "svg"}
+                    url={plan.image_url}
+                    zoomScale={scale}
+                    touchReleaseTick={touchReleaseTick}
+                    activePointersRef={panPointersRef}
+                  >
                     <PinsAndNotesLayer
                       visiblePins={visiblePins}
                       pinNumberById={pinNumberById}
@@ -10860,7 +10946,13 @@ function FloorPlanView({
                         Bildschirmfläche). Ältere Grundrisse ohne tile_manifest sowie ein
                         eventuell fehlgeschlagener Kachel-Upload zeigen automatisch weiterhin
                         nur das bisherige Fallback-Bild — keine Regression. */}
-                    <TiledPlanImage ref={imgRef} plan={plan} scale={scale} />
+                    <TiledPlanImage
+                      ref={imgRef}
+                      plan={plan}
+                      scale={scale}
+                      touchReleaseTick={touchReleaseTick}
+                      activePointersRef={panPointersRef}
+                    />
                     <PinsAndNotesLayer
                       visiblePins={visiblePins}
                       pinNumberById={pinNumberById}
