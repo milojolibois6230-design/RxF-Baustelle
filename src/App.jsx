@@ -252,11 +252,9 @@ const PIN_FIELD_LABELS = {
   title: "Titel",
   description: "Beschreibung",
   priority: "Priorität",
-  assigned_to: "Zuständigkeit",
   trade_id: "Gewerk",
   angle: "Blickrichtung",
   due_date: "Frist / Fälligkeitsdatum",
-  reference_code: "Anschlussbezeichnung",
   area: "Bereich",
 };
 
@@ -2222,6 +2220,102 @@ async function preloadPinPhotosForPdf(pins, opts = {}) {
   return cache;
 }
 
+// ---- EINHEITLICHE BILDGRÖSSEN IM PDF-EXPORT (object-fit: cover-Äquivalent) --------
+// jsPDF kennt kein CSS und damit kein object-fit: eingebettete Bilder werden von
+// doc.addImage() immer exakt auf die angegebene Breite/Höhe GESTRECKT bzw. — wenn man
+// vorher das Seitenverhältnis erhält (bisheriges Verhalten) — mittig eingepasst mit
+// Leerraum an den kürzeren Kanten ("object-fit: contain"). Für ein einheitliches
+// Raster-Layout ist das unerwünscht: unterschiedliche Kamera-Seitenverhältnisse lassen
+// dieselbe Box dann unterschiedlich "voll" wirken. coverCropDataUrl schneidet das
+// Quellbild deshalb per Offscreen-Canvas VORAB exakt auf das Ziel-Seitenverhältnis zu
+// (mittig, überstehende Ränder werden abgeschnitten) — exakt das Verhalten von CSS
+// "object-fit: cover". Die Box wird dadurch garantiert lückenlos gefüllt, unabhängig
+// von der Ausgangsauflösung/dem Ausgangs-Seitenverhältnis des Kamerafotos.
+function coverCropDataUrl(sourceDataUrl, targetWidthPx, targetHeightPx, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const targetRatio = targetWidthPx / targetHeightPx;
+      const srcRatio = img.naturalWidth / img.naturalHeight;
+      let sx, sy, sw, sh;
+      if (srcRatio > targetRatio) {
+        // Quellbild im Verhältnis breiter als die Zielbox -> links/rechts kappen.
+        sh = img.naturalHeight;
+        sw = sh * targetRatio;
+        sy = 0;
+        sx = (img.naturalWidth - sw) / 2;
+      } else {
+        // Quellbild im Verhältnis höher als die Zielbox -> oben/unten kappen.
+        sw = img.naturalWidth;
+        sh = sw / targetRatio;
+        sx = 0;
+        sy = (img.naturalHeight - sh) / 2;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(targetWidthPx));
+      canvas.height = Math.max(1, Math.round(targetHeightPx));
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => reject(new Error("Bild konnte für den einheitlichen Bild-Zuschnitt nicht dekodiert werden."));
+    img.src = sourceDataUrl;
+  });
+}
+
+// Auflösung des Cover-Zuschnitts in Pixel je mm PDF-Seitenfläche — ca. 200 dpi-
+// Äquivalent (200 / 25.4 ≈ 7.9, aufgerundet auf 8), ausreichend scharf für die
+// typischen Bild-Boxgrößen im Bericht (Haupt- wie Vorschaubild), ohne die
+// Zieldateigröße des Gesamtberichts (siehe compressImageDataUrl) unnötig zu sprengen.
+const PDF_PHOTO_COVER_PX_PER_MM = 8;
+
+// Zeichnet EIN Foto — oder, falls keine URL vorliegt bzw. der Preload für genau dieses
+// Foto fehlgeschlagen ist (siehe photoCache/preloadPinPhotosForPdf), einen dezenten
+// Platzhalter — exakt füllend (object-fit: cover, siehe coverCropDataUrl) und mit
+// abgerundeten Ecken in eine fest vorgegebene Box. Zentrale, von ALLEN DREI
+// PDF-Export-Funktionen (generateProjectReportPdf, generateFloorPinsTablePdf,
+// generateSinglePinPdf) gemeinsam genutzte Stelle — dadurch besitzen Hauptbild UND
+// Vorschaubilder/Anhänge im gesamten PDF-Export garantiert exakt dieselbe, einheitlich
+// zugeschnittene Darstellungsgröße, unabhängig von Kamera-Auflösung/-Seitenverhältnis.
+// Die abgerundeten Ecken werden über jsPDF's natives Clipping erzeugt (roundedRect-Pfad
+// ohne Füllung/Strich, .clip(), Bild zeichnen, Grafikzustand wiederherstellen) statt
+// über eine transparente PNG-Maske — das hält die Bilder als komprimiertes JPEG und
+// damit die Berichtsgröße klein.
+async function drawPdfPhotoBox(
+  doc,
+  { url, photoCache, x, y, w, h, radius = 2, placeholderText = "Foto konnte nicht geladen werden", mutedRgb = [100, 116, 139], inkRgb = [15, 23, 42], bgRgb = [248, 250, 252], borderRgb = [226, 232, 240] }
+) {
+  const cached = url ? photoCache.get(url) : null;
+  doc.setFillColor(...bgRgb);
+  doc.setDrawColor(...borderRgb);
+  doc.roundedRect(x, y, w, h, radius, radius, "FD");
+  const drawPlaceholder = () => {
+    doc.setFontSize(h >= 24 ? 9 : 6.3);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(...mutedRgb);
+    doc.text(placeholderText, x + w / 2, y + h / 2, { align: "center", maxWidth: Math.max(w - 3, 6) });
+    doc.setTextColor(...inkRgb);
+  };
+  if (cached && cached.ok) {
+    try {
+      const targetWidthPx = Math.max(1, Math.round(w * PDF_PHOTO_COVER_PX_PER_MM));
+      const targetHeightPx = Math.max(1, Math.round(h * PDF_PHOTO_COVER_PX_PER_MM));
+      const covered = await coverCropDataUrl(cached.dataUrl, targetWidthPx, targetHeightPx);
+      doc.saveGraphicsState();
+      doc.roundedRect(x, y, w, h, radius, radius, null);
+      doc.clip();
+      doc.discardPath();
+      doc.addImage(covered, "JPEG", x, y, w, h);
+      doc.restoreGraphicsState();
+    } catch (err) {
+      console.warn("Bild konnte nicht auf einheitliche Größe zugeschnitten werden, zeige Platzhalter:", err);
+      drawPlaceholder();
+    }
+  } else {
+    drawPlaceholder();
+  }
+}
+
 // Schneidet aus einem bereits geladenen Grundriss-Bild (Data-URL) einen quadratischen
 // Ausschnitt zentriert auf eine relative Position (centerXRatio/centerYRatio, je 0–1,
 // entspricht pin.x/pin.y aus 0–100 umgerechnet) aus und liefert ihn — analog zu
@@ -2693,8 +2787,6 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     field("Priorität", PRIORITY[pin.priority]?.label || pin.priority);
     field("Gewerk", tradesById.get(pin.trade_id)?.name);
     field("Bereich", pin.area);
-    field("Anschlussbezeichnung", pin.reference_code);
-    field("Verantwortlicher", pin.assigned_to);
     field("Frist", pin.due_date ? formatDateOnly(pin.due_date) : null);
     field("Ersteller", pin.created_by);
     field("Angelegt am", formatDateTime(pin.created_at));
@@ -2742,13 +2834,20 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
       dy += 3;
     }
 
-    // Fotos im Raster (3 Spalten), seitenübergreifend falls nötig
+    // Fotos im Raster (3 Spalten), seitenübergreifend falls nötig — EINHEITLICHE
+    // BILDGRÖSSEN (object-fit: cover-Äquivalent mit abgerundeten Ecken, siehe
+    // drawPdfPhotoBox) statt wie zuvor zentriert mit Leerraum an den kürzeren Kanten.
+    // Fotos DIESES Pins werden vorab parallel geladen (preloadPinPhotosForPdf,
+    // Promise.allSettled) statt sequentiell im Zeichen-Loop — dieselbe robuste
+    // Fehlerbehandlung wie im Geschoss- und Einzelpin-Export: ein fehlgeschlagenes
+    // Foto zeigt nur einen Platzhalter, der Rest des Berichts bleibt unberührt.
     const photos = pin.pin_photos || [];
     if (photos.length > 0) {
       bold();
       doc.text("Fotos:", margin, dy);
       dy += 6;
       normal();
+      const projectPinPhotoCache = await preloadPinPhotosForPdf([pin]);
       const cols = 3;
       const gap = 4;
       const cellW = (contentWidth - gap * (cols - 1)) / cols;
@@ -2760,19 +2859,8 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
           dy = margin;
           col = 0;
         }
-        try {
-          const rawImgData = await loadImageAsDataUrl(photo.photo_url);
-          // Downscaling & JPEG-Komprimierung vor dem Einbetten (siehe compressImageDataUrl)
-          // — Kamerafotos landen sonst in voller Originalauflösung im PDF.
-          const imgData = await compressImageDataUrl(rawImgData.dataUrl, PDF_PHOTO_MAX_WIDTH, PDF_PHOTO_MAX_HEIGHT, PDF_PHOTO_JPEG_QUALITY);
-          const px = margin + col * (cellW + gap);
-          const ratio = Math.min(cellW / imgData.width, cellH / imgData.height);
-          const w = imgData.width * ratio;
-          const h = imgData.height * ratio;
-          doc.addImage(imgData.dataUrl, "JPEG", px + (cellW - w) / 2, dy + (cellH - h) / 2, w, h);
-        } catch (err) {
-          console.error("Foto konnte nicht in den PDF-Export geladen werden:", err);
-        }
+        const px = margin + col * (cellW + gap);
+        await drawPdfPhotoBox(doc, { url: photo.photo_url, photoCache: projectPinPhotoCache, x: px, y: dy, w: cellW, h: cellH });
         col += 1;
         if (col >= cols) {
           col = 0;
@@ -2830,24 +2918,23 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
 // NIRGENDS Text stillschweigend abgeschnitten, auch nicht bei sehr langen
 // Beschreibungen oder vielen Fotos je Pin.
 
-// Baut für einen einzelnen Pin die Anzeige-Werte der elf vorgegebenen Kernfelder
-// (Nr. → Aufnahmedatum → Thema → Anschlussbezeichnung → Gewerk → Bereich →
-// Geschoss → Status → Kommentar → Erledigt bis → Erledigen durch) — als
-// gemeinsame Grundlage sowohl für die Mangel-Karten im PDF-Export als auch für
-// eine konsistente Feldbezeichnung im CSV/Excel-Export.
+// Baut für einen einzelnen Pin die Anzeige-Werte der Kernfelder (Nr. → Aufnahmedatum →
+// Thema → Gewerk → Bereich → Geschoss → Status → Kommentar → Erledigt bis) — als
+// gemeinsame Grundlage für die Mangel-Karten im PDF-Export. "Anschlussbezeichnung" und
+// "Erledigen durch" wurden hier bewusst entfernt (siehe PDF LAYOUT CLEANUP-Anforderung)
+// — im rohdaten-vollständigen CSV/Excel-Export (siehe pinsToFloorExportRows, davon
+// unabhängige Funktion) bleiben beide Felder unverändert erhalten.
 function buildFloorExportRowValues(pin, tradesById, floorName) {
   return {
     number: String(pin.exportNumber),
     recordedDate: formatDateShort(pin.created_at),
     topic: pin.title || "–",
-    referenceCode: pin.reference_code || "–",
     trade: tradesById.get(pin.trade_id)?.name || "–",
     area: pin.area || "–",
     floor: floorName || "–",
     status: STATUS[pin.status]?.label || pin.status || "–",
     comment: pin.description || "–",
     dueDate: pin.due_date ? formatDateOnly(pin.due_date) : "–",
-    assignedTo: pin.assigned_to || "–",
   };
 }
 
@@ -3073,26 +3160,12 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
     const thumbSize = (rightW - thumbGap * (thumbCols - 1)) / thumbCols;
 
     // Zeichnet EIN Foto (oder einen Platzhalter, falls url fehlt/Preload
-    // fehlgeschlagen ist) in die angegebene Box — zentriert, seitenverhältnistreu,
-    // nie beschnitten. Zentrale Stelle, damit Haupt- und Rasterfotos exakt gleich
-    // behandelt werden.
-    const drawPhotoBox = (url, bx, by, bw, bh, placeholderText) => {
-      const cached = url ? photoCache.get(url) : null;
-      doc.setFillColor(248, 250, 252);
-      doc.setDrawColor(226, 232, 240);
-      doc.roundedRect(bx, by, bw, bh, 2, 2, "FD");
-      if (cached && cached.ok) {
-        const ratio = Math.min(bw / cached.width, bh / cached.height);
-        const w = cached.width * ratio;
-        const h = cached.height * ratio;
-        doc.addImage(cached.dataUrl, "JPEG", bx + (bw - w) / 2, by + (bh - h) / 2, w, h);
-      } else {
-        doc.setFontSize(bh >= 24 ? 9 : 6.3);
-        mutedColor();
-        doc.text(placeholderText, bx + bw / 2, by + bh / 2, { align: "center", maxWidth: Math.max(bw - 3, 6) });
-        inkColor();
-      }
-    };
+    // fehlgeschlagen ist) — EINHEITLICHE BILDGRÖSSEN: object-fit: cover-Äquivalent mit
+    // abgerundeten Ecken über die gemeinsame drawPdfPhotoBox (siehe oben), damit
+    // Haupt- und Rasterfotos exakt gleich behandelt werden und die Box unabhängig vom
+    // Kamera-Seitenverhältnis IMMER lückenlos gefüllt ist (kein Letterboxing mehr).
+    const drawPhotoBox = (url, bx, by, bw, bh, placeholderText) =>
+      drawPdfPhotoBox(doc, { url, photoCache, x: bx, y: by, w: bw, h: bh, placeholderText });
 
     let y = margin;
 
@@ -3111,10 +3184,8 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       doc.setFontSize(10);
       normal();
       const shortFieldDefs = [
-        ["Anschlussbezeichnung", rowValues.referenceCode],
         ["Gewerk", rowValues.trade],
         ["Bereich", rowValues.area],
-        ["Erledigen durch", rowValues.assignedTo],
       ];
       const shortFields = shortFieldDefs.map(([label, value]) => {
         const lines = doc.splitTextToSize(String(value ?? "–"), leftW);
@@ -3200,26 +3271,29 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
       // preloadPinPhotosForPdf, oben vor der Schleife parallel geladen) ohne
       // zusätzlichen Netzwerk-Request an dieser Stelle. ----
       if (photos.length > 0) {
-        drawPhotoBox(photos[0].photo_url, rightX, columnsStartY, rightW, photoBoxH, "Foto konnte nicht geladen werden");
+        await drawPhotoBox(photos[0].photo_url, rightX, columnsStartY, rightW, photoBoxH, "Foto konnte nicht geladen werden");
         if (extraPhotoCount > 0) {
           const gridY = columnsStartY + photoBoxH + thumbGap;
-          photos.slice(1).forEach((photo, idx) => {
+          let idx = 0;
+          for (const photo of photos.slice(1)) {
             const col = idx % thumbCols;
             const row = Math.floor(idx / thumbCols);
             const tx = rightX + col * (thumbSize + thumbGap);
             const ty = gridY + row * (thumbSize + thumbGap);
-            drawPhotoBox(photo.photo_url, tx, ty, thumbSize, thumbSize, "Fehler");
-          });
+            await drawPhotoBox(photo.photo_url, tx, ty, thumbSize, thumbSize, "Fehler");
+            idx += 1;
+          }
         }
       } else {
-        drawPhotoBox(null, rightX, columnsStartY, rightW, photoBoxH, "Kein Bild vorhanden");
+        await drawPhotoBox(null, rightX, columnsStartY, rightW, photoBoxH, "Kein Bild vorhanden");
       }
       doc.setDrawColor(226, 232, 240);
       const photoColumnBottom = columnsStartY + rightColumnHeight;
 
-      // ---- Linke Spalte — Datenfakten (Anschlussbezeichnung, Gewerk, Bereich,
-      // Erledigen durch — Status/Aufnahmedatum/Erledigt bis sitzen bereits kompakt im
-      // Kartenkopf) und vollständiger Kommentar. ----
+      // ---- Linke Spalte — Datenfakten (Gewerk, Bereich — Status/Aufnahmedatum/
+      // Erledigt bis sitzen bereits kompakt im Kartenkopf) und vollständiger
+      // Kommentar. "Anschlussbezeichnung" und "Erledigen durch" wurden entfernt
+      // (siehe PDF LAYOUT CLEANUP-Anforderung). ----
       let dy = columnsStartY;
       shortFields.forEach(({ label, lines }) => {
         doc.setFontSize(7.5);
@@ -3606,10 +3680,8 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
   };
   field("Projekt", project?.name);
   field("Etage", floor?.name);
-  field("Anschlussbezeichnung", rowValues.referenceCode);
   field("Gewerk", rowValues.trade);
   field("Bereich", rowValues.area);
-  field("Erledigen durch", rowValues.assignedTo);
 
   doc.setFontSize(7.5);
   bold();
@@ -3719,23 +3791,18 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
     let col = 0;
     for (const photo of photos) {
       if (col === 0) ensureSpace(cellH);
-      const cached = singlePinPhotoCache.get(photo.photo_url);
-      if (cached && cached.ok) {
-        const px = margin + col * (cellW + gap);
-        const ratio = Math.min(cellW / cached.width, cellH / cached.height);
-        const w = cached.width * ratio;
-        const h = cached.height * ratio;
-        doc.addImage(cached.dataUrl, "JPEG", px + (cellW - w) / 2, sectionY + (cellH - h) / 2, w, h);
-      } else {
-        console.error("Foto konnte nicht in den Einzel-PDF-Export geladen werden:", photo.photo_url);
-        const px = margin + col * (cellW + gap);
-        doc.setFillColor(248, 250, 252);
-        doc.roundedRect(px, sectionY, cellW, cellH, 2, 2, "FD");
-        doc.setFontSize(7);
-        mutedColor();
-        doc.text("Foto konnte nicht geladen werden", px + cellW / 2, sectionY + cellH / 2, { align: "center", maxWidth: cellW - 3 });
-        inkColor();
-      }
+      // EINHEITLICHE BILDGRÖSSEN: object-fit: cover-Äquivalent mit abgerundeten Ecken
+      // über die gemeinsame drawPdfPhotoBox (siehe oben) — dieselbe Behandlung wie im
+      // Geschoss- und Gesamtexport, jedes Foto füllt seine Kachel lückenlos aus.
+      const px = margin + col * (cellW + gap);
+      await drawPdfPhotoBox(doc, {
+        url: photo.photo_url,
+        photoCache: singlePinPhotoCache,
+        x: px,
+        y: sectionY,
+        w: cellW,
+        h: cellH,
+      });
       col += 1;
       if (col >= cols) {
         col = 0;
@@ -10970,11 +11037,9 @@ function PinModal({
     status: pin.status,
     priority: pin.priority,
     description: pin.description,
-    assignee: pin.assigned_to || "",
     angle: pin.angle ?? 0,
     trade_id: pin.trade_id || "",
     dueDate: pin.due_date || "",
-    referenceCode: pin.reference_code || "",
     area: pin.area || "",
   });
   const [todoInput, setTodoInput] = useState("");
@@ -11011,14 +11076,6 @@ function PinModal({
     });
   };
 
-  // Autocomplete-Vorschlagsliste für "Firma / Zuständige Person" — alle bislang für
-  // diese Grundrissskizze vergebenen Namen/Firmen, dedupliziert. Bewusst nur dieses
-  // eine Feld, nicht Gewerk (das hat bereits eine feste Auswahlliste aus der
-  // Gewerke-Verwaltung).
-  const uniqueAssignees = useMemo(() => {
-    return Array.from(new Set((pins || []).map((p) => p.assigned_to).filter(Boolean)));
-  }, [pins]);
-
   // Voice-to-Text (Abschnitt 2): zwei unabhängige Diktier-Sitzungen, je eine für
   // "Thema" und "Beschreibung / Notiz" — siehe useDictation weiter oben.
   const titleDictation = useDictation({ getBaseText: () => draft.title, setText: (v) => update("title", v) });
@@ -11036,11 +11093,9 @@ function PinModal({
         status: draft.status,
         priority: draft.priority,
         description: draft.description,
-        assigned_to: draft.assignee,
         angle: draft.angle,
         trade_id: draft.trade_id || null,
         due_date: draft.dueDate || null,
-        reference_code: draft.referenceCode.trim(),
         area: draft.area.trim(),
       });
       // Bei Erfolg schließt der Aufrufer (App) das Modal.
@@ -11235,28 +11290,11 @@ function PinModal({
             </div>
           </div>
 
-          {/* Zuständigkeit: Firma/Person (mit Autocomplete) & Gewerk nebeneinander */}
+          {/* Gewerk & Bereich nebeneinander — "Anschlussbezeichnung" und "Firma /
+              Zuständige Person" wurden entfernt (siehe PDF LAYOUT CLEANUP-
+              Anforderung: beide Felder komplett aus Anlege-/Bearbeiten-Modal und
+              PDF-Bericht entfernt). */}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <div>
-              <FieldLabel>Firma / Zuständige Person</FieldLabel>
-              <div className="relative">
-                <User className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                <input
-                  type="text"
-                  list="pin-assignee-suggestions"
-                  value={draft.assignee}
-                  onChange={(e) => update("assignee", e.target.value)}
-                  disabled={readOnly}
-                  placeholder="z.B. Helmut / Fa. Mustermann Elektro"
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
-                />
-                <datalist id="pin-assignee-suggestions">
-                  {uniqueAssignees.map((name, i) => (
-                    <option key={i} value={name} />
-                  ))}
-                </datalist>
-              </div>
-            </div>
             <div>
               <FieldLabel>Gewerk</FieldLabel>
               <div className="relative">
@@ -11279,6 +11317,19 @@ function PinModal({
                 </select>
               </div>
             </div>
+            <div>
+              <FieldLabel>Bereich</FieldLabel>
+              <div className="relative">
+                <MapPin className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+                <input
+                  value={draft.area}
+                  onChange={(e) => update("area", e.target.value)}
+                  disabled={readOnly}
+                  placeholder="z.B. Flur Nord"
+                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+                />
+              </div>
+            </div>
           </div>
 
           {/* Frist / Fälligkeitsdatum */}
@@ -11293,37 +11344,6 @@ function PinModal({
                 disabled={readOnly}
                 className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
               />
-            </div>
-          </div>
-
-          {/* Anschlussbezeichnung & Bereich — für die Export-Spaltenstruktur des
-              Geschoss-Berichts (Abschnitt 2). */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <FieldLabel>Anschlussbezeichnung</FieldLabel>
-              <div className="relative">
-                <Link2 className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                <input
-                  value={draft.referenceCode}
-                  onChange={(e) => update("referenceCode", e.target.value)}
-                  disabled={readOnly}
-                  placeholder="z.B. S002"
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
-                />
-              </div>
-            </div>
-            <div>
-              <FieldLabel>Bereich</FieldLabel>
-              <div className="relative">
-                <MapPin className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                <input
-                  value={draft.area}
-                  onChange={(e) => update("area", e.target.value)}
-                  disabled={readOnly}
-                  placeholder="z.B. Flur Nord"
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
-                />
-              </div>
             </div>
           </div>
 
@@ -13073,7 +13093,7 @@ function App() {
     const prevPin = pins.find((p) => p.id === pinId);
     if (!online || isPinPendingSync(pinId)) {
       // Offline-First (Punkt 15): Feldänderungen (Titel, Beschreibung, Gewerk,
-      // Zuständigkeit, Priorität) UND Statuswechsel (Offen → In Bearbeitung →
+      // Bereich, Priorität) UND Statuswechsel (Offen → In Bearbeitung →
       // Abgeschlossen/Freigabe) laufen über denselben Save-Aufruf wie online — der
       // Unterschied ist ausschließlich, dass hier lokal aktualisiert und in die
       // Warteschlange eingereiht statt sofort an Supabase gesendet wird.
