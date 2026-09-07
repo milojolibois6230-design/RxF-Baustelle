@@ -2170,39 +2170,56 @@ function compressImageDataUrl(sourceDataUrl, maxWidth, maxHeight, quality) {
   });
 }
 
-// ---- ASYNCHRONES BILDER-PRELOADING (Promise.all) für den Geschoss-PDF-Export ------
-// Lädt JEDES Mängelfoto ALLER übergebenen Pins parallel als Base64/Data-URL vor,
-// BEVOR die eigentliche PDF-Generierung beginnt (statt wie zuvor sequentiell erst beim
-// Zeichnen jeder einzelnen Karte). Vorteile gegenüber dem sequentiellen Laden:
+// ---- EINZEL-BILD-PRELOAD: Foto-URL -> Base64/Data-URL -------------------------------
+// Lädt EINE Foto-URL vollständig als Base64-Data-String vor — über fetch() + Blob +
+// FileReader (siehe loadImageAsDataUrl), NICHT per <img crossOrigin>/Canvas-Snapshot,
+// da Supabase-Storage-URLs je nach Bucket-Konfiguration keine anonyme Canvas-Lesbarkeit
+// garantieren (Tainted-Canvas-Risiko). Direkt im Anschluss auf PDF-taugliche Auflösung
+// herunterskaliert & als JPEG re-encodiert (siehe compressImageDataUrl), damit der
+// vorgeladene Cache bereits das fertige, einbettbare Format enthält. Wirft bei einem
+// Lade-/Dekodierfehler ganz normal (kein internes try/catch) — die Fehlerbehandlung je
+// Bild liegt bewusst bei der aufrufenden Stelle (siehe preloadPinPhotosForPdf,
+// Promise.allSettled), damit ein einzelnes fehlschlagendes Foto individuell und
+// nachvollziehbar behandelt werden kann, ohne die übrigen Ladevorgänge zu beeinflussen.
+async function preloadImageAsBase64(url, { maxWidth = PDF_PHOTO_MAX_WIDTH, maxHeight = PDF_PHOTO_MAX_HEIGHT, quality = PDF_PHOTO_JPEG_QUALITY } = {}) {
+  const raw = await loadImageAsDataUrl(url);
+  return await compressImageDataUrl(raw.dataUrl, maxWidth, maxHeight, quality);
+}
+
+// ---- ASYNCHRONES BILDER-PRELOADING (Promise.allSettled) für den Geschoss-PDF-Export -
+// Lädt JEDES Mängelfoto ALLER übergebenen Pins parallel (preloadImageAsBase64 je Foto)
+// vor, BEVOR die eigentliche PDF-Generierung beginnt (statt wie zuvor sequentiell erst
+// beim Zeichnen jeder einzelnen Karte). Vorteile gegenüber dem sequentiellen Laden:
 // 1. Deutlich schnellerer Gesamt-Export bei vielen Pins/Fotos, da die Netzwerk-Ladezeit
 //    aller Bilder überlappt statt sich zu addieren.
 // 2. Ein einzelnes fehlschlagendes Foto (Netzwerk-Hänger, CORS, gelöschte Datei) bricht
-//    den Export NICHT ab — jeder Ladevorgang ist einzeln try/catch-abgesichert, ein
-//    Fehlschlag liefert lediglich { ok: false } für genau diese URL, alle anderen
-//    Fotos UND der restliche Bericht werden davon unberührt vollständig fertiggestellt
-//    (Graceful Fallback, siehe Verwendung in generateFloorPinsTablePdf).
+//    den Export NICHT ab — Promise.allSettled wartet auf ALLE Ladevorgänge, unabhängig
+//    davon ob einzelne davon ablehnen ("rejected"). Ein Fehlschlag liefert lediglich
+//    { ok: false } für genau diese URL, alle anderen Fotos UND der restliche Bericht
+//    werden davon unberührt vollständig fertiggestellt (Graceful Fallback, siehe
+//    Verwendung/drawPhotoBox in generateFloorPinsTablePdf).
 // Mehrfach verwendete Foto-URLs (kommt praktisch nicht vor, aber möglich) werden dank
 // des Sets nur einmal geladen. Rückgabe: Map<photo_url, { ok, dataUrl?, width?, height? }>.
-async function preloadPinPhotosForPdf(pins, { maxWidth = PDF_PHOTO_MAX_WIDTH, maxHeight = PDF_PHOTO_MAX_HEIGHT, quality = PDF_PHOTO_JPEG_QUALITY } = {}) {
+async function preloadPinPhotosForPdf(pins, opts = {}) {
   const urls = new Set();
   (pins || []).forEach((pin) => {
     (pin.pin_photos || []).forEach((photo) => {
       if (photo?.photo_url) urls.add(photo.photo_url);
     });
   });
-  const entries = await Promise.all(
-    [...urls].map(async (url) => {
-      try {
-        const raw = await loadImageAsDataUrl(url);
-        const compressed = await compressImageDataUrl(raw.dataUrl, maxWidth, maxHeight, quality);
-        return [url, { ok: true, ...compressed }];
-      } catch (err) {
-        console.warn(`Mängelfoto konnte nicht vorab in den PDF-Export geladen werden (${url}):`, err);
-        return [url, { ok: false }];
-      }
-    })
-  );
-  return new Map(entries);
+  const urlList = [...urls];
+  const settled = await Promise.allSettled(urlList.map((url) => preloadImageAsBase64(url, opts)));
+  const cache = new Map();
+  settled.forEach((result, idx) => {
+    const url = urlList[idx];
+    if (result.status === "fulfilled") {
+      cache.set(url, { ok: true, ...result.value });
+    } else {
+      console.warn(`Mängelfoto konnte nicht vorab in den PDF-Export geladen werden (${url}):`, result.reason);
+      cache.set(url, { ok: false });
+    }
+  });
+  return cache;
 }
 
 // Schneidet aus einem bereits geladenen Grundriss-Bild (Data-URL) einen quadratischen
@@ -9193,6 +9210,11 @@ function FloorPlanView({
   const exportMenuRef = useRef(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  // Nicht-leer, solange der Geschoss-PDF-Export läuft (Bilder-Preload + Zeichnen) —
+  // steuert den vollflächigen Fortschritts-Overlay weiter unten, damit auf einer
+  // Baustelle mit vielen Fotos/langsamer Verbindung jederzeit erkennbar bleibt, dass
+  // das System noch arbeitet, statt dass die Oberfläche scheinbar hängt.
+  const [pdfExportStage, setPdfExportStage] = useState("");
   const [exportError, setExportError] = useState("");
   const [exportIncludeOnboarding, setExportIncludeOnboarding] = useState(() => hasOnboardingInfo(project));
   const [draggingPinId, setDraggingPinId] = useState(null);
@@ -9374,6 +9396,10 @@ function FloorPlanView({
     setExportMenuOpen(false);
     setExportError("");
     setExporting(true);
+    // Fortschritts-Overlay ausschließlich beim PDF-Export (Bilder-Preload + jsPDF-
+    // Zeichnen kann bei vielen Fotos spürbar dauern) — der CSV-Export ist synchron
+    // und praktisch verzögerungsfrei, dafür braucht es keinen Overlay-Hinweis.
+    if (format === "pdf") setPdfExportStage("Lade Bilder und erstelle PDF...");
     try {
       if (format === "pdf") {
         await generateFloorPinsTablePdf({
@@ -9395,6 +9421,7 @@ function FloorPlanView({
       setExportError("Export fehlgeschlagen. Bitte erneut versuchen.");
     } finally {
       setExporting(false);
+      setPdfExportStage("");
     }
   };
 
@@ -10155,6 +10182,22 @@ function FloorPlanView({
 
       {helpModalOpen && (
         <FloorPlanHelpModal session={session} noteMode={noteMode} onClose={() => setHelpModalOpen(false)} />
+      )}
+
+      {/* Fortschritts-Overlay Geschoss-PDF-Export — vollflächig & nicht schließbar
+          (kein onClose), da der laufende Export nicht sinnvoll abgebrochen werden
+          kann; verschwindet automatisch, sobald generateFloorPinsTablePdf im
+          finally-Block von handleExportFloor pdfExportStage wieder leert. */}
+      {pdfExportStage && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-3 rounded-2xl bg-white px-8 py-7 shadow-xl">
+            <Loader2 size={30} className="animate-spin text-[#FF2A00]" />
+            <p className="text-sm font-semibold text-slate-700">{pdfExportStage}</p>
+            <p className="max-w-[220px] text-center text-[11px] leading-snug text-slate-400">
+              Alle Fotos werden geladen und in den Bericht eingebettet — bei vielen Bildern kann das einen Moment dauern.
+            </p>
+          </div>
+        </div>
       )}
     </div>
   );
