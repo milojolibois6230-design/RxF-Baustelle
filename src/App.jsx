@@ -9932,74 +9932,6 @@ const FLOORPLAN_PAN_CLICK_THRESHOLD = 5; // px — ab hier zählt eine Interakti
 const FLOORPLAN_PAN_MIN_OVERLAP_PX = 72;
 
 // ----------------------------------------------------------------------------------
-// TEMPORÄRES ON-SCREEN-DEBUG-PROTOKOLL (siehe Einordnung in der Antwort)
-// ----------------------------------------------------------------------------------
-// Rein diagnostisches Hilfsmittel für die Fehlersuche zum weißen Bildschirm beim
-// Zoomen auf dem iPad: zwei bereits ausgelieferte Fixes (will-change entfernt,
-// Pinch-Loslassen-Bugfix) haben das Problem NICHT gelöst, die Ursache ist also noch
-// unklar. Ohne Mac/Remote-Debugging ist die Browser-Konsole auf dem iPad selbst nicht
-// einsehbar — dieses kleine, immer sichtbare Protokoll auf dem Bildschirm ersetzt sie
-// notdürftig: es zeigt JS-Fehler, unbehandelte Promise-Fehler sowie die tatsächlichen
-// Zoom-/Verschiebungswerte an genau den Stellen, an denen der weiße Bildschirm bisher
-// vermutet wurde. Rein additiv, ändert an der eigentlichen Funktion nichts und lässt
-// sich nach Abschluss der Fehlersuche gefahrlos wieder entfernen — deshalb bewusst
-// als eigener, klar abgegrenzter Block statt über den gesamten Code verstreut.
-const ZOOM_DEBUG_LOG_MAX_ENTRIES = 20;
-const zoomDebugLogListeners = new Set();
-let zoomDebugLogEntries = [];
-function pushZoomDebugLog(label, data) {
-  const time = new Date().toISOString().slice(11, 23);
-  let line = `${time} ${label}`;
-  if (data !== undefined) {
-    try {
-      line += ` ${JSON.stringify(data)}`;
-    } catch {
-      line += ` ${String(data)}`;
-    }
-  }
-  zoomDebugLogEntries = [...zoomDebugLogEntries.slice(-(ZOOM_DEBUG_LOG_MAX_ENTRIES - 1)), line];
-  zoomDebugLogListeners.forEach((fn) => fn(zoomDebugLogEntries));
-}
-// window.onerror/unhandledrejection global (nicht an eine Komponente gebunden) und nur
-// EINMAL registriert (__baudocZoomDebugInstalled-Flag), auch wenn FloorPlanView mehrfach
-// neu gemountet wird — sonst würden bei jedem Mount zusätzliche, doppelte Listener
-// entstehen.
-if (typeof window !== "undefined" && !window.__baudocZoomDebugInstalled) {
-  window.__baudocZoomDebugInstalled = true;
-  window.addEventListener("error", (e) => {
-    pushZoomDebugLog("JS-FEHLER", e?.message || String(e?.error || e));
-  });
-  window.addEventListener("unhandledrejection", (e) => {
-    pushZoomDebugLog("PROMISE-FEHLER", (e?.reason && (e.reason.message || String(e.reason))) || "unbekannt");
-  });
-}
-
-// Fest (nicht innerhalb der transformierten "Bühne") positioniert, damit das Protokoll
-// auch dann noch lesbar bleibt, wenn ausgerechnet der Grundriss-Bereich selbst weiß
-// wird — es hängt an keiner Stelle von contentRef/dessen CSS-Transform ab.
-// pointer-events-none, damit es Long-Press-/Pinch-Gesten auf dem Plan darunter nicht
-// stört.
-function ZoomDebugOverlay() {
-  const [entries, setEntries] = useState(() => zoomDebugLogEntries);
-  useEffect(() => {
-    const listener = (next) => setEntries(next);
-    zoomDebugLogListeners.add(listener);
-    return () => zoomDebugLogListeners.delete(listener);
-  }, []);
-  if (entries.length === 0) return null;
-  return (
-    <div
-      className="pointer-events-none fixed left-1 top-1 z-[999] max-h-48 w-72 overflow-hidden rounded-md bg-black/85 p-1.5 font-mono text-[9px] leading-tight text-lime-300 shadow-lg"
-      style={{ whiteSpace: "pre-wrap" }}
-    >
-      <div className="mb-0.5 font-bold text-amber-300">Zoom-Debug (temporär)</div>
-      {entries.map((line, i) => (
-        <div key={i}>{line}</div>
-      ))}
-    </div>
-  );
-}
-
 function FloorPlanView({
   floor,
   plan,
@@ -10430,7 +10362,6 @@ function FloorPlanView({
         startScale: scale,
         startTranslate: { ...translate },
       };
-      pushZoomDebugLog("pinch-start", { scale, startDistance: pinchGestureRef.current.startDistance });
       if (panGestureRef.current) panGestureRef.current.moved = true; // Pinch zählt nie als Tap/Long Press
       clearLongPressTimer();
     }
@@ -10501,14 +10432,25 @@ function FloorPlanView({
       return;
     }
 
-    panPointersRef.current.delete(e.pointerId);
+    // IPAD-DOPPEL-EVENT-FIX (siehe Einordnung in der Antwort): dieser Handler hängt an
+    // DREI verschiedenen DOM-Events gleichzeitig (onPointerUp, onPointerLeave,
+    // onPointerCancel, siehe JSX weiter unten) — auf iPad-Safari feuern beim Beenden
+    // einer Pinch-Geste nachweislich (per Debug-Protokoll bestätigt: "finger-drop" und
+    // ein doppeltes "release-end" exakt 1ms auseinander) MEHRERE dieser Events für
+    // DENSELBEN Finger/Pointer, z.B. sowohl pointerup als auch direkt danach
+    // pointercancel für dieselbe pointerId, wenn WebKit die Geste am Ende selbst noch
+    // einmal "übernimmt". Ohne diese Sperre lief der komplette Aufräum-/Nachschärf-
+    // Pfad unten (inkl. setTouchReleaseTick, siehe dort) dadurch zweimal
+    // hintereinander für ein- und denselben Loslass-Vorgang. panPointersRef ist die
+    // EINZIGE Quelle der Wahrheit dafür, welche Finger gerade aktiv sind (siehe
+    // handleViewportPointerDown, wo jeder Pointer genau einmal eingetragen wird) — ist
+    // eine pointerId hier nicht mehr enthalten, wurde ihr Loslassen bereits durch ein
+    // vorheriges dieser drei Events vollständig verarbeitet, und dieser zweite Aufruf
+    // wird ersatzlos übersprungen, statt denselben Zustand ein zweites Mal zu
+    // committen.
+    if (!panPointersRef.current.has(e.pointerId)) return;
 
-    if (pinchGestureRef.current) {
-      // Nur relevant, wenn gerade tatsächlich ein Pinch lief — loggt den Zustand
-      // GENAU an der Stelle, an der laut Praxis-Rückmeldung der weiße Bildschirm
-      // auftritt (siehe Einordnung in der Antwort).
-      pushZoomDebugLog("finger-drop", { remaining: panPointersRef.current.size, scale, translate });
-    }
+    panPointersRef.current.delete(e.pointerId);
 
     if (panPointersRef.current.size < 2) {
       // BUGFIX "weißer Bildschirm beim Loslassen nach Pinch-Zoom" (Praxis-Rückmeldung
@@ -10540,7 +10482,6 @@ function FloorPlanView({
 
     if (panPointersRef.current.size === 0) {
       setIsPanningActive(false);
-      pushZoomDebugLog("release-end", { scale, translate });
       // Ein Loslassen VOR Ablauf des Long-Press-Timers (siehe handleViewportPointerDown)
       // verwirft ihn ersatzlos — ein kurzer Tap/Klick auf freier Fläche setzt bewusst
       // KEINEN Pin mehr (dient nur noch dem Zoomen/Verschieben der Ansicht).
@@ -14674,19 +14615,16 @@ function App() {
 // ----------------------------------------------------------------------------------
 // In der gesamten App existierte bislang KEINE Error Boundary. Ohne eine solche räumt
 // React bei einem unabgefangenen Fehler WÄHREND DES RENDERNS den kompletten
-// Komponentenbaum vollständig ab — die sichtbare Folge ist exakt ein vollständig
-// weißer, leerer Bildschirm, von einem GPU-/Speicher-bedingten Absturz der bisher
-// vermuteten Art nicht zu unterscheiden. Nach zwei erfolglosen Fixversuchen (will-
-// change entfernt, Pinch-Loslassen-Bugfix) ist ein tatsächlicher JavaScript-Fehler
-// beim Rendern, ausgelöst durch einen bestimmten Zoom-/Verschiebungszustand nach dem
-// Loslassen, jetzt der naheliegendste nächste Verdacht. Diese Boundary fängt einen
-// solchen Fehler ab, zeigt seine Meldung UND den React-Komponenten-Stack direkt auf
-// dem Bildschirm an (auch ohne Mac/Remote-Debugging lesbar, siehe auch
-// ZoomDebugOverlay/pushZoomDebugLog weiter oben) und bietet einen "Weiter"-Button, der
-// den betroffenen Bereich neu zu mounten versucht, statt dass die App bis zum
-// manuellen Neuladen komplett weiß und unbenutzbar bleibt. Behebt die eigentliche
-// Fehlerursache nicht selbst, verhindert aber ab sofort, dass sie sich weiterhin als
-// undurchsichtiger weißer Bildschirm ohne jede Fehlermeldung zeigt.
+// Komponentenbaum vollständig ab — die sichtbare Folge ist ein vollständig weißer,
+// leerer Bildschirm. Diese Boundary fängt einen solchen Fehler ab, zeigt seine
+// Meldung UND den React-Komponenten-Stack direkt auf dem Bildschirm an (auch ohne
+// Mac/Remote-Debugging lesbar) und bietet einen "Weiter"-Button, der den betroffenen
+// Bereich neu zu mounten versucht, statt dass die App bis zum manuellen Neuladen
+// komplett weiß und unbenutzbar bleibt. Das ursprünglich begleitende On-Screen-
+// Debug-Protokoll (ZoomDebugOverlay/pushZoomDebugLog) war ein temporäres Hilfsmittel
+// für die inzwischen abgeschlossene Fehlersuche zum Zoom-Loslassen-Absturz und wurde
+// entfernt — diese Boundary selbst bleibt als dauerhaftes Sicherheitsnetz gegen
+// JEDEN unabgefangenen Rendering-Fehler bestehen, nicht nur zoombezogene.
 class ZoomErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
@@ -14696,7 +14634,6 @@ class ZoomErrorBoundary extends React.Component {
     return { error };
   }
   componentDidCatch(error, info) {
-    pushZoomDebugLog("REACT-RENDER-FEHLER", error?.message || String(error));
     this.setState({ info });
     console.error("Unabgefangener Rendering-Fehler (siehe ZoomErrorBoundary):", error, info);
   }
@@ -14727,19 +14664,17 @@ class ZoomErrorBoundary extends React.Component {
   }
 }
 
-// AppWithZoomDebug ersetzt den bisherigen direkten Export von App als Root-Komponente:
-// bettet App in die ZoomErrorBoundary ein (siehe oben) und rendert das
-// ZoomDebugOverlay EINMAL, global, außerhalb jeder transformierten "Bühne" — dadurch
-// bleibt das Protokoll auch dann lesbar, wenn ausgerechnet der Grundriss-Bereich
-// selbst weiß wird. Reine Diagnose-/Sicherheitsnetz-Hülle, App selbst ist inhaltlich
-// unverändert.
-function AppWithZoomDebug(props) {
+// AppWithErrorBoundary ersetzt den direkten Export von App als Root-Komponente:
+// bettet App lediglich in die ZoomErrorBoundary ein (siehe oben), als dauerhaftes
+// Sicherheitsnetz gegen unabgefangene Rendering-Fehler. Das früher hier zusätzlich
+// gerenderte, rein diagnostische ZoomDebugOverlay ist entfernt (siehe Kommentar bei
+// ZoomErrorBoundary). App selbst ist inhaltlich unverändert.
+function AppWithErrorBoundary(props) {
   return (
     <ZoomErrorBoundary>
-      <ZoomDebugOverlay />
       <App {...props} />
     </ZoomErrorBoundary>
   );
 }
 
-export default AppWithZoomDebug;
+export default AppWithErrorBoundary;
