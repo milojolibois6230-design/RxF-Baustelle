@@ -1027,13 +1027,16 @@ async function compressPdfForUpload(file) {
 // wahrnehmbaren Detailauflösung selbst eines modernen Tablet-Displays bei voll
 // ausgereiztem FLOORPLAN_MAX_SCALE (400%), ein sichtbarer Schärfeverlust ist damit nicht zu
 // erwarten. PNG-Quellen bleiben bewusst PNG (verlustfrei, wichtig für gestochen scharfe
-// CAD-/Linienzeichnungen mit feinem Text), alle anderen Raster-Formate werden als
-// hochqualitatives JPEG (Qualität 0.92, deutlich über der 0.8 von compressImage für reine
-// Foto-Dokumentation) re-encodiert. Ein bereits kleinerer Plan bleibt unverändert die
-// Original-Datei (kein unnötiges Re-Encoding). Wirft absichtlich nie einen Fehler nach
-// außen — schlägt das Dekodieren fehl, wird unverändert die Original-Datei zurückgegeben
-// (dieselbe Fallback-Strategie wie bei compressImage für Pin-Fotos oben), damit ein
-// einzelnes exotisches Bildformat den Grundriss-Upload nicht blockiert.
+// CAD-/Linienzeichnungen mit feinem Text), alle anderen Raster-Formate werden — wie bei
+// compressImage() für reine Mängel-Fotos — bevorzugt als hochqualitatives WebP (Qualität
+// 0.92, deutlich über der 0.82 von compressImage für reine Foto-Dokumentation)
+// re-encodiert, mit automatischem JPEG-Fallback auf Browsern ohne WebP-Kodierungs-
+// unterstützung (siehe supportsWebpEncoding). Ein bereits kleinerer Plan bleibt
+// unverändert die Original-Datei (kein unnötiges Re-Encoding). Wirft absichtlich nie
+// einen Fehler nach außen — schlägt das Dekodieren fehl, wird unverändert die
+// Original-Datei zurückgegeben (dieselbe Fallback-Strategie wie bei compressImage für
+// Pin-Fotos oben), damit ein einzelnes exotisches Bildformat den Grundriss-Upload nicht
+// blockiert.
 const FLOOR_PLAN_IMAGE_MAX_DIM_PX = 3000;
 const FLOOR_PLAN_IMAGE_JPEG_QUALITY = 0.92;
 function resizeFloorPlanImageForUpload(file, maxDim = FLOOR_PLAN_IMAGE_MAX_DIM_PX, quality = FLOOR_PLAN_IMAGE_JPEG_QUALITY) {
@@ -1050,7 +1053,7 @@ function resizeFloorPlanImageForUpload(file, maxDim = FLOOR_PLAN_IMAGE_MAX_DIM_P
       resolve(file);
     };
     const img = new Image();
-    img.onload = () => {
+    img.onload = async () => {
       try {
         const naturalWidth = img.naturalWidth || img.width;
         const naturalHeight = img.naturalHeight || img.height;
@@ -1080,14 +1083,23 @@ function resizeFloorPlanImageForUpload(file, maxDim = FLOOR_PLAN_IMAGE_MAX_DIM_P
           return;
         }
         if (!isPng) {
-          // JPEG kennt keine Transparenz — weißer Hintergrund vor dem Zeichnen (siehe
-          // dieselbe Begründung bei compressImage für Pin-Fotos).
+          // Weder JPEG noch WebP (verlustbehaftet, wie hier eingesetzt) kennen
+          // Transparenz — weißer Hintergrund vor dem Zeichnen (siehe dieselbe
+          // Begründung bei compressImage für Pin-Fotos).
           ctx.fillStyle = "#ffffff";
           ctx.fillRect(0, 0, targetWidth, targetHeight);
         }
         ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
 
-        const outputType = isPng ? "image/png" : "image/jpeg";
+        // ANFORDERUNG "CLIENT-SIDE IMAGE RESIZING & WEBP COMPRESSION": PNG-Quellen
+        // bleiben weiterhin verlustfrei PNG (siehe Kommentar oben, CAD-/
+        // Linienzeichnungen mit feinem Text) — alle anderen Raster-Grundrisse werden
+        // jetzt, wie die reinen Mängel-Fotos über compressImage(), bevorzugt als WebP
+        // re-encodiert (kleinere Datei bei gleicher Zielqualität), mit demselben
+        // automatischen JPEG-Fallback auf Browsern ohne WebP-Kodierungsunterstützung
+        // (siehe supportsWebpEncoding oben).
+        const useWebp = !isPng && (await supportsWebpEncoding());
+        const outputType = isPng ? "image/png" : useWebp ? "image/webp" : "image/jpeg";
         canvas.toBlob(
           (blob) => {
             cleanup();
@@ -1099,7 +1111,7 @@ function resizeFloorPlanImageForUpload(file, maxDim = FLOOR_PLAN_IMAGE_MAX_DIM_P
               return;
             }
             const baseName = (file.name || "grundriss").replace(/\.[a-zA-Z0-9]+$/, "");
-            const ext = isPng ? "png" : "jpg";
+            const ext = isPng ? "png" : useWebp ? "webp" : "jpg";
             resolve(new File([blob], `${baseName}.${ext}`, { type: outputType, lastModified: Date.now() }));
           },
           outputType,
@@ -2163,92 +2175,125 @@ function resolveOfflineId(id) {
   return readOfflineIdMap()[id] || id;
 }
 
-// ---- Client-seitige Foto-Komprimierung (vor JEDEM Speichern/Upload) ---------------
-// Skaliert ein neu aufgenommenes/ausgewähltes Mangel-Foto auf dem Client herunter und
-// re-encodiert es als JPEG, BEVOR es überhaupt an die Offline-Warteschlange oder den
-// Online-Upload übergeben wird (siehe einziger Aufrufer handleUploadPhotos unten) —
-// läuft vollständig lokal über ein <canvas>, ohne externen Dienst, und funktioniert
-// dadurch unverändert auch ohne Netzverbindung. Nutzen dafür: kleinere data:-URLs im
+// ---- Client-seitige Bild-Komprimierung (vor JEDEM Foto-Upload) --------------------
+// ANFORDERUNG "CLIENT-SIDE IMAGE RESIZING & WEBP COMPRESSION BEFORE SUPABASE UPLOAD":
+// skaliert ein neu aufgenommenes/ausgewähltes Foto auf dem Client herunter und
+// re-encodiert es als WebP (mit automatischem JPEG-Fallback für Browser ohne
+// WebP-Kodierungsunterstützung, siehe supportsWebpEncoding), BEVOR es überhaupt an die
+// Offline-Warteschlange oder den Online-Upload übergeben wird — läuft vollständig
+// lokal über ein <canvas>, ohne externen Dienst, und funktioniert dadurch unverändert
+// auch ohne Netzverbindung. Nutzen dafür: spürbar kleinere Dateien bei gleicher
+// wahrgenommener Qualität als das bisherige JPEG (WebP komprimiert bei vergleichbarer
+// Qualitätsstufe typischerweise 25-35% kleiner), kleinere data:-URLs im
 // localStorage-Sync-Queue-Eintrag (dessen Größe sonst schnell an praktische
 // localStorage-Grenzen stößt, siehe OFFLINE_SYNC_QUEUE_KEY), kleinere IndexedDB-
-// Cache-Einträge und spürbar schnellere Uploads auf der Baustelle bei schwachem
-// Empfang. Wirft absichtlich NIE einen Fehler nach außen: schlägt das Dekodieren
-// eines einzelnen, ggf. exotischen Bildformats fehl, wird unverändert die
-// Original-Datei zurückgegeben (nur mit einer Konsolenwarnung) — ein einzelnes
-// fehlerhaftes Foto darf niemals den gesamten Foto-Upload blockieren.
-function compressImage(file, maxWidth = 1920, maxHeight = 1080, quality = 0.8) {
-  return new Promise((resolve) => {
-    if (!file || !file.type || !file.type.startsWith("image/")) {
-      resolve(file);
-      return;
-    }
-    const objectUrl = URL.createObjectURL(file);
-    const cleanup = () => URL.revokeObjectURL(objectUrl);
-    const fallbackToOriginal = (reason) => {
-      cleanup();
-      console.warn("Foto-Komprimierung übersprungen, Original wird verwendet:", reason);
-      resolve(file);
-    };
-    const img = new Image();
-    img.onload = () => {
+// Cache-Einträge, spürbar schnellere Uploads auf der Baustelle bei schwachem Empfang
+// und — namensgebend für diese Erweiterung — weniger VRAM-Druck beim Zoomen auf dem
+// iPad, da nie mehr als maxDimension Pixel an der längeren Kante geladen werden
+// müssen. Wirft absichtlich NIE einen Fehler nach außen: schlägt das Dekodieren eines
+// einzelnen, ggf. exotischen Bildformats fehl, wird unverändert die Original-Datei
+// zurückgegeben (nur mit einer Konsolenwarnung) — ein einzelnes fehlerhaftes Foto darf
+// niemals den gesamten Foto-Upload blockieren. Aufrufer: handleUploadPhotos (Mängel-
+// Pin-Fotos) sowie — über resizeFloorPlanImageForUpload weiter unten, das dieselbe
+// WebP-Kodierung für seinen JPEG-fähigen Zweig wiederverwendet — die Multi-File-
+// Grundriss-Skizzen-Uploads. Für Notiz-Fotos gibt es aktuell keinen Upload-Pfad (siehe
+// Einordnung): PlanNoteModal ist bewusst ein reiner Text-Marker ohne Foto-Anhang,
+// dafür also nichts zu verschalten.
+const COMPRESS_IMAGE_DEFAULT_MAX_DIMENSION = 2000;
+const COMPRESS_IMAGE_DEFAULT_QUALITY = 0.82;
+
+// Einmalige, gecachte Feature-Erkennung, ob dieser Browser Canvas-Inhalte tatsächlich
+// als WebP kodieren kann (Kodier-Unterstützung ist NICHT deckungsgleich mit reiner
+// Anzeige-Unterstützung eines <img>) — canvas.toBlob liefert auf Browsern ohne
+// WebP-Encoder entweder gar keinen Blob oder fällt still auf PNG zurück; beides wird
+// hier erkannt, indem der tatsächliche MIME-Type des Ergebnis-Blobs geprüft wird,
+// statt einer reinen Versions-/User-Agent-Prüfung zu vertrauen. Das Ergebnis wird
+// promise-weise zwischengespeichert, damit nicht bei jedem einzelnen Foto erneut ein
+// Test-Canvas erzeugt werden muss.
+let _webpEncodingSupportPromise = null;
+function supportsWebpEncoding() {
+  if (!_webpEncodingSupportPromise) {
+    _webpEncodingSupportPromise = new Promise((resolve) => {
       try {
-        const naturalWidth = img.naturalWidth || img.width;
-        const naturalHeight = img.naturalHeight || img.height;
-        if (!naturalWidth || !naturalHeight) {
-          fallbackToOriginal("Bildabmessungen konnten nicht ermittelt werden.");
-          return;
-        }
-        // Nur verkleinern, nie vergrößern — ein bereits kleineres Foto (z.B. Nahaufnahme
-        // aus einer älteren/einfacheren Kamera) bleibt in seiner Originalauflösung, wird
-        // aber trotzdem als JPEG mit der Ziel-Qualität re-encodiert (siehe unten), damit
-        // z.B. unkomprimierte PNG-Aufnahmen ebenfalls von der Komprimierung profitieren.
-        const downscale = Math.min(1, maxWidth / naturalWidth, maxHeight / naturalHeight);
-        const targetWidth = Math.max(1, Math.round(naturalWidth * downscale));
-        const targetHeight = Math.max(1, Math.round(naturalHeight * downscale));
-
         const canvas = document.createElement("canvas");
-        canvas.width = targetWidth;
-        canvas.height = targetHeight;
-        const ctx = canvas.getContext("2d", { alpha: false });
-        if (!ctx) {
-          fallbackToOriginal("2D-Canvas-Context nicht verfügbar.");
+        canvas.width = 1;
+        canvas.height = 1;
+        if (!canvas.toBlob) {
+          resolve(false);
           return;
         }
-        // Weißer Hintergrund vor dem Zeichnen: JPEG kennt keine Transparenz — ohne dies
-        // würde ein transparenter Bildbereich (z.B. bei einem PNG-Foto) sonst je nach
-        // Browser schwarz statt weiß dargestellt werden.
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, targetWidth, targetHeight);
-        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
-
-        canvas.toBlob(
-          (blob) => {
-            cleanup();
-            if (!blob) {
-              console.warn("Foto-Komprimierung übersprungen, Original wird verwendet: toBlob lieferte kein Ergebnis.");
-              resolve(file);
-              return;
-            }
-            // Dateiname bleibt erhalten (nur die Endung wird auf .jpg vereinheitlicht,
-            // da die Ausgabe jetzt immer JPEG ist) — sanitizeFileName() beim eigentlichen
-            // Storage-Upload (siehe uploadPinPhoto) greift unverändert auf diesen Namen zu.
-            const baseName = (file.name || "foto").replace(/\.[a-zA-Z0-9]+$/, "");
-            const compressedFile = new File([blob], `${baseName}.jpg`, {
-              type: "image/jpeg",
-              lastModified: Date.now(),
-            });
-            resolve(compressedFile);
-          },
-          "image/jpeg",
-          quality
-        );
-      } catch (err) {
-        fallbackToOriginal(err);
+        canvas.toBlob((blob) => resolve(!!blob && blob.type === "image/webp"), "image/webp");
+      } catch {
+        resolve(false);
       }
-    };
-    img.onerror = (err) => fallbackToOriginal(err);
-    img.src = objectUrl;
-  });
+    });
+  }
+  return _webpEncodingSupportPromise;
+}
+
+async function compressImage(file, maxDimension = COMPRESS_IMAGE_DEFAULT_MAX_DIMENSION, quality = COMPRESS_IMAGE_DEFAULT_QUALITY) {
+  if (!file || !file.type || !file.type.startsWith("image/")) return file;
+  const objectUrl = URL.createObjectURL(file);
+  const cleanup = () => URL.revokeObjectURL(objectUrl);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Bild konnte nicht geladen werden."));
+      image.src = objectUrl;
+    });
+
+    const naturalWidth = img.naturalWidth || img.width;
+    const naturalHeight = img.naturalHeight || img.height;
+    if (!naturalWidth || !naturalHeight) {
+      throw new Error("Bildabmessungen konnten nicht ermittelt werden.");
+    }
+
+    // Nur verkleinern, nie vergrößern — ein bereits kleineres Foto (z.B. Nahaufnahme aus
+    // einer älteren/einfacheren Kamera) bleibt in seiner Originalauflösung, wird aber
+    // trotzdem mit der Ziel-Qualität re-encodiert, damit z.B. unkomprimierte PNG-
+    // Aufnahmen ebenfalls von der Komprimierung profitieren. Skaliert an der LÄNGEREN
+    // Kante auf exakt maxDimension, die kürzere Kante folgt proportional.
+    const largestDim = Math.max(naturalWidth, naturalHeight);
+    const downscale = Math.min(1, maxDimension / largestDim);
+    const targetWidth = Math.max(1, Math.round(naturalWidth * downscale));
+    const targetHeight = Math.max(1, Math.round(naturalHeight * downscale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) {
+      throw new Error("2D-Canvas-Context nicht verfügbar.");
+    }
+    // Weißer Hintergrund vor dem Zeichnen: weder JPEG noch das hier primär verwendete
+    // WebP-Encoding (verlustbehaftet, ohne Alpha-Kanal in diesem Einsatz) kennen
+    // Transparenz in dieser Pipeline — ohne dies würde ein transparenter Bildbereich
+    // (z.B. bei einem PNG-Foto) sonst je nach Browser schwarz statt weiß dargestellt.
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, targetWidth, targetHeight);
+    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+    const useWebp = await supportsWebpEncoding();
+    const outputType = useWebp ? "image/webp" : "image/jpeg";
+    const outputExt = useWebp ? "webp" : "jpg";
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, outputType, quality));
+    cleanup();
+    if (!blob) {
+      console.warn("Foto-Komprimierung übersprungen, Original wird verwendet: toBlob lieferte kein Ergebnis.");
+      return file;
+    }
+    // Dateiname bleibt erhalten (nur die Endung wird auf .webp bzw. im Fallback-Fall auf
+    // .jpg vereinheitlicht) — sanitizeFileName() beim eigentlichen Storage-Upload (siehe
+    // uploadPinPhoto) greift unverändert auf diesen Namen zu.
+    const baseName = (file.name || "foto").replace(/\.[a-zA-Z0-9]+$/, "");
+    return new File([blob], `${baseName}.${outputExt}`, { type: outputType, lastModified: Date.now() });
+  } catch (err) {
+    cleanup();
+    console.warn("Foto-Komprimierung übersprungen, Original wird verwendet:", err);
+    return file;
+  }
 }
 
 // ---- Foto-Konvertierung für die Offline-Warteschlange -----------------------------
