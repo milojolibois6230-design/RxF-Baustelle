@@ -80,6 +80,10 @@ import {
   HelpCircle,
   Table,
   Move,
+  CalendarRange,
+  CalendarClock,
+  Flag,
+  TrendingUp,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -335,6 +339,96 @@ const PROJECT_STATUS_META = {
   "On Hold": { text: "text-violet-700", bg: "bg-violet-50", dot: "bg-violet-500" },
   Abgeschlossen: { text: "text-emerald-700", bg: "bg-emerald-50", dot: "bg-emerald-500" },
 };
+
+// ----------------------------------------------------------------------------------
+// BAUZEITENPLAN — MEILENSTEIN-STATUS (project_milestones.status)
+// ----------------------------------------------------------------------------------
+// Gleiches Shape-Muster wie STATUS (Mängel-Pins) oben, damit UI-Stellen (Badge,
+// Pill-Auswahl im MilestoneModal) einheitlich damit arbeiten können.
+const MILESTONE_STATUS_OPTIONS = ["ausstehend", "bearbeitung", "abgeschlossen"];
+
+const MILESTONE_STATUS_META = {
+  ausstehend: { label: "Ausstehend", dot: "bg-slate-400", text: "text-slate-600", bg: "bg-slate-100", ring: "ring-slate-200" },
+  bearbeitung: { label: "In Bearbeitung", dot: "bg-amber-500", text: "text-amber-700", bg: "bg-amber-50", ring: "ring-amber-200" },
+  abgeschlossen: { label: "Abgeschlossen", dot: "bg-emerald-500", text: "text-emerald-700", bg: "bg-emerald-50", ring: "ring-emerald-200" },
+};
+
+// ----------------------------------------------------------------------------------
+// BAUZEITENPLAN — DATUMS-/FORTSCHRITTSHILFSFUNKTIONEN
+// ----------------------------------------------------------------------------------
+// todayDateOnly()/parseDateOnly() arbeiten bewusst rein auf Kalendertagen (keine
+// Uhrzeitkomponente) — sowohl project.start_date/end_date als auch
+// project_milestones.start_date/end_date sind reine SQL "date"-Spalten (kein
+// timestamptz), ein Vergleich inklusive Uhrzeit würde am selben Kalendertag
+// abhängig von der Tageszeit unterschiedliche Ergebnisse liefern (z.B. "heute
+// fällig" würde ab Mitternacht fälschlich schon als "überfällig" gelten).
+function todayDateOnly() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+function parseDateOnly(value) {
+  if (!value) return null;
+  // "YYYY-MM-DD" explizit in lokale Mitternacht statt UTC-Mitternacht parsen (new
+  // Date("YYYY-MM-DD") interpretiert als UTC, was je nach Zeitzone auf den
+  // Vortag zurückfallen kann) — dieselbe Vorsicht wie bei allen Datumsvergleichen
+  // in dieser Datei.
+  const parts = String(value).slice(0, 10).split("-").map(Number);
+  if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return null;
+  const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  d.setHours(0, 0, 0, 0);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+// Zeitlicher Ist-Fortschritt in % — heutiges Datum relativ zu start_date/end_date,
+// auf 0–100 begrenzt (ein Projekt vor Baubeginn zeigt 0%, eines nach dem geplanten
+// Fertigstellungstermin 100%, nie negative oder über 100% hinausgehende Werte).
+// Liefert null, wenn eines der beiden Daten fehlt oder end_date nicht nach
+// start_date liegt (Division durch Null bzw. unsinniger Zeitraum).
+function computeTimeProgressPercent(project) {
+  const start = parseDateOnly(project?.start_date);
+  const end = parseDateOnly(project?.end_date);
+  if (!start || !end) return null;
+  const totalMs = end.getTime() - start.getTime();
+  if (totalMs <= 0) return null;
+  const elapsedMs = todayDateOnly().getTime() - start.getTime();
+  const pct = (elapsedMs / totalMs) * 100;
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
+
+// Geschaffener Ist-Fortschritt in % — Anteil der als "abgeschlossen" markierten
+// Meilensteine an allen Meilensteinen. Liefert null bei keinen Meilensteinen
+// (statt fälschlich 0%, das UI unterscheidet "noch nichts angelegt" von "0 von N
+// erledigt").
+function computeMilestoneProgressPercent(milestones) {
+  if (!Array.isArray(milestones) || milestones.length === 0) return null;
+  const done = milestones.filter((m) => m.status === "abgeschlossen").length;
+  return Math.round((done / milestones.length) * 100);
+}
+
+// "Heute anstehend" — gleicht das heutige Datum mit den Meilensteinen ab und
+// gruppiert sie in drei sich nicht überschneidende Kategorien:
+//   startingToday: start_date === heute (und noch nicht abgeschlossen)
+//   dueToday: end_date === heute (und noch nicht abgeschlossen)
+//   overdue: end_date < heute und noch nicht abgeschlossen (echter Verzug)
+// Ein bereits abgeschlossener Meilenstein taucht bewusst in keiner der drei
+// Kategorien mehr auf, auch wenn sein end_date heute oder in der Vergangenheit
+// liegt — er ist erledigt, kein "Verzug" oder "heute fällig" mehr.
+function getTodaysMilestoneHighlights(milestones) {
+  const today = todayDateOnly().getTime();
+  const startingToday = [];
+  const dueToday = [];
+  const overdue = [];
+  for (const m of milestones || []) {
+    if (m.status === "abgeschlossen") continue;
+    const start = parseDateOnly(m.start_date);
+    const end = parseDateOnly(m.end_date);
+    if (start && start.getTime() === today) startingToday.push(m);
+    if (end && end.getTime() === today) dueToday.push(m);
+    if (end && end.getTime() < today) overdue.push(m);
+  }
+  return { startingToday, dueToday, overdue };
+}
 
 // ----------------------------------------------------------------------------------
 // PROJEKTSPEZIFISCHE GEWERKE-AUSWAHL (project.selected_trades)
@@ -1652,6 +1746,52 @@ async function updatePlanNote(noteId, fields, actor) {
 
 async function deletePlanNote(noteId) {
   const { error } = await supabase.from("plan_notes").delete().eq("id", noteId);
+  if (error) throw error;
+}
+
+// ----------------------------------------------------------------------------------
+// PROJEKT-MEILENSTEINE (BAUZEITENPLAN) — Bauabschnitte/Gewerke-Meilensteine auf
+// Projektebene, siehe supabase_schema_v20_bauzeitenplan.sql sowie ScheduleView/
+// MilestoneModal/ProjectScheduleProgress weiter unten. Bewusst schlank gehalten wie
+// plan_notes (keine Offline-Warteschlange, keine Foto-/Verlaufs-Anhänge) — reine
+// Terminplanung, kein Ersatz für die Mängeldokumentation über pins.
+// ----------------------------------------------------------------------------------
+async function fetchProjectMilestones(projectId) {
+  const { data, error } = await supabase
+    .from("project_milestones")
+    .select("*")
+    .eq("project_id", projectId)
+    .order("start_date", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function createProjectMilestone(projectId, fields, actor) {
+  const payload = {
+    project_id: projectId,
+    title: (fields.title || "").trim(),
+    trade_id: fields.trade_id || null,
+    start_date: fields.start_date || null,
+    end_date: fields.end_date || null,
+    status: fields.status || "ausstehend",
+    created_by: actor?.email || null,
+    updated_by: actor?.email || null,
+  };
+  const { data, error } = await supabase.from("project_milestones").insert(payload).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateProjectMilestone(milestoneId, fields, actor) {
+  const payload = { ...fields, updated_by: actor?.email || null, updated_at: new Date().toISOString() };
+  const { data, error } = await supabase.from("project_milestones").update(payload).eq("id", milestoneId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function deleteProjectMilestone(milestoneId) {
+  const { error } = await supabase.from("project_milestones").delete().eq("id", milestoneId);
   if (error) throw error;
 }
 
@@ -7706,6 +7846,13 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
   const [address, setAddress] = useState(project?.address || "");
   const [status, setStatus] = useState(project?.status || "Geplant");
   const [projectLeader, setProjectLeader] = useState(project?.project_leader || "");
+  // Bauzeitenplan — geplanter Baubeginn/geplante Fertigstellung (Grundlage für den
+  // zeitlichen Ist-Fortschritt, siehe ProjectScheduleProgress/computeTimeProgressPercent).
+  // Bewusst nur diese zwei einfachen Datumsfelder hier im schlanken Anlege-Formular —
+  // die eigentliche Verfeinerung mit einzelnen Meilensteinen passiert separat im neuen
+  // Bereich "Bauzeitenplan" (ScheduleView), nicht hier.
+  const [startDate, setStartDate] = useState(project?.start_date ? String(project.start_date).slice(0, 10) : "");
+  const [endDate, setEndDate] = useState(project?.end_date ? String(project.end_date).slice(0, 10) : "");
   // Baustellen-Info für Nachunternehmer (Site Onboarding) — vier strukturierte
   // Freitextfelder, die neuen Nachunternehmern die Orientierung vor Ort erleichtern
   // (siehe hasOnboardingInfo/buildOnboardingSections sowie die Anzeige im
@@ -7746,6 +7893,8 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
     setSiteContactName(project?.site_contact_name || "");
     setSiteContactPhone(project?.site_contact_phone || "");
     setSiteAmenitiesInfo(project?.site_amenities_info || "");
+    setStartDate(project?.start_date ? String(project.start_date).slice(0, 10) : "");
+    setEndDate(project?.end_date ? String(project.end_date).slice(0, 10) : "");
     setCoverImageFile(null);
     setCoverImagePreview(project?.cover_image_url || null);
     setCoverImageRemoved(false);
@@ -7779,6 +7928,10 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
       setError("Bitte einen Projektnamen vergeben.");
       return;
     }
+    if (startDate && endDate && endDate < startDate) {
+      setError("Das geplante Fertigstellungsdatum darf nicht vor dem geplanten Baubeginn liegen.");
+      return;
+    }
     setError("");
     setSubmitting(true);
     try {
@@ -7794,6 +7947,8 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
         site_contact_name: siteContactName.trim(),
         site_contact_phone: siteContactPhone.trim(),
         site_amenities_info: siteAmenitiesInfo.trim(),
+        start_date: startDate || null,
+        end_date: endDate || null,
       };
       // _coverImageFile ist kein echtes Projektfeld, sondern ein Marker für den
       // Aufrufer (App/handleSaveProject): dort wird die Datei erst NACH dem
@@ -7953,6 +8108,30 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
                   className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
                 />
               </div>
+            </div>
+            <div>
+              <FieldLabel>Geplanter Baubeginn</FieldLabel>
+              <input
+                type="date"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                disabled={submitting}
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+            <div>
+              <FieldLabel>Geplante Fertigstellung</FieldLabel>
+              <input
+                type="date"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                disabled={submitting}
+                className={TEXT_INPUT_CLASS}
+              />
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                Optional — Grundlage für die Fortschrittsleiste im Bauzeitenplan. Einzelne
+                Bauabschnitte/Meilensteine werden separat im Bereich "Bauzeitenplan" gepflegt.
+              </p>
             </div>
           </div>
 
@@ -9392,6 +9571,8 @@ function FloorOverview({
   onDeleteFloor,
   onReorderFloors,
   onExportPdf,
+  milestones = [],
+  onOpenSchedule,
   readOnly = false,
 }) {
   // Bestandsprojekte ohne gespeicherte Gewerke-Auswahl (siehe resolveProjectTradeIds)
@@ -9565,14 +9746,28 @@ function FloorOverview({
               </button>
             )}
           </div>
-          <button
-            onClick={onOpenAddFloor}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
-          >
-            <Plus size={16} /> Neues Geschoss hinzufügen
-          </button>
+          <div className="flex items-center gap-2">
+            {onOpenSchedule && (
+              <button
+                onClick={onOpenSchedule}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50"
+              >
+                <CalendarRange size={15} /> Bauzeitenplan
+              </button>
+            )}
+            <button
+              onClick={onOpenAddFloor}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+            >
+              <Plus size={16} /> Neues Geschoss hinzufügen
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Prominente Fortschrittsleiste + "Heute anstehend"-Widget, siehe ANFORDERUNG
+          "Platziere in der Projektübersicht eine prominente Fortschrittsleiste". */}
+      <ProjectScheduleProgress project={project} milestones={milestones} onOpenSchedule={onOpenSchedule} />
 
       <SiteOnboardingPanel project={project} />
 
@@ -9694,6 +9889,375 @@ function FloorOverview({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function MilestoneStatusBadge({ status }) {
+  const meta = MILESTONE_STATUS_META[status] || MILESTONE_STATUS_META.ausstehend;
+  return (
+    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset ${meta.bg} ${meta.text} ${meta.ring}`}>
+      <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} /> {meta.label}
+    </span>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// ANFORDERUNG "INTEGRATION GESAMT-BAUZEITENPLAN & DYNAMISCHER FORTSCHRITTSBALKEN":
+// prominente Fortschrittsleiste + "Heute anstehend"-Widget, siehe computeTimeProgressPercent/
+// computeMilestoneProgressPercent/getTodaysMilestoneHighlights weiter oben. Wird sowohl
+// direkt in FloorOverview (Projektübersicht, siehe ANFORDERUNG Punkt 3 "Platziere in der
+// Projektübersicht eine prominente Fortschrittsleiste") als auch oben in ScheduleView
+// eingebettet — exakt dieselbe Komponente, damit beide Stellen niemals auseinanderlaufen
+// können. Rendert bewusst NICHTS (null), solange weder ein zeitlicher noch ein
+// meilenstein-basierter Fortschritt berechnet werden kann (weder start_date/end_date noch
+// Meilensteine hinterlegt) — vermeidet unnötige Leerstellen auf Projekten, die dieses
+// Feature (noch) nicht nutzen.
+function ProjectScheduleProgress({ project, milestones = [], onOpenSchedule }) {
+  const timePct = computeTimeProgressPercent(project);
+  const milestonePct = computeMilestoneProgressPercent(milestones);
+  if (timePct === null && milestonePct === null) return null;
+
+  const { startingToday, dueToday, overdue } = getTodaysMilestoneHighlights(milestones);
+  const hasHighlights = startingToday.length > 0 || dueToday.length > 0 || overdue.length > 0;
+
+  return (
+    <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          <TrendingUp size={15} className="text-[#FF2A00]" />
+          <h2 className="text-sm font-bold text-slate-900">Bauzeitenplan &amp; Fortschritt</h2>
+        </div>
+        {onOpenSchedule && (
+          <button
+            onClick={onOpenSchedule}
+            className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 transition hover:text-[#FF2A00]"
+          >
+            Bauzeitenplan öffnen <ChevronRight size={13} />
+          </button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div>
+          <div className="mb-1 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            <span>Zeitlicher Fortschritt</span>
+            <span className="text-slate-700">{timePct === null ? "–" : `${timePct}%`}</span>
+          </div>
+          {timePct === null ? (
+            <p className="text-[11px] text-slate-400">Kein Baubeginn/Fertigstellungsdatum hinterlegt (siehe Projekt bearbeiten).</p>
+          ) : (
+            <>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full rounded-full bg-[#FF2A00] transition-all" style={{ width: `${timePct}%` }} />
+              </div>
+              <p className="mt-1 text-[11px] text-slate-400">
+                {formatDateOnly(project.start_date)} – {formatDateOnly(project.end_date)}
+              </p>
+            </>
+          )}
+        </div>
+        <div>
+          <div className="mb-1 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            <span>Baufortschritt (Meilensteine)</span>
+            <span className="text-slate-700">{milestonePct === null ? "–" : `${milestonePct}%`}</span>
+          </div>
+          {milestonePct === null ? (
+            <p className="text-[11px] text-slate-400">Noch keine Meilensteine im Bauzeitenplan angelegt.</p>
+          ) : (
+            <>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${milestonePct}%` }} />
+              </div>
+              <p className="mt-1 text-[11px] text-slate-400">
+                {milestones.filter((m) => m.status === "abgeschlossen").length} von {milestones.length} Meilenstein
+                {milestones.length !== 1 ? "en" : ""} abgeschlossen
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+
+      {hasHighlights && (
+        <div className="mt-4 border-t border-slate-100 pt-3.5">
+          <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            <CalendarClock size={13} /> Heute anstehend
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {overdue.map((m) => (
+              <span
+                key={`overdue-${m.id}`}
+                title={`Fertigstellung war ${formatDateOnly(m.end_date)} geplant`}
+                className="inline-flex items-center gap-1.5 rounded-full bg-red-50 px-2.5 py-1 text-[11px] font-semibold text-[#FF2A00] ring-1 ring-inset ring-red-200"
+              >
+                <AlertTriangle size={12} /> {m.title} — in Verzug
+              </span>
+            ))}
+            {dueToday.map((m) => (
+              <span
+                key={`due-${m.id}`}
+                className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200"
+              >
+                <Flag size={12} /> {m.title} — heute Fertigstellung geplant
+              </span>
+            ))}
+            {startingToday.map((m) => (
+              <span
+                key={`start-${m.id}`}
+                className="inline-flex items-center gap-1.5 rounded-full bg-sky-50 px-2.5 py-1 text-[11px] font-semibold text-sky-700 ring-1 ring-inset ring-sky-200"
+              >
+                <CalendarRange size={12} /> {m.title} — startet heute
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Bauzeitenplan-Screen (Ebene 2b) — Verfeinerung nach der schlanken Projekterstellung
+// (siehe ANFORDERUNG Punkt 2 "Terminplan-Manager"): Liste der Bauabschnitte/Gewerke-
+// Meilensteine dieses Projekts, sortiert nach Startdatum (Meilensteine ohne Datum am
+// Ende). Embeddet dieselbe ProjectScheduleProgress-Komponente wie FloorOverview, damit
+// beide Fortschrittsanzeigen garantiert übereinstimmen.
+function ScheduleView({ project, milestones, trades = [], loading, onBack, onOpenAddMilestone, onEditMilestone, readOnly = false }) {
+  const tradesById = new Map(trades.map((t) => [t.id, t]));
+  const sortedMilestones = [...(milestones || [])].sort((a, b) => {
+    if (!a.start_date && !b.start_date) return 0;
+    if (!a.start_date) return 1;
+    if (!b.start_date) return -1;
+    return a.start_date < b.start_date ? -1 : a.start_date > b.start_date ? 1 : 0;
+  });
+  const today = todayDateOnly().getTime();
+
+  return (
+    <div className="mx-auto max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
+      <button
+        onClick={onBack}
+        className="mb-4 inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+      >
+        <ChevronLeft size={17} /> Zurück zur Projektübersicht
+      </button>
+
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">Bauzeitenplan</h1>
+          <p className="mt-0.5 text-sm text-slate-500">{project.name}</p>
+        </div>
+        {!readOnly && (
+          <button
+            onClick={onOpenAddMilestone}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+          >
+            <Plus size={16} /> Neuer Meilenstein
+          </button>
+        )}
+      </div>
+
+      <ProjectScheduleProgress project={project} milestones={milestones} />
+
+      {loading ? (
+        <LoadingBlock label="Bauzeitenplan wird geladen…" />
+      ) : sortedMilestones.length === 0 ? (
+        <div className="flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 px-4 py-12 text-center">
+          <CalendarRange size={28} className="text-slate-300" />
+          <p className="text-sm font-semibold text-slate-500">Noch keine Bauabschnitte/Meilensteine angelegt.</p>
+          <p className="max-w-sm text-xs text-slate-400">
+            Meilensteine wie "Rohbau", "Elektro Rohinstallation" oder "Fliesenarbeiten" bilden hier den Bauzeitenplan
+            dieses Projekts ab.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {sortedMilestones.map((m) => {
+            const trade = m.trade_id ? tradesById.get(m.trade_id) : null;
+            const end = parseDateOnly(m.end_date);
+            const isOverdue = m.status !== "abgeschlossen" && end && end.getTime() < today;
+            return (
+              <button
+                key={m.id}
+                onClick={() => onEditMilestone(m)}
+                className={`flex w-full flex-wrap items-center gap-3 rounded-xl border bg-white p-3.5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md ${
+                  isOverdue ? "border-red-200" : "border-slate-200"
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-sm font-semibold text-slate-900">{m.title}</h3>
+                    {isOverdue && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-bold text-[#FF2A00] ring-1 ring-inset ring-red-200">
+                        <AlertTriangle size={10} /> In Verzug
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    {trade && <TradeBadge trade={trade} />}
+                    <span className="inline-flex items-center gap-1 text-xs text-slate-500">
+                      <CalendarRange size={12} className="text-slate-400" />
+                      {formatDateOnly(m.start_date)} – {formatDateOnly(m.end_date)}
+                    </span>
+                  </div>
+                </div>
+                <MilestoneStatusBadge status={m.status} />
+                <ChevronRight size={16} className="shrink-0 text-slate-300" />
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Anlegen/Bearbeiten eines einzelnen Meilensteins. Bewusst EINZELNE Gewerke-Auswahl
+// (<select>, nicht TradeChipsPicker) — anders als bei Mängel-Pins gehört ein
+// Bauabschnitt fachlich zu genau einem Gewerk. Direct-Delete-Button im Footer, gleiches
+// Muster wie PlanNoteModal (siehe handleDeleteMilestone) statt eines separaten
+// ConfirmDialog.
+function MilestoneModal({ mode, milestone, trades = [], onClose, onSave, onDelete }) {
+  const [title, setTitle] = useState(milestone?.title || "");
+  const [tradeId, setTradeId] = useState(milestone?.trade_id || "");
+  const [startDate, setStartDate] = useState(milestone?.start_date ? String(milestone.start_date).slice(0, 10) : "");
+  const [endDate, setEndDate] = useState(milestone?.end_date ? String(milestone.end_date).slice(0, 10) : "");
+  const [status, setStatus] = useState(milestone?.status || "ausstehend");
+  const [submitting, setSubmitting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+  const isNew = mode === "create";
+  const busy = submitting || deleting;
+
+  const handleSubmit = async () => {
+    if (!title.trim()) {
+      setError("Bitte einen Titel für den Bauabschnitt/Meilenstein vergeben.");
+      return;
+    }
+    if (startDate && endDate && endDate < startDate) {
+      setError("Das Fertigstellungsdatum darf nicht vor dem Startdatum liegen.");
+      return;
+    }
+    setError("");
+    setSubmitting(true);
+    try {
+      await onSave({
+        title: title.trim(),
+        trade_id: tradeId || null,
+        start_date: startDate || null,
+        end_date: endDate || null,
+        status,
+      });
+    } catch (err) {
+      console.error("Meilenstein konnte nicht gespeichert werden:", err);
+      setError(err?.message || "Der Meilenstein konnte nicht gespeichert werden. Bitte erneut versuchen.");
+      setSubmitting(false);
+    }
+  };
+
+  const handleDeleteClick = async () => {
+    setDeleting(true);
+    try {
+      await onDelete(milestone.id);
+    } catch (err) {
+      console.error("Meilenstein konnte nicht gelöscht werden:", err);
+      setError(err?.message || "Der Meilenstein konnte nicht gelöscht werden. Bitte erneut versuchen.");
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-50`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[90vh] sm:max-w-lg sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>{isNew ? "Neuer Meilenstein" : "Meilenstein bearbeiten"}</p>
+            <h2 className="text-lg font-bold text-slate-900">{isNew ? "Bauabschnitt anlegen" : milestone?.title}</h2>
+          </div>
+          <button onClick={onClose} disabled={busy} className={MODAL_CLOSE_BTN_DISABLED}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className={MODAL_BODY_SCROLL}>
+          <div>
+            <FieldLabel>Titel</FieldLabel>
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              disabled={busy}
+              placeholder="z.B. Rohbau, Elektro Rohinstallation, Trockenbau"
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+
+          <div>
+            <FieldLabel>Gewerk</FieldLabel>
+            <select value={tradeId} onChange={(e) => setTradeId(e.target.value)} disabled={busy} className={TEXT_INPUT_CLASS}>
+              <option value="">Kein Gewerk zugeordnet</option>
+              {trades.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <FieldLabel>Startdatum</FieldLabel>
+              <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={busy} className={TEXT_INPUT_CLASS} />
+            </div>
+            <div>
+              <FieldLabel>Fertigstellung</FieldLabel>
+              <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} disabled={busy} className={TEXT_INPUT_CLASS} />
+            </div>
+          </div>
+
+          <div>
+            <FieldLabel>Status</FieldLabel>
+            <div className="flex flex-wrap gap-2">
+              {MILESTONE_STATUS_OPTIONS.map((opt) => {
+                const meta = MILESTONE_STATUS_META[opt];
+                const active = status === opt;
+                return (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => setStatus(opt)}
+                    disabled={busy}
+                    className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 ring-inset transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                      active ? `${meta.bg} ${meta.text} ${meta.ring}` : "bg-white text-slate-500 ring-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} /> {meta.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {error && (
+            <p className="rounded-lg bg-red-50 px-3 py-2 text-xs font-medium text-[#FF2A00] ring-1 ring-inset ring-red-200">{error}</p>
+          )}
+        </div>
+
+        <div className={MODAL_FOOTER_ROW}>
+          {!isNew && (
+            <button
+              onClick={handleDeleteClick}
+              disabled={busy}
+              className="mr-auto inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Trash2 size={15} /> {deleting ? "Wird gelöscht…" : "Löschen"}
+            </button>
+          )}
+          <button onClick={onClose} disabled={busy} className={BTN_SECONDARY}>
+            Abbrechen
+          </button>
+          <button onClick={handleSubmit} disabled={busy} className={BTN_PRIMARY}>
+            <Save size={15} /> {submitting ? "Wird gespeichert…" : "Speichern"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -13137,6 +13701,14 @@ function App() {
   const [floorPlans, setFloorPlans] = useState([]); // Grundrisskizzen der aktuell geöffneten Etage (inkl. leichter Pin-Zusammenfassung)
   const [loadingFloorPlans, setLoadingFloorPlans] = useState(false);
 
+  // Bauzeitenplan — Meilensteine des aktuell geöffneten Projekts (siehe ScheduleView/
+  // ProjectScheduleProgress). Bewusst OHNE Offline-Cache (anders als floors/floorPlans/
+  // pins) — reine Terminplanung, keine vor-Ort-Dokumentationspflicht, für die eine
+  // Offline-Verfügbarkeit auf der Baustelle entscheidend wäre.
+  const [milestones, setMilestones] = useState([]);
+  const [loadingMilestones, setLoadingMilestones] = useState(false);
+  const [milestoneModalState, setMilestoneModalState] = useState(null); // { mode: "create" | "edit", milestone }
+
   const [pins, setPins] = useState([]); // Pins der aktuell geöffneten Grundrissskizze, inkl. pin_photos
   const [loadingPins, setLoadingPins] = useState(false);
 
@@ -13379,6 +13951,32 @@ function App() {
         }
       } finally {
         if (!cancelled) setLoadingFloors(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProjectId]);
+
+  // Bauzeitenplan-Meilensteine des aktuell geöffneten Projekts — lädt parallel zu den
+  // Etagen (gleiche Abhängigkeit selectedProjectId), bewusst ohne Offline-Cache/
+  // Fallback (siehe Kommentar bei der milestones-State-Deklaration oben).
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setMilestones([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setLoadingMilestones(true);
+      try {
+        const data = await fetchProjectMilestones(selectedProjectId);
+        if (!cancelled) setMilestones(data);
+      } catch (err) {
+        console.error("Bauzeitenplan-Meilensteine konnten nicht geladen werden:", err);
+        if (!cancelled) setGlobalError("Bauzeitenplan-Meilensteine konnten nicht geladen werden. Bitte erneut versuchen.");
+      } finally {
+        if (!cancelled) setLoadingMilestones(false);
       }
     })();
     return () => {
@@ -13729,6 +14327,14 @@ function App() {
     setScreen("sketches");
   };
 
+  // Führt zum Bauzeitenplan (Ebene 2b, parallel zur Etagenübersicht) — bewusst über
+  // einen eigenen screen-Wert statt eines Reiters innerhalb von FloorOverview, damit
+  // die Navigation dem etablierten Breadcrumb-Muster dieser App folgt (siehe
+  // Breadcrumb-Leiste weiter unten).
+  const openScheduleView = () => {
+    setScreen("schedule");
+  };
+
   const openFloorPlanSketch = (id) => {
     setSelectedFloorPlanId(id);
     setScreen("plan");
@@ -13839,6 +14445,44 @@ function App() {
     // Fehler werden (bis auf den separat abgefangenen Titelbild-Upload oben) NICHT
     // hier gefangen: ProjectFormModal wartet auf dieses Promise und zeigt einen
     // Fehlertext direkt im Modal, falls Insert/Update scheitern.
+  };
+
+  // ---------------------------------------------------------------------------------
+  // BAUZEITENPLAN — MEILENSTEIN-HANDLER (siehe ScheduleView/MilestoneModal)
+  // ---------------------------------------------------------------------------------
+  const openAddMilestoneModal = () => {
+    if (!requireAuth()) return;
+    setMilestoneModalState({ mode: "create", milestone: null });
+  };
+
+  const openEditMilestoneModal = (milestone) => {
+    if (!requireAuth()) return;
+    setMilestoneModalState({ mode: "edit", milestone });
+  };
+
+  const handleSaveMilestone = async (fields) => {
+    if (milestoneModalState.mode === "create") {
+      const created = await createProjectMilestone(selectedProjectId, fields, currentActor);
+      setMilestones((prev) => [...prev, created]);
+    } else {
+      const updated = await updateProjectMilestone(milestoneModalState.milestone.id, fields, currentActor);
+      setMilestones((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+    }
+    setMilestoneModalState(null);
+    // Fehler werden bewusst NICHT hier gefangen — MilestoneModal wartet auf dieses
+    // Promise und zeigt einen Fehlertext direkt im Modal (gleiches Muster wie
+    // handleSaveProject/ProjectFormModal).
+  };
+
+  // Direktes Löschen aus dem Modal-Footer heraus, ohne separaten Bestätigungsdialog —
+  // gleiches, bereits etabliertes Muster wie handleDeleteNote/PlanNoteModal (siehe
+  // ANFORDERUNG "Direct Delete in Pin- & Notiz-Modals"), bewusst auch für Meilensteine
+  // übernommen statt ConfirmDialog: ein Bauabschnitt trägt deutlich weniger Risiko
+  // (keine Fotos/Verlauf/Unterpins) als ein Mängel-Pin.
+  const handleDeleteMilestone = async (milestoneId) => {
+    await deleteProjectMilestone(milestoneId);
+    setMilestones((prev) => prev.filter((m) => m.id !== milestoneId));
+    setMilestoneModalState(null);
   };
 
   const confirmDeleteProject = async () => {
@@ -14839,10 +15483,18 @@ function App() {
                 <span className="text-slate-300">/</span>
                 <button
                   onClick={() => setScreen("floors")}
-                  className={`transition hover:text-[#FF2A00] ${screen === "floors" ? "font-semibold text-[#FF2A00]" : "text-slate-500"}`}
+                  className={`transition hover:text-[#FF2A00] ${
+                    screen === "floors" || screen === "schedule" ? "font-semibold text-[#FF2A00]" : "text-slate-500"
+                  }`}
                 >
                   {project.name}
                 </button>
+              </>
+            )}
+            {project && screen === "schedule" && (
+              <>
+                <span className="text-slate-300">/</span>
+                <span className="font-semibold text-[#FF2A00]">Bauzeitenplan</span>
               </>
             )}
             {floor && (screen === "sketches" || screen === "plan") && (
@@ -14970,6 +15622,21 @@ function App() {
           onDeleteFloor={handleDeleteFloorClick}
           onReorderFloors={handleReorderFloors}
           onExportPdf={openPdfExportModal}
+          milestones={milestones}
+          onOpenSchedule={openScheduleView}
+          readOnly={!session}
+        />
+      )}
+
+      {screen === "schedule" && project && (
+        <ScheduleView
+          project={project}
+          milestones={milestones}
+          trades={projectTrades}
+          loading={loadingMilestones}
+          onBack={() => setScreen("floors")}
+          onOpenAddMilestone={openAddMilestoneModal}
+          onEditMilestone={openEditMilestoneModal}
           readOnly={!session}
         />
       )}
@@ -15097,6 +15764,17 @@ function App() {
           plan={editFloorPlanModalState.plan}
           onClose={() => setEditFloorPlanModalState(null)}
           onSave={handleUpdateFloorPlanSketch}
+        />
+      )}
+
+      {milestoneModalState && (
+        <MilestoneModal
+          mode={milestoneModalState.mode}
+          milestone={milestoneModalState.milestone}
+          trades={projectTrades}
+          onClose={() => setMilestoneModalState(null)}
+          onSave={handleSaveMilestone}
+          onDelete={handleDeleteMilestone}
         />
       )}
 
