@@ -3405,6 +3405,31 @@ function filterExportPins(pins, filters) {
 // übereinstimmen.
 const PDF_STATUS_RGB = { offen: [255, 42, 0], bearbeitung: [245, 158, 11], erledigt: [16, 185, 129] };
 
+// ANFORDERUNG "PIN-DESIGN AUF DEM PLAN (FARBLOS & NEUTRAL)": einheitliche, neutrale
+// Füllfarbe für Pin-Marker, die DIREKT AUF DER PLANFLÄCHE gezeichnet werden (Übersichts-
+// seite jeder Skizze in drawFloorPinsReportSection sowie die Pin-Plan-Ausschnitte je
+// Mangelkarte) — bewusst eine eigene, von PDF_STATUS_RGB getrennte Konstante, da
+// Status-Badges und die Legende weiterhin unverändert ihre Statusfarbe behalten (siehe
+// dortige Aufrufstellen) und nur die Planflächen-Darstellung selbst neutral wird, exakt
+// dieselbe Abgrenzung wie bei der monochromen Pin-Darstellung in der Live-Planansicht
+// (siehe PinMarker). jsPDF bietet ohne Zusatz-Plugin keine verlässliche Flächen-
+// transparenz — der "leicht transparente" Effekt wird stattdessen über einen weißen
+// Kontrast-Ring hinter dem dunklen Marker nachgebildet (siehe Aufrufstellen).
+const PDF_PIN_NEUTRAL_RGB = [15, 23, 42]; // #0F172A, identisch mit inkColor()
+
+// ANFORDERUNG "PIN-AUSSCHNITT-BILD (PLAN-CROP FÜR JEDEN PIN)": kompakte, quadratische
+// Planausschnitt-Miniatur, die in drawFloorPinsReportSection JEDER Mangel-Karte
+// zusätzlich zu ihren Foto-Uploads beigefügt wird — zeigt auf einen Blick, WO GENAU auf
+// dem Plan sich dieser Mangel befindet, nach demselben Prinzip wie der bereits
+// bestehende Detail-Zoom im Einzel-Pin-Export (siehe cropImageDataUrl/
+// SINGLE_PIN_PLAN_CROP_RATIO bei generateSinglePinPdf), hier aber bewusst kleiner
+// dimensioniert, da sie nur EINE von mehreren Informationen auf der Karte ist, nicht
+// deren Hauptinhalt.
+const FLOOR_REPORT_PIN_CROP_SIZE_MM = 30;
+const FLOOR_REPORT_PIN_CROP_RATIO = 0.24;
+const FLOOR_REPORT_PIN_CROP_MAX_OUTPUT_PX = 260;
+const FLOOR_REPORT_PIN_CROP_QUALITY = 0.68;
+
 // Zeichnet den Blickrichtungsindikator ("View Cone") eines Pins auf einer
 // Planübersicht-Seite im PDF — 1:1 an die interaktive Planansicht angepasst (siehe
 // ViewCone-Komponente): dort ist der Indikator ein halbtransparenter Fächer/
@@ -3956,6 +3981,17 @@ async function drawFloorPinsReportSection(
     .map((pin) => ({ ...pin, exportNumber: exportNumberEntryById.get(pin.id)?.label ?? "" }))
     .sort((a, b) => comparePinNumberEntries(exportNumberEntryById.get(a.id), exportNumberEntryById.get(b.id)));
 
+  // ANFORDERUNG "PIN-AUSSCHNITT-BILD (PLAN-CROP FÜR JEDEN PIN)": hält die ROHE, noch
+  // unkomprimierte Planbild-Datenquelle (volle beim Laden erhaltene Auflösung) fest,
+  // damit die weiter unten pro Mangel-Karte gezeichneten Planausschnitte (siehe
+  // cropImageDataUrl-Aufruf in der Pin-Schleife) scharf bleiben, statt auf der bereits
+  // für die große Planübersicht herunterskalierten Kopie (imgData nach
+  // compressImageDataUrl, siehe unten) zu basieren. Wird NUR einmal pro Skizze geladen
+  // (kein zusätzlicher Netzwerk-Request je Pin) und bleibt null, falls der Plan nicht
+  // geladen werden konnte — die Ausschnitte zeigen dann denselben Platzhalter-Hinweis
+  // wie die große Planübersicht.
+  let rawPlanImageDataUrl = null;
+
   // ---- Seite 1 (dieser Skizze) — Deckblatt & visuelle Planübersicht ---------------
   if (!isFirstSection) doc.addPage("a4", "landscape");
   {
@@ -4046,6 +4082,9 @@ async function drawFloorPinsReportSection(
           imgData = await loadFloorPlanImageWithRetry(plan.image_url, planKind);
         }
         if (imgData) {
+          // Rohe Datenquelle sichern, BEVOR sie unten für die Planübersicht
+          // herunterskaliert/überschrieben wird — siehe rawPlanImageDataUrl oben.
+          rawPlanImageDataUrl = imgData.dataUrl;
           // Vor dem Einbetten auf PDF-taugliche Auflösung herunterskalieren & als JPEG
           // komprimieren (siehe compressImageDataUrl) — entscheidend für die Dateigröße.
           imgData = await compressImageDataUrl(imgData.dataUrl, PDF_PLAN_MAX_WIDTH, PDF_PLAN_MAX_HEIGHT, PDF_PLAN_JPEG_QUALITY);
@@ -4063,12 +4102,20 @@ async function drawFloorPinsReportSection(
     }
 
     if (imgRect) {
+      // ANFORDERUNG "PIN-DESIGN AUF DEM PLAN (FARBLOS & NEUTRAL)": die Marker auf der
+      // großen Planübersicht nutzen bewusst PDF_PIN_NEUTRAL_RGB statt der Statusfarbe
+      // (PDF_STATUS_RGB) — ein weißer Kontrast-Ring dahinter bildet den "leicht
+      // transparenten" Effekt nach, da jsPDF ohne Zusatz-Plugin keine verlässliche
+      // Flächentransparenz bietet (siehe Kommentar an PDF_PIN_NEUTRAL_RGB). Die
+      // Statusfarbe bleibt unverändert in der Legende oben (legendItem) und in den
+      // Status-Badges der Mangel-Karten weiter unten erhalten.
       numberedPins.forEach((pin) => {
         const px = imgRect.x + (pin.x / 100) * imgRect.w;
         const py = imgRect.y + (pin.y / 100) * imgRect.h;
-        const rgb = PDF_STATUS_RGB[pin.status] || PDF_STATUS_RGB.offen;
-        drawPdfViewCone(doc, px, py, pin.angle, rgb);
-        doc.setFillColor(...rgb);
+        drawPdfViewCone(doc, px, py, pin.angle, PDF_PIN_NEUTRAL_RGB);
+        doc.setFillColor(255, 255, 255);
+        doc.circle(px, py, 3.9, "F");
+        doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
         doc.circle(px, py, 3.4, "F");
         // Etwas kleinere Schrift bei längeren Unter-Nummern (siehe computePinNumberById).
         doc.setFontSize(String(pin.exportNumber).length > 2 ? 5.3 : 7);
@@ -4173,9 +4220,20 @@ async function drawFloorPinsReportSection(
       // Fotos soll im Bericht sichtbar dokumentiert sein, nicht stillschweigend fehlen.
       const photoRows = Math.max(1, Math.ceil(photos.length / PDF_PHOTO_GRID_COLS));
       const photoSectionHeight = 9.5 + photoRows * PDF_PHOTO_GRID_ROW_HEIGHT_MM + (photoRows - 1) * PDF_PHOTO_GRID_GAP_MM;
+      // ANFORDERUNG "PIN-AUSSCHNITT-BILD": feste Zusatzhöhe für Beschriftung + die
+      // quadratische Planausschnitt-Miniatur (siehe Zeichnung weiter unten zwischen
+      // Kommentar und Fotoraster).
+      const planCropSectionHeight = 4.5 + FLOOR_REPORT_PIN_CROP_SIZE_MM + 4;
 
       const estimatedCardHeight =
-        headerBottomOffset + 6 + shortFieldsHeight + commentBlockHeight + 4 + photoSectionHeight + cardBottomGap;
+        headerBottomOffset +
+        6 +
+        shortFieldsHeight +
+        commentBlockHeight +
+        4 +
+        planCropSectionHeight +
+        photoSectionHeight +
+        cardBottomGap;
 
       // ---- Seitenumbruch-Entscheidung: Karte als Ganzes auf eine neue Seite, wenn sie
       // hier nicht mehr vollständig Platz findet (y > margin verhindert eine leere
@@ -4264,12 +4322,82 @@ async function drawFloorPinsReportSection(
         commentY += 4.6;
       }
 
+      // ---- ANFORDERUNG "PIN-AUSSCHNITT-BILD (PLAN-CROP FÜR JEDEN PIN)": kompakte,
+      // quadratische Miniatur des Grundrisses, zentriert auf die exakte Pin-Position
+      // (cropImageDataUrl, dieselbe Technik wie der Detail-Zoom im Einzel-Pin-Export,
+      // siehe generateSinglePinPdf), direkt im Anschluss an den Kommentar und VOR dem
+      // Fotoraster — zeigt sofort, WO GENAU auf dem Plan dieser Mangel liegt, ohne dafür
+      // separat zur Planübersichtsseite dieser Skizze blättern zu müssen. Nutzt
+      // rawPlanImageDataUrl (oben einmal pro Skizze geladen, siehe dort) statt eines
+      // zusätzlichen Netzwerk-Requests je Pin. Der Marker darauf ist bewusst ebenfalls
+      // monochrom/neutral (PDF_PIN_NEUTRAL_RGB), siehe ANFORDERUNG "PIN-DESIGN AUF DEM
+      // PLAN". ----
+      let planCropY = commentY + 4;
+      if (planCropY + 4.5 + FLOOR_REPORT_PIN_CROP_SIZE_MM > pageHeight - margin) {
+        doc.addPage("a4", "portrait");
+        pageWidth = doc.internal.pageSize.getWidth();
+        pageHeight = doc.internal.pageSize.getHeight();
+        planCropY = margin;
+      }
+      doc.setFontSize(7.5);
+      bold();
+      mutedColor();
+      doc.text("LAGE AUF DEM PLAN", margin, planCropY);
+      inkColor();
+      planCropY += 4.5;
+      doc.setDrawColor(226, 232, 240);
+      doc.setFillColor(248, 250, 252);
+      doc.roundedRect(margin, planCropY, FLOOR_REPORT_PIN_CROP_SIZE_MM, FLOOR_REPORT_PIN_CROP_SIZE_MM, 2, 2, "FD");
+      if (rawPlanImageDataUrl) {
+        try {
+          const cropped = await cropImageDataUrl(
+            rawPlanImageDataUrl,
+            (pin.x ?? 50) / 100,
+            (pin.y ?? 50) / 100,
+            FLOOR_REPORT_PIN_CROP_RATIO,
+            FLOOR_REPORT_PIN_CROP_MAX_OUTPUT_PX,
+            FLOOR_REPORT_PIN_CROP_QUALITY
+          );
+          const cropRatio = Math.min(FLOOR_REPORT_PIN_CROP_SIZE_MM / cropped.width, FLOOR_REPORT_PIN_CROP_SIZE_MM / cropped.height);
+          const cropW = cropped.width * cropRatio;
+          const cropH = cropped.height * cropRatio;
+          const cropImgX = margin + (FLOOR_REPORT_PIN_CROP_SIZE_MM - cropW) / 2;
+          const cropImgY = planCropY + (FLOOR_REPORT_PIN_CROP_SIZE_MM - cropH) / 2;
+          doc.addImage(cropped.dataUrl, "JPEG", cropImgX, cropImgY, cropW, cropH);
+          const markerX = cropImgX + cropped.pinRatioX * cropW;
+          const markerY = cropImgY + cropped.pinRatioY * cropH;
+          drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB);
+          doc.setFillColor(255, 255, 255);
+          doc.circle(markerX, markerY, 2.6, "F");
+          doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
+          doc.circle(markerX, markerY, 2.2, "F");
+        } catch (err) {
+          console.error(`Planausschnitt für Pin "${pin.exportNumber}" konnte nicht erzeugt werden:`, err);
+          doc.setFontSize(7);
+          mutedColor();
+          doc.text("Ausschnitt nicht verfügbar", margin + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, planCropY + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, {
+            align: "center",
+            maxWidth: FLOOR_REPORT_PIN_CROP_SIZE_MM - 4,
+          });
+          inkColor();
+        }
+      } else {
+        doc.setFontSize(7);
+        mutedColor();
+        doc.text("Kein Grundriss verfügbar", margin + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, planCropY + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, {
+          align: "center",
+          maxWidth: FLOOR_REPORT_PIN_CROP_SIZE_MM - 4,
+        });
+        inkColor();
+      }
+      normal();
+
       // ---- Fotoraster — volle Kartenbreite, 2 Spalten, AUSNAHMSLOS alle Fotos dieses
       // Pins (dank photoCache, siehe preloadPinPhotosForPdf oben vor der Schleife
       // parallel geladen, ohne weiteren Netzwerk-Request an dieser Stelle). Startet
-      // unterhalb des Kommentarendes; ein eigener Seitenumbruch VOR dem Raster stellt
+      // unterhalb des Planausschnitts; ein eigener Seitenumbruch VOR dem Raster stellt
       // sicher, dass zumindest die Überschrift nicht isoliert am Seitenende landet. ----
-      let photoY = commentY + 4;
+      let photoY = planCropY + FLOOR_REPORT_PIN_CROP_SIZE_MM + 5;
       if (photoY + 8 > pageHeight - margin) {
         doc.addPage("a4", "portrait");
         pageWidth = doc.internal.pageSize.getWidth();
@@ -4346,21 +4474,147 @@ async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, 
   return fileName;
 }
 
-// ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": Sammelbericht über
+// ANFORDERUNG "RESTRUKTURIERUNG DES PDF-EXPORTS: SKIZZEN-BASIERTE SEQUENZ": eigenes
+// Deckblatt als ERSTE Seite des Sammelberichts, vor der ersten Skizze — zeigt
+// Projektname, Etage, Erstellungsdatum/Ersteller sowie eine Zusammenfassung ALLER
+// ausgewählten Skizzen (Name, Kategorie, Mängelzahlen je Status) inkl. Gesamtsumme.
+// Ersetzt NICHT den kompakten Kopfbereich der einzelnen Skizzen-Übersichtsseiten (siehe
+// drawFloorPinsReportSection) — der bleibt je Skizze unverändert erhalten; das Deckblatt
+// liefert zusätzlich den Überblick über den GESAMTEN Bericht, bevor Skizze 1 im Detail
+// folgt (siehe ANFORDERUNG Punkt 1, Schritt 1 der geforderten Sequenz).
+function drawMultiSketchCoverPage(doc, { project, floor, plans, pinsByPlanId, generatedBy }) {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 16;
+  const contentWidth = pageWidth - margin * 2;
+
+  const bold = () => doc.setFont("helvetica", "bold");
+  const normal = () => doc.setFont("helvetica", "normal");
+  const brandColor = () => doc.setTextColor(255, 42, 0); // #FF2A00, exaktes Markenrot
+  const inkColor = () => doc.setTextColor(15, 23, 42); // #0F172A
+  const mutedColor = () => doc.setTextColor(100, 116, 139);
+
+  doc.setFontSize(13);
+  bold();
+  brandColor();
+  doc.text("REISNER × FRANK", pageWidth - margin, margin + 6, { align: "right" });
+  doc.setFontSize(8);
+  normal();
+  mutedColor();
+  doc.text("Baustellendokumentation", pageWidth - margin, margin + 11, { align: "right" });
+
+  doc.setFontSize(21);
+  bold();
+  inkColor();
+  doc.text(`${project.name}`, margin, margin + 10);
+  doc.setFontSize(14);
+  doc.text(`${floor.name} — Sammelbericht`, margin, margin + 19);
+
+  doc.setFontSize(9.5);
+  normal();
+  mutedColor();
+  doc.text(
+    `Erstellungsdatum: ${formatDateOnly(new Date().toISOString())} · Erstellt von: ${generatedBy || "–"} · ${plans.length} ausgewählte Skizze(n)`,
+    margin,
+    margin + 26
+  );
+
+  const headerBottom = margin + 32;
+  doc.setDrawColor(226, 232, 240);
+  doc.line(margin, headerBottom, pageWidth - margin, headerBottom);
+
+  // ---- Gesamt-Zusammenfassung über ALLE ausgewählten Skizzen hinweg ----------------
+  let allOpen = 0;
+  let allProgress = 0;
+  let allDone = 0;
+  const rows = plans.map((plan) => {
+    const planPins = pinsByPlanId.get(plan.id) || [];
+    const open = planPins.filter((p) => p.status === "offen").length;
+    const progress = planPins.filter((p) => p.status === "bearbeitung").length;
+    const done = planPins.filter((p) => p.status === "erledigt").length;
+    allOpen += open;
+    allProgress += progress;
+    allDone += done;
+    const categoryMeta = PLAN_CATEGORY_META[getPlanCategory(plan)] || PLAN_CATEGORY_META.grundriss;
+    return { name: plan.name, categoryLabel: categoryMeta.label, open, progress, done };
+  });
+
+  let legendY = headerBottom + 10;
+  let legendX = margin;
+  const legendItem = (label, count, rgb) => {
+    doc.setFillColor(...rgb);
+    doc.circle(legendX + 1.3, legendY - 1.3, 1.3, "F");
+    doc.setFontSize(10);
+    normal();
+    inkColor();
+    const text = `${count} ${label}`;
+    doc.text(text, legendX + 4.5, legendY);
+    legendX += doc.getTextWidth(text) + 12;
+  };
+  legendItem("offen", allOpen, PDF_STATUS_RGB.offen);
+  legendItem("in Bearbeitung", allProgress, PDF_STATUS_RGB.bearbeitung);
+  legendItem("erledigt", allDone, PDF_STATUS_RGB.erledigt);
+  doc.setFontSize(10);
+  bold();
+  inkColor();
+  doc.text(`Gesamt: ${allOpen + allProgress + allDone} Mängel-Pin(s)`, pageWidth - margin, legendY, { align: "right" });
+  normal();
+
+  // ---- Tabellarische Übersicht je Skizze, in Export-Reihenfolge (= Reihenfolge der
+  // nachfolgenden Abschnitte) -------------------------------------------------------
+  let tableY = legendY + 10;
+  doc.setFontSize(8.5);
+  bold();
+  mutedColor();
+  doc.text("SKIZZE", margin, tableY);
+  doc.text("KATEGORIE", margin + contentWidth * 0.42, tableY);
+  doc.text("OFFEN", margin + contentWidth * 0.64, tableY, { align: "right" });
+  doc.text("IN BEARB.", margin + contentWidth * 0.8, tableY, { align: "right" });
+  doc.text("ERLEDIGT", margin + contentWidth, tableY, { align: "right" });
+  tableY += 3;
+  doc.setDrawColor(226, 232, 240);
+  doc.line(margin, tableY, pageWidth - margin, tableY);
+  tableY += 6;
+
+  rows.forEach((row, idx) => {
+    if (tableY > pageHeight - margin) {
+      doc.addPage("a4", "landscape");
+      tableY = margin + 6;
+    }
+    doc.setFontSize(9.5);
+    normal();
+    inkColor();
+    const nameLines = doc.splitTextToSize(`${idx + 1}. ${row.name}`, contentWidth * 0.4);
+    doc.text(nameLines, margin, tableY);
+    mutedColor();
+    doc.text(row.categoryLabel, margin + contentWidth * 0.42, tableY);
+    inkColor();
+    doc.text(String(row.open), margin + contentWidth * 0.64, tableY, { align: "right" });
+    doc.text(String(row.progress), margin + contentWidth * 0.8, tableY, { align: "right" });
+    doc.text(String(row.done), margin + contentWidth, tableY, { align: "right" });
+    tableY += Math.max(6, nameLines.length * 4.6);
+  });
+}
+
+// ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL" (erweitert um
+// "RESTRUKTURIERUNG DES PDF-EXPORTS: SKIZZEN-BASIERTE SEQUENZ"): Sammelbericht über
 // eine vom Nutzer in der Geschossansicht gezielt gewählte Teilmenge der Grundriss-
-// skizzen eines Geschosses (siehe SketchExportModal/handleExportSelectedSketchesPdf) —
-// EIN gemeinsames PDF-Dokument, in dem für jede ausgewählte Skizze exakt derselbe
-// Abschnitt erscheint wie im bisherigen Einzelskizzen-Bericht (Deckblatt mit
-// nummerierten Pin-Markierungen, anschließend die fließenden Mangel-Karten inkl.
-// 2-Spalten-Fotoraster, siehe drawFloorPinsReportSection oben) — nicht ausgewählte
-// Skizzen tauchen im Ergebnis-PDF an keiner Stelle auf. plans ist die vom Nutzer im
-// Auswahl-Modal bestätigte Teilmenge (in der gewünschten Reihenfolge, siehe dort);
-// pinsByPlanId ordnet jeder Skizzen-ID ihre VOLLSTÄNDIGE, ungefilterte Pin-Liste
-// (inkl. Fotos) zu — diese Funktion filtert selbst nicht, das aufrufende
-// handleExportSelectedSketchesPdf lädt bereits gezielt nur die benötigten Daten.
+// skizzen eines Geschosses (siehe SketchExportModal/handleExportSelectedSketchesPdf).
+// Reihenfolge im Dokument strikt sequenziell: 1. Deckblatt (siehe
+// drawMultiSketchCoverPage oben), 2. Skizze 1 — Planübersicht MIT allen ihren Pins,
+// DIREKT GEFOLGT von genau den Mangel-Karten dieser einen Skizze, 3. Skizze 2 — dieselbe
+// Abfolge, usw. (siehe drawFloorPinsReportSection, hier je Skizze EIN kompletter
+// Aufruf) — zu keinem Zeitpunkt werden erst alle Planübersichten gesammelt und die
+// Mangel-Karten ans Ende verschoben. Nicht ausgewählte Skizzen tauchen im Ergebnis-PDF
+// an keiner Stelle auf. plans ist die vom Nutzer im Auswahl-Modal bestätigte Teilmenge
+// (in der gewünschten Reihenfolge, siehe dort); pinsByPlanId ordnet jeder Skizzen-ID
+// ihre VOLLSTÄNDIGE, ungefilterte Pin-Liste (inkl. Fotos) zu — diese Funktion filtert
+// selbst nicht, das aufrufende handleExportSelectedSketchesPdf lädt bereits gezielt nur
+// die benötigten Daten.
 async function generateMultiSketchFloorReportPdf({ project, floor, plans, pinsByPlanId, trades, generatedBy, includeOnboarding = false }) {
   const jsPDF = await loadJsPdf();
   const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape", compress: true });
+  drawMultiSketchCoverPage(doc, { project, floor, plans, pinsByPlanId, generatedBy });
   for (let i = 0; i < plans.length; i++) {
     const plan = plans[i];
     const planPins = pinsByPlanId.get(plan.id) || [];
@@ -4377,7 +4631,10 @@ async function generateMultiSketchFloorReportPdf({ project, floor, plans, pinsBy
       // immer leer, jede ausgewählte Skizze erscheint vollständig ungefiltert.
       filterSummary: null,
       includeOnboarding,
-      isFirstSection: i === 0,
+      // isFirstSection ist jetzt IMMER false: Seite 1 des Dokuments trägt bereits das
+      // neue Deckblatt (siehe oben), jede Skizze — auch die erste — beginnt deshalb
+      // bewusst auf einer eigenen, neuen Seite.
+      isFirstSection: false,
     });
   }
   const fileName = `${sanitizeFileNamePart(project.name)}_${sanitizeFileNamePart(floor.name)}_Sammelbericht_${plans.length}_Skizzen_${new Date()
