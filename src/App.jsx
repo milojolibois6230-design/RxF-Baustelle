@@ -11510,6 +11510,15 @@ function SketchOverview({
 // ursprünglichen Fassung vertikal gespiegelt (samt entsprechend gespiegeltem
 // SVG-Sweep-Flag), NICHT per zusätzlichem Rotations-Offset "korrigiert" — der Fächer
 // zeigt dadurch bei jedem Winkel korrekt in dieselbe Richtung wie der Kompass.
+// ANFORDERUNG "FARBGLEICHHEIT VON PIN UND BLICKRICHTUNG": die Füll- und Kontur-
+// Opazität des Sichtkegels liegt jetzt bei 0.5 / 0.6 statt vorher 0.22 / 0.55 — beide
+// Werte damit innerhalb des geforderten 40–60%-Korridors (vorher lag die Füllung mit
+// 22% klar darunter). colorClass wird am Call-Site (siehe PinMarker) NICHT mehr auf ein
+// neutrales Grau gesetzt, sondern exakt auf denselben Rotton "text-[#D32F2F]" wie die
+// MapPin-Füllung "fill-[#D32F2F]/50" — bewusst beide als literale Tailwind-Arbitrary-
+// Value-Klassen direkt im JSX (kein dynamisch zusammengesetzter Klassenname aus einer
+// JS-Variable), weil Tailwinds JIT-Scanner nur literale Klassen-Strings im Quellcode
+// erkennt und eine Variable hier sonst zu fehlendem CSS führen würde.
 function ViewCone({ angle, colorClass }) {
   return (
     <svg
@@ -11526,9 +11535,9 @@ function ViewCone({ angle, colorClass }) {
         d="M 50 96 L 18 38 A 40 40 0 0 1 82 38 Z"
         className={colorClass}
         fill="currentColor"
-        opacity="0.22"
+        opacity="0.5"
       />
-      <path d="M 50 96 L 18 38 A 40 40 0 0 1 82 38 Z" className={colorClass} fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.55" />
+      <path d="M 50 96 L 18 38 A 40 40 0 0 1 82 38 Z" className={colorClass} fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.6" />
     </svg>
   );
 }
@@ -11628,10 +11637,13 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
         className="relative flex flex-col items-center drop-shadow-md"
         style={{ transform: `scale(${counterScale})`, transformOrigin: "50% 100%" }}
       >
-        {/* Sichtkegel: war schon immer halbtransparent (opacity 0.22 Füllung / 0.55
-            Kontur, siehe ViewCone-Komponente oben) und damit von Anfang an konform zur
-            ANFORDERUNG "Sichtkegel sollen semi-transparent bleiben" — hier unverändert. */}
-        <ViewCone angle={pin.angle ?? 0} colorClass="text-slate-700" />
+        {/* ANFORDERUNG "FARBGLEICHHEIT VON PIN UND BLICKRICHTUNG": der Sichtkegel nutzt
+            jetzt denselben Rotton wie der Pin-Körper (text-[#D32F2F] hier, fill-
+            [#D32F2F]/50 unten bei MapPin) statt des bisherigen neutralen Grautons
+            (text-slate-700) — keine Farbabweichung zwischen Kegel und Hauptpin mehr. Die
+            Opazität (0.5 Füllung / 0.6 Kontur, siehe ViewCone-Komponente oben) liegt
+            innerhalb des geforderten 40–60%-Korridors. */}
+        <ViewCone angle={pin.angle ?? 0} colorClass="text-[#D32F2F]" />
         {pin.status === "offen" && !isDragging && (
           <span className="absolute -top-1 h-7 w-7 animate-ping rounded-full bg-slate-900 opacity-30" />
         )}
