@@ -11065,7 +11065,11 @@ function ViewCone({ angle, colorClass }) {
 const LONG_PRESS_MS = 500;
 
 function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, viewScale = 1 }) {
-  const s = STATUS[pin.status];
+  // ANFORDERUNG "FARBLOSE / MONOCHROME MÄNGEL-PINS": der Marker auf der Planfläche
+  // liest die Statusfarbe (STATUS[pin.status]) absichtlich nicht mehr aus — Farbe als
+  // Unterscheidungsmerkmal bleibt ausschließlich der Sidebar-Liste, den Badges und dem
+  // PinModal vorbehalten (dort weiterhin unverändert über STATUS, siehe z.B.
+  // sortedListPins-Rendering weiter unten in FloorPlanView).
   // Gegen-Skalierung: die sichtbare Pin-Größe bleibt unabhängig vom Zoomfaktor der
   // Grundriss-"Bühne" konstant (wie bei Kartenmarkern üblich), während die Position
   // (left/top in %, weiter unten am Button) exakt am Grundriss verankert bleibt — das
@@ -11136,7 +11140,7 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
       // gleichzeitig anwendbarer Utility-Klassen), damit Tailwinds Kaskade nicht von der
       // Reihenfolge der generierten Utilities abhängt. Kontur/Form selbst bleiben
       // unverändert scharf (nur Deckkraft, kein Weichzeichnen/Blur).
-      className={`absolute z-10 -translate-x-1/2 -translate-y-full transition-opacity duration-150 focus:outline-none hover:opacity-100 focus:opacity-100 active:opacity-100 ${
+      className={`group absolute z-10 -translate-x-1/2 -translate-y-full transition-opacity duration-150 focus:outline-none hover:opacity-100 focus:opacity-100 active:opacity-100 ${
         isDragging ? "opacity-100" : "opacity-70"
       } ${draggable ? "cursor-pointer active:cursor-grabbing" : ""}`}
       title={`${pin.title} (${pin.angle ?? 0}°)${draggable ? " — gedrückt halten zum Verschieben" : ""}`}
@@ -11145,21 +11149,35 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
         className="relative flex flex-col items-center drop-shadow-md"
         style={{ transform: `scale(${counterScale})`, transformOrigin: "50% 100%" }}
       >
-        <ViewCone angle={pin.angle ?? 0} colorClass={s.text} />
+        {/* ANFORDERUNG "FARBLOSE / MONOCHROME MÄNGEL-PINS": der Blickrichtungs-Fächer
+            wird bewusst NICHT mehr statusfarben (s.text) eingefärbt, sondern einheitlich
+            neutral grau, damit kein "buntes" Element auf der Planfläche übrig bleibt. Die
+            Status-Farblogik (STATUS-Konstante) bleibt unverändert für Badges, Filterleiste,
+            Sidebar-Liste und PDF-Export erhalten — nur die Planflächen-Darstellung selbst
+            wird neutral. */}
+        <ViewCone angle={pin.angle ?? 0} colorClass="text-slate-700" />
+        {/* Der pulsierende Hinweisring für offene Pins bleibt als reine
+            Aufmerksamkeits-Animation erhalten, aber ebenfalls farblos/neutral (dunkles
+            Grau statt Markenrot) statt im bisherigen Status-Ton. */}
         {pin.status === "offen" && !isDragging && (
-          <span className={`absolute -top-1 h-7 w-7 animate-ping rounded-full ${s.dot} opacity-40`} />
+          <span className="absolute -top-1 h-7 w-7 animate-ping rounded-full bg-slate-900 opacity-30" />
         )}
-        {/* Visuelle Pin-Nummerierung: voll deckender, statusfarbener Marker (statt weißer
-            Fläche mit dünner Kontur) als Hintergrund für eine fett gedruckte, weiße
-            Nummer — zentriert im runden "Kopf" des Icons, für 1:1-Abgleich mit der
-            "Nr."-Spalte im Geschoss-Export (siehe pinNumberById in FloorPlanView).
-            Etwas kleinere Schrift bei längeren Unter-Nummern (z.B. "12.3" für per
-            "Duplizieren" erzeugte Kopien, siehe computePinNumberById), damit die
-            Nummer im kleinen Markerkopf lesbar bleibt. */}
+        {/* Visuelle Pin-Nummerierung: dezenter, monochromer Marker statt des bisherigen,
+            grellen statusfarbenen Markers — leicht transparentes Dunkelgrau/Schwarz als
+            Füllung (fill-slate-900/80) mit scharfer, heller 1,5px-Kontur (stroke-white/90)
+            für hohe Lesbarkeit auf jedem Planhintergrund. Beim Hovern, Antippen (Fokus)
+            oder Auswählen/Verschieben (isDragging) wird die Füllung dunkler/deckender und
+            die Kontur dicker (stroke-2 statt der Basis-strokeWidth 1,5) — der aktive Pin
+            hebt sich dadurch klar vom Plan ab, ohne dass Farbe als Unterscheidungsmerkmal
+            zurückkehrt. Status (offen/in Bearbeitung/erledigt) bleibt weiterhin über die
+            farbigen Badges in der Sidebar-Liste und im PinModal sofort erkennbar — nur die
+            Planfläche selbst wird bewusst farblos gehalten (siehe ANFORDERUNG). */}
         <MapPin
           size={30}
           strokeWidth={1.5}
-          className={`${s.text} fill-current transition group-hover:scale-110`}
+          className={`fill-slate-900/80 stroke-white/90 transition-all duration-150 group-hover:scale-110 group-hover:fill-slate-900/95 group-hover:stroke-2 group-focus:fill-slate-900/95 group-focus:stroke-2 group-active:fill-slate-900/95 group-active:stroke-2 ${
+            isDragging ? "fill-slate-900/95 stroke-2" : ""
+          }`}
           style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.35))" }}
         />
         {number != null && (
