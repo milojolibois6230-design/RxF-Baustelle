@@ -3432,6 +3432,20 @@ const FLOOR_REPORT_PIN_CROP_RATIO = 0.24;
 const FLOOR_REPORT_PIN_CROP_MAX_OUTPUT_PX = 260;
 const FLOOR_REPORT_PIN_CROP_QUALITY = 0.68;
 
+// FIX "RIESIGER SCHWARZER KREIS AUF DEM MINI-CROP": der Sichtkegel (drawPdfViewCone)
+// und der Marker-Punkt darauf nutzten bislang dieselben absoluten mm-Radien wie auf
+// der großformatigen Planübersicht (radius 9mm bzw. Kreis 2.6/2.2mm) — auf der dort
+// ca. 180-250mm breiten Seite unauffällig klein, auf der hier nur 30mm großen
+// "Lage auf dem Plan"-Box (siehe FLOOR_REPORT_PIN_CROP_SIZE_MM) dagegen ca. 30% des
+// gesamten Ausschnitts und damit deutlich zu groß — genau das vom Nutzer gemeldete
+// Deckungsproblem. Beide Werte werden jetzt als Anteil von
+// FLOOR_REPORT_PIN_CROP_SIZE_MM abgeleitet statt fest verdrahtet, damit sie bei einer
+// künftigen Änderung der Box-Größe automatisch mitskalieren und nie wieder über die
+// Box hinauswachsen können.
+const FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM = FLOOR_REPORT_PIN_CROP_SIZE_MM * 0.15; // 4.5mm
+const FLOOR_REPORT_PIN_CROP_MARKER_OUTER_MM = FLOOR_REPORT_PIN_CROP_SIZE_MM * 0.06; // 1.8mm (weißer Kontrastring)
+const FLOOR_REPORT_PIN_CROP_MARKER_INNER_MM = FLOOR_REPORT_PIN_CROP_SIZE_MM * 0.05; // 1.5mm (Kernpunkt)
+
 // Zeichnet den Blickrichtungsindikator ("View Cone") eines Pins auf einer
 // Planübersicht-Seite im PDF — 1:1 an die interaktive Planansicht angepasst (siehe
 // ViewCone-Komponente): dort ist der Indikator ein halbtransparenter Fächer/
@@ -3449,10 +3463,17 @@ const FLOOR_REPORT_PIN_CROP_QUALITY = 0.68;
 // ViewCone im Screen-Rendering hinter MapPin/PinMarker liegt. Von beiden
 // PDF-Planübersichten geteilt (generateProjectReportPdf & generateFloorPinsTablePdf)
 // UND vom Grundriss-Ausschnitt des Einzel-Pin-Exports (generateSinglePinPdf).
-function drawPdfViewCone(doc, px, py, angleDeg, statusRgb) {
+// coneRadius (mm, optional): Standard 9mm passt für die großformatigen
+// Planübersichten (ca. 180-250mm Seitenbreite), auf denen dieser Parameter bislang
+// überall implizit mitlief. Für die kleinen "Lage auf dem Plan"-Mini-Crops
+// (FLOOR_REPORT_PIN_CROP_SIZE_MM, nur 30mm) wäre derselbe Wert ca. 30% der gesamten
+// Box und hat dort sichtbar den Ausschnitt verdeckt (siehe FIX-Kommentar an
+// FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM oben) — Aufrufer an kleinen Boxen übergeben
+// deshalb jetzt explizit einen zur jeweiligen Box-Größe proportionalen Radius.
+function drawPdfViewCone(doc, px, py, angleDeg, statusRgb, coneRadius = 9) {
   const theta = ((angleDeg || 0) * Math.PI) / 180;
   const halfSpread = Math.atan2(32, 58); // exakter Öffnungswinkel des ViewCone-SVG-Pfads
-  const radius = 9;
+  const radius = coneRadius;
   const segments = 10;
   const pointAt = (a) => [px + radius * Math.sin(a), py - radius * Math.cos(a)];
 
@@ -3839,11 +3860,13 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
         doc.addImage(cropped.dataUrl, "JPEG", cropImgX, cropImgY, cropW, cropH);
         const markerX = cropImgX + cropped.pinRatioX * cropW;
         const markerY = cropImgY + cropped.pinRatioY * cropH;
-        drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB);
+        // FIX: Radius/Marker proportional zur 30mm-Box statt der fest verdrahteten
+        // Planübersichts-Werte (siehe FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM oben).
+        drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB, FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM);
         doc.setFillColor(255, 255, 255);
-        doc.circle(markerX, markerY, 2.6, "F");
+        doc.circle(markerX, markerY, FLOOR_REPORT_PIN_CROP_MARKER_OUTER_MM, "F");
         doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
-        doc.circle(markerX, markerY, 2.2, "F");
+        doc.circle(markerX, markerY, FLOOR_REPORT_PIN_CROP_MARKER_INNER_MM, "F");
       } catch (err) {
         console.error(`Planausschnitt für Pin "${pin.exportNumber}" konnte nicht erzeugt werden:`, err);
         doc.setFontSize(7.5);
@@ -4590,11 +4613,13 @@ async function drawFloorPinsReportSection(
           doc.addImage(cropped.dataUrl, "JPEG", cropImgX, cropImgY, cropW, cropH);
           const markerX = cropImgX + cropped.pinRatioX * cropW;
           const markerY = cropImgY + cropped.pinRatioY * cropH;
-          drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB);
+          // FIX: Radius/Marker proportional zur 30mm-Box statt der fest verdrahteten
+          // Planübersichts-Werte (siehe FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM oben).
+          drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB, FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM);
           doc.setFillColor(255, 255, 255);
-          doc.circle(markerX, markerY, 2.6, "F");
+          doc.circle(markerX, markerY, FLOOR_REPORT_PIN_CROP_MARKER_OUTER_MM, "F");
           doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
-          doc.circle(markerX, markerY, 2.2, "F");
+          doc.circle(markerX, markerY, FLOOR_REPORT_PIN_CROP_MARKER_INNER_MM, "F");
         } catch (err) {
           console.error(`Planausschnitt für Pin "${pin.exportNumber}" konnte nicht erzeugt werden:`, err);
           doc.setFontSize(7);
@@ -5118,9 +5143,17 @@ async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, t
       doc.addImage(cropped.dataUrl, "JPEG", detailImgX, detailImgY, detailW, detailH);
       const markerX = detailImgX + cropped.pinRatioX * detailW;
       const markerY = detailImgY + cropped.pinRatioY * detailH;
-      drawPdfViewCone(doc, markerX, markerY, pin.angle, rgb);
+      // FIX "RIESIGER SCHWARZER KREIS AUF DEM MINI-CROP": derselbe proportionale Ansatz
+      // wie bei FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM (siehe dort) — der Radius richtet
+      // sich nach der tatsächlichen Box-Größe dieses Exports (rightW × detailBoxH) statt
+      // nach dem für die großformatige Planübersicht gedachten festen 9mm-Standardwert.
+      // Der Punktradius bekommt zusätzlich eine Untergrenze von 3mm, damit die
+      // zweistellige Pin-Nummer darin weiterhin lesbar bleibt.
+      const detailConeRadius = Math.min(rightW, detailBoxH) * 0.15;
+      const detailMarkerRadius = Math.max(3, Math.min(rightW, detailBoxH) * 0.04);
+      drawPdfViewCone(doc, markerX, markerY, pin.angle, rgb, detailConeRadius);
       doc.setFillColor(...rgb);
-      doc.circle(markerX, markerY, 3, "F");
+      doc.circle(markerX, markerY, detailMarkerRadius, "F");
       // Etwas kleinere Schrift bei längeren Unter-Nummern (siehe computePinNumberById).
       doc.setFontSize(String(exportNumber).length > 2 ? 5.3 : 7);
       bold();
