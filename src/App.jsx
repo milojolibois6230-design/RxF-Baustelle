@@ -312,7 +312,9 @@ function pinFieldValueChanged(key, newVal, oldVal) {
 }
 
 // Menschenlesbare Bezeichnungen + Icons für die Aktions-Typen in pin_activity_log —
-// verwendet sowohl im Verlauf im Pin-Modal als auch im PDF-Export.
+// verwendet ausschließlich im Verlauf im Pin-Modal (PinActivityHistory). Keiner der
+// drei PDF-Exportfunktionen (Gesamt-, Geschoss-/Sammel- und Einzelpin-Export) druckt
+// die Historie, siehe Kommentar "HINWEIS ZUR HISTORIE" in drawPinDetailPage.
 const PIN_ACTIVITY_META = {
   created: { label: "Angelegt", icon: Plus },
   status_changed: { label: "Status geändert", icon: CheckSquare },
@@ -3660,6 +3662,9 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
   );
   coverLine("Exportdatum", formatDateTime(new Date().toISOString()));
   coverLine("Erstellt von", generatedBy);
+  // ANFORDERUNG "LAYOUT UND UPDATE-LOGIK FÜR DEN PDF-EXPORT": fester Empfänger-Hinweis
+  // auf dem Deckblatt, wie explizit vorgegeben.
+  coverLine("Empfänger", "Reisner & Frank GmbH");
 
   y += 3;
   bold();
@@ -3676,7 +3681,87 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     y += 6;
   });
   y += 3;
-  doc.text(`${numberedPins.length} Mängel-Pin(s) in diesem Bericht.`, margin, y);
+
+  // ---- Status-Übersicht (ANFORDERUNG "LAYOUT UND UPDATE-LOGIK FÜR DEN PDF-EXPORT"):
+  // Gesamtanzahl, Aufschlüsselung nach Plänen/Geschossen sowie die nächste anstehende
+  // Fristsetzung unter den exportierten Pins — ergänzt die bisherige reine Filter-
+  // zusammenfassung um eine auf einen Blick erfassbare Kennzahlen-Übersicht. Die
+  // Fristsetzung wird AUS DEN ECHTEN PIN-DATEN berechnet (nächstes offenes
+  // Fälligkeitsdatum), nicht hartkodiert — das Beispieldatum in der ANFORDERUNG
+  // ("16.10.2026") diente nur der Format-Illustration.
+  bold();
+  doc.text("Status-Übersicht", margin, y);
+  normal();
+  y += 7;
+
+  const totalOpen = numberedPins.filter((p) => p.status === "offen").length;
+  const totalProgress = numberedPins.filter((p) => p.status === "bearbeitung").length;
+  const totalDone = numberedPins.filter((p) => p.status === "erledigt").length;
+  doc.setFontSize(10);
+  doc.text(
+    `Gesamtanzahl Pins: ${numberedPins.length}  (offen: ${totalOpen} · in Bearbeitung: ${totalProgress} · erledigt: ${totalDone})`,
+    margin,
+    y,
+    { maxWidth: contentWidth }
+  );
+  y += 7;
+
+  const coverPlanBreakdown = [];
+  const coverSeenPlanIds = new Set();
+  for (const pin of numberedPins) {
+    if (pin.plan && !coverSeenPlanIds.has(pin.plan.id)) {
+      coverSeenPlanIds.add(pin.plan.id);
+      const floorName = floors.find((f) => f.id === pin.plan.floor_id)?.name || "–";
+      coverPlanBreakdown.push({ floorName, planName: pin.plan.name, planId: pin.plan.id });
+    }
+  }
+  const orphanCoverCount = numberedPins.filter((p) => !p.plan).length;
+  coverPlanBreakdown.sort((a, b) =>
+    a.floorName !== b.floorName ? a.floorName.localeCompare(b.floorName) : a.planName.localeCompare(b.planName)
+  );
+
+  bold();
+  doc.setFontSize(9);
+  doc.text("Aufschlüsselung nach Geschoss / Plan:", margin, y);
+  normal();
+  y += 6;
+  doc.setFontSize(9.5);
+  coverPlanBreakdown.forEach((entry) => {
+    if (y > pageHeight - margin - 10) {
+      doc.addPage();
+      y = margin + 10;
+    }
+    const count = numberedPins.filter((p) => p.plan?.id === entry.planId).length;
+    doc.text(`•  ${entry.floorName} — ${entry.planName}: ${count} Pin(s)`, margin, y, { maxWidth: contentWidth });
+    y += 5.5;
+  });
+  if (orphanCoverCount > 0) {
+    if (y > pageHeight - margin - 10) {
+      doc.addPage();
+      y = margin + 10;
+    }
+    doc.text(`•  Ohne zugeordneten Plan: ${orphanCoverCount} Pin(s)`, margin, y, { maxWidth: contentWidth });
+    y += 5.5;
+  }
+  y += 2;
+
+  const pinsWithDueDate = numberedPins.filter((p) => p.due_date && p.status !== "erledigt");
+  let nextDueLabel = "Keine offene Frist gesetzt";
+  if (pinsWithDueDate.length > 0) {
+    const nextDue = [...pinsWithDueDate].sort((a, b) => new Date(a.due_date) - new Date(b.due_date))[0];
+    nextDueLabel = `${formatDateOnly(nextDue.due_date)}  (Pin ${nextDue.exportNumber} — ${nextDue.title})`;
+  }
+  if (y > pageHeight - margin - 10) {
+    doc.addPage();
+    y = margin + 10;
+  }
+  bold();
+  doc.setFontSize(9);
+  doc.text("Nächste Fristsetzung:", margin, y);
+  normal();
+  doc.setFontSize(9.5);
+  doc.text(nextDueLabel, margin + 42, y, { maxWidth: contentWidth - 42 });
+  doc.setFontSize(11);
   y += 10;
 
   // Baustellen-Info für Nachunternehmer (optional, siehe includeOnboarding-Checkbox
@@ -3702,47 +3787,33 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
   // Platzhalter.
   const drawPinDetailPage = async (pin, rawPlanImageDataUrl) => {
     doc.addPage();
-    doc.setFontSize(14);
+
+    // ANFORDERUNG "LAYOUT UND UPDATE-LOGIK FÜR DEN PDF-EXPORT": neue Kopfzeile im
+    // Format "Pin [Nummer] | [Kategorie: Mangel / Restleistung] | [Raum / Bereich]".
+    // INTERPRETATION: das Datenmodell kennt aktuell keine Unterscheidung zwischen
+    // "Mangel" und "Restleistung" (jeder Pin ist inhaltlich ein Mangel) — die
+    // Kategorie wird deshalb bewusst fest mit "Mangel" beschriftet, statt ungeprüft
+    // eine neue Datenstruktur einzuführen. Der bisherige Pin-Titel bleibt zusätzlich
+    // als zweite Zeile sichtbar, damit beim Umbau des Headers keine Information
+    // verloren geht (Zero-Regression).
+    doc.setFontSize(13);
     bold();
-    doc.text(`Pin ${pin.exportNumber} — ${pin.title}`, margin, 20, { maxWidth: contentWidth });
+    doc.text(`Pin ${pin.exportNumber}  |  Mangel  |  ${pin.area || "Bereich n. a."}`, margin, 20, { maxWidth: contentWidth });
+    doc.setFontSize(10);
     normal();
+    doc.setTextColor(100, 116, 139);
+    doc.text(pin.title || "–", margin, 26, { maxWidth: contentWidth });
+    doc.setTextColor(0, 0, 0);
     doc.setFontSize(10);
 
-    let dy = 30;
-    const field = (label, value) => {
-      bold();
-      doc.text(`${label}:`, margin, dy);
-      normal();
-      doc.text(String(value || "–"), margin + 34, dy, { maxWidth: contentWidth - 34 });
-      dy += 6;
-    };
-    field("Etage", pin.floor.name);
-    field("Grundrissskizze", pin.plan?.name);
-    field("Status", STATUS[pin.status]?.label || pin.status);
-    field("Priorität", PRIORITY[pin.priority]?.label || pin.priority);
-    field("Gewerke", getPinTradeNames(pin, tradesById) || null);
-    field("Bereich", pin.area);
-    field("Frist", pin.due_date ? formatDateOnly(pin.due_date) : null);
-    field("Ersteller", pin.created_by);
-    field("Angelegt am", formatDateTime(pin.created_at));
+    let dy = 34;
 
-    dy += 2;
-    bold();
-    doc.text("Beschreibung:", margin, dy);
-    dy += 6;
-    normal();
-    const descLines = doc.splitTextToSize(pin.description || "–", contentWidth);
-    doc.text(descLines, margin, dy);
-    dy += descLines.length * 5 + 4;
-
-    // ANFORDERUNG "PLANAUSSCHNITT (CROP)": dieselbe Technik wie im Geschoss-/
-    // Sammelbericht (siehe FLOOR_REPORT_PIN_CROP_* bei drawFloorPinsReportSection) —
-    // bewusst dieselben, bereits dort etablierten Maße/Konstanten wiederverwendet,
-    // damit alle PDF-Exporte optisch konsistent bleiben.
-    if (dy + 4.5 + FLOOR_REPORT_PIN_CROP_SIZE_MM > pageHeight - margin) {
-      doc.addPage();
-      dy = margin;
-    }
+    // ANFORDERUNG "PLANAUSSCHNITT (CROP)": steht jetzt DIREKT nach der Kopfzeile statt
+    // nach Stammdaten/Beschreibung — neue Abschnittsreihenfolge lautet Header →
+    // Planausschnitt → Stammdaten → Chronologie/Historie → Fotodokumentation.
+    // Dieselbe, bereits im Geschoss-/Sammelbericht etablierte Technik (siehe
+    // FLOOR_REPORT_PIN_CROP_* bei drawFloorPinsReportSection), damit alle PDF-Exporte
+    // optisch konsistent bleiben.
     bold();
     doc.text("Lage auf dem Plan:", margin, dy);
     dy += 5.5;
@@ -3794,8 +3865,52 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
       doc.setTextColor(0, 0, 0);
       doc.setFontSize(10);
     }
-    dy += FLOOR_REPORT_PIN_CROP_SIZE_MM + 6;
+    dy += FLOOR_REPORT_PIN_CROP_SIZE_MM + 7;
 
+    // ANFORDERUNG "BLUEPRINT FÜR ALLE GESCHOSS-PDF-EXPORTE": das kompakte 4-Felder-
+    // Kartenformat (Gewerk / Status & Frist / Befund / Foto) aus dem referenzierten
+    // Mängelbericht (Word-Export vom 02.10., ARN62) ist jetzt der verbindliche Standard
+    // für den projektweiten Gesamtbericht. Ersetzt den bisherigen, deutlich
+    // ausführlicheren Stammdaten-Block (Titel/Etage/Grundrissskizze/Priorität/Bereich/
+    // Ersteller/Angelegt am als neun Einzelfelder) sowie den separaten Chronologie/
+    // Historie-Abschnitt (erst in dieser Session zuvor ergänzt) — beide entfallen hier
+    // bewusst, weil das Blueprint-Format sie nicht vorsieht. Titel und Bereich bleiben
+    // weiterhin sichtbar (Titel als zweite Headerzeile, Bereich im Pipe-Header), gehen
+    // also trotz Wegfall der Einzelfelder nicht verloren. Kein "Maßnahme"-Feld (siehe
+    // Rückfrage/Antwort): die App hat dafür keine eigene Datenquelle, eine KI-generierte
+    // Nachbesserungsempfehlung wäre erfundener Inhalt und keine echte Pin-Angabe.
+    const field = (label, value) => {
+      if (dy > pageHeight - margin) {
+        doc.addPage();
+        dy = margin;
+      }
+      bold();
+      doc.text(`${label}:`, margin, dy);
+      normal();
+      doc.text(String(value || "–"), margin + 34, dy, { maxWidth: contentWidth - 34 });
+      dy += 6;
+    };
+    field("Gewerk", getPinTradeNames(pin, tradesById) || null);
+    field("Status & Frist", `${STATUS[pin.status]?.label || pin.status || "–"} | ${pin.due_date ? formatDateOnly(pin.due_date) : "–"}`);
+
+    dy += 2;
+    if (dy > pageHeight - margin - 10) {
+      doc.addPage();
+      dy = margin;
+    }
+    bold();
+    doc.text("Befund:", margin, dy);
+    dy += 6;
+    normal();
+    const descLines = doc.splitTextToSize(pin.description || "–", contentWidth);
+    doc.text(descLines, margin, dy);
+    dy += descLines.length * 5 + 4;
+
+    // "Foto" (Blueprint-Feldname, Singular) zeigt hier bewusst die ECHTEN eingebetteten
+    // Aufnahmen statt eines Seitenverweises: der Seitenverweis im Word-Blueprint ergab
+    // nur Sinn, weil dort ein bereits fertiges, separates PDF referenziert wurde — der
+    // App-Export hier erzeugt sein eigenes Dokument und hat die Originalfotos direkt
+    // zur Hand, ein Verweis wäre ein Rückschritt gegenüber dem bisherigen Funktionsumfang.
     // GUARANTEED UNIFORM IMAGE RESIZING: 2-Spalten-Raster mit fester Zeilenhöhe (siehe
     // PDF_PHOTO_GRID_COLS/PDF_PHOTO_GRID_ROW_HEIGHT_MM), seitenübergreifend falls nötig.
     // Fotos DIESES Pins werden vorab parallel geladen und auf ein einheitliches
@@ -3810,7 +3925,7 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
         dy = margin;
       }
       bold();
-      doc.text("Fotos:", margin, dy);
+      doc.text("Foto:", margin, dy);
       dy += 6;
       normal();
       const projectPinPhotoCache = await preloadPinPhotosForPdf([pin]);
@@ -3833,12 +3948,12 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
       if (col !== 0) dy += cellH + PDF_PHOTO_GRID_GAP_MM;
       dy += 2;
     }
-    // EXPORT CLEANUP (NO HISTORY): die Bearbeitungshistorie/das Änderungsprotokoll
-    // (pin_activity_log) wird hier bewusst NICHT mehr gedruckt — sie bleibt exklusiv
-    // der internen Ansicht vorbehalten (siehe PinActivityHistory im Pin-Bearbeiten-
-    // Modal). Alle drei PDF-Exportfunktionen (Gesamt-, Geschoss- und Einzelpin-Export)
-    // ignorieren pin_activity_log konsequent; die anderen beiden hatten ohnehin nie
-    // einen Historie-Abschnitt gedruckt.
+    // HINWEIS ZUR HISTORIE: pin_activity_log wird hier bewusst NICHT gedruckt. Ein
+    // Chronologie/Historie-Abschnitt war kurzzeitig Teil dieser Funktion (siehe
+    // Versionshistorie dieser Datei), wurde aber mit der Umstellung auf das kompakte
+    // Blueprint-Kartenformat (Gewerk/Status & Frist/Befund/Foto) wieder entfernt, da
+    // das Blueprint keinen Historie-Abschnitt vorsieht. drawFloorPinsReportSection und
+    // generateSinglePinPdf drucken ebenfalls weiterhin keine Historie.
   };
 
   // ---- 2. + 3. KOMBINIERT, JE SKIZZE: Planübersicht MIT allen ihren Pins, DIREKT
@@ -11498,62 +11613,81 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
         onClick(pin);
       }}
       style={{ left: `${pin.x}%`, top: `${pin.y}%`, touchAction: draggable ? "none" : undefined }}
-      // ANFORDERUNG "PIN-TRANSPARENZ FÜR BESSERE PLAN-LESEBARKEIT": Pins verdecken die
-      // darunterliegende Zeichnung nicht mehr vollständig — Standard-Deckkraft ca. 70%
-      // (opacity-70), beim Hovern (Maus), Antippen/Fokussieren (Touch/Tastatur) oder
-      // während des Verschiebens (isDragging, entspricht "Auswählen") steigt sie auf
-      // 100%. Bewusst genau EIN statischer Opacity-Wert pro Render (Ternary statt zweier
-      // gleichzeitig anwendbarer Utility-Klassen), damit Tailwinds Kaskade nicht von der
-      // Reihenfolge der generierten Utilities abhängt. Kontur/Form selbst bleiben
-      // unverändert scharf (nur Deckkraft, kein Weichzeichnen/Blur).
-      className={`group absolute z-10 -translate-x-1/2 -translate-y-full transition-opacity duration-150 focus:outline-none hover:opacity-100 focus:opacity-100 active:opacity-100 ${
-        isDragging ? "opacity-100" : "opacity-70"
-      } ${draggable ? "cursor-pointer active:cursor-grabbing" : ""}`}
+      // ANFORDERUNG "KONTRASTERHÖHUNG BEI BEIBEHALTUNG DER TEILTRANSPARENZ": der
+      // Pin-KÖRPER (SVG-Füllung unten) trägt seine Transparenz jetzt direkt als
+      // Fill-Opacity-Modifier (fill-[#D32F2F]/50) statt als Opacity auf diesem ganzen
+      // Button — nur so bleibt die Ziffer (eigenes Geschwister-Element weiter unten,
+      // außerhalb der SVG-Füllung) immer zu 100% deckend, wie gefordert, während der
+      // Korpus halbtransparent bleibt. Deshalb hier bewusst KEINE Opacity-Klasse mehr.
+      className={`group absolute z-10 -translate-x-1/2 -translate-y-full focus:outline-none ${
+        draggable ? "cursor-pointer active:cursor-grabbing" : ""
+      }`}
       title={`${pin.title} (${pin.angle ?? 0}°)${draggable ? " — gedrückt halten zum Verschieben" : ""}`}
     >
       <span
         className="relative flex flex-col items-center drop-shadow-md"
         style={{ transform: `scale(${counterScale})`, transformOrigin: "50% 100%" }}
       >
-        {/* ANFORDERUNG "FARBLOSE / MONOCHROME MÄNGEL-PINS": der Blickrichtungs-Fächer
-            wird bewusst NICHT mehr statusfarben (s.text) eingefärbt, sondern einheitlich
-            neutral grau, damit kein "buntes" Element auf der Planfläche übrig bleibt. Die
-            Status-Farblogik (STATUS-Konstante) bleibt unverändert für Badges, Filterleiste,
-            Sidebar-Liste und PDF-Export erhalten — nur die Planflächen-Darstellung selbst
-            wird neutral. */}
+        {/* Sichtkegel: war schon immer halbtransparent (opacity 0.22 Füllung / 0.55
+            Kontur, siehe ViewCone-Komponente oben) und damit von Anfang an konform zur
+            ANFORDERUNG "Sichtkegel sollen semi-transparent bleiben" — hier unverändert. */}
         <ViewCone angle={pin.angle ?? 0} colorClass="text-slate-700" />
-        {/* Der pulsierende Hinweisring für offene Pins bleibt als reine
-            Aufmerksamkeits-Animation erhalten, aber ebenfalls farblos/neutral (dunkles
-            Grau statt Markenrot) statt im bisherigen Status-Ton. */}
         {pin.status === "offen" && !isDragging && (
           <span className="absolute -top-1 h-7 w-7 animate-ping rounded-full bg-slate-900 opacity-30" />
         )}
-        {/* Visuelle Pin-Nummerierung: dezenter, monochromer Marker statt des bisherigen,
-            grellen statusfarbenen Markers — leicht transparentes Dunkelgrau/Schwarz als
-            Füllung (fill-slate-900/80) mit scharfer, heller 1,5px-Kontur (stroke-white/90)
-            für hohe Lesbarkeit auf jedem Planhintergrund. Beim Hovern, Antippen (Fokus)
-            oder Auswählen/Verschieben (isDragging) wird die Füllung dunkler/deckender und
-            die Kontur dicker (stroke-2 statt der Basis-strokeWidth 1,5) — der aktive Pin
-            hebt sich dadurch klar vom Plan ab, ohne dass Farbe als Unterscheidungsmerkmal
-            zurückkehrt. Status (offen/in Bearbeitung/erledigt) bleibt weiterhin über die
-            farbigen Badges in der Sidebar-Liste und im PinModal sofort erkennbar — nur die
-            Planfläche selbst wird bewusst farblos gehalten (siehe ANFORDERUNG). */}
+        {/* ANFORDERUNG "KONTRASTERHÖHUNG BEI BEIBEHALTUNG DER TEILTRANSPARENZ": Grundton
+            Solid Red #D32F2F bleibt (siehe letzte Änderung), die Deckkraft des Korpus
+            geht aber von 100% auf 50% zurück (Mitte des geforderten 40–60%-Korridors) —
+            CAD-Linien/Maße scheinen dadurch wieder durch den Pin-Kopf durch. Die weiße
+            Kontur (stroke) bleibt bewusst voll deckend, damit die Pin-Silhouette selbst
+            auf hellen wie dunklen Plan-Hintergründen klar erkennbar bleibt — nur die
+            Flächenfüllung ist transparent, nicht die Kontur. Bei Hover/Fokus/Drag steigt
+            die Füllung leicht auf 65%, als dezentes Auswahl-Feedback, ohne die
+            Teiltransparenz ganz zu verlassen. */}
         <MapPin
-          size={30}
+          size={36}
           strokeWidth={1.5}
-          className={`fill-slate-900/80 stroke-white/90 transition-all duration-150 group-hover:scale-110 group-hover:fill-slate-900/95 group-hover:stroke-2 group-focus:fill-slate-900/95 group-focus:stroke-2 group-active:fill-slate-900/95 group-active:stroke-2 ${
-            isDragging ? "fill-slate-900/95 stroke-2" : ""
+          className={`fill-[#D32F2F]/50 stroke-white transition-all duration-150 group-hover:scale-110 group-hover:fill-[#D32F2F]/65 group-hover:stroke-2 group-focus:fill-[#D32F2F]/65 group-focus:stroke-2 group-active:fill-[#D32F2F]/65 group-active:stroke-2 ${
+            isDragging ? "fill-[#D32F2F]/65 stroke-2" : ""
           }`}
           style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.35))" }}
         />
         {number != null && (
-          <span
-            className={`pointer-events-none absolute top-[6px] left-1/2 -translate-x-1/2 font-extrabold leading-none text-white ${
-              String(number).length > 2 ? "text-[7.5px]" : "text-[10px]"
-            }`}
-            style={{ textShadow: "0 1px 1.5px rgba(0,0,0,0.55)" }}
-          >
-            {number}
+          <span className="pointer-events-none absolute top-[7.2px] left-1/2 -translate-x-1/2 flex h-4 w-4 items-center justify-center">
+            {/* ANFORDERUNG "LEICHTER INNEN-GLOW": minimaler, kreisförmiger, milchiger
+                Weichzeichner direkt hinter der Ziffer, dämpft CAD-Linien genau unter der
+                Zahl ab, ohne den restlichen (halbtransparenten) Pin-Korpus zusätzlich
+                abzudunkeln — rein additiv, kein eigener Farbton, kein Einfluss auf die
+                Pin-Position. */}
+            <span
+              className="pointer-events-none absolute inset-0 rounded-full"
+              style={{
+                background: "radial-gradient(circle, rgba(255,255,255,0.6) 0%, rgba(255,255,255,0) 72%)",
+                filter: "blur(0.4px)",
+              }}
+            />
+            {/* ANFORDERUNG "ISOLATION DER ZIFFER / FARBANPASSUNG": die Zahl selbst liegt
+                AUSSERHALB der SVG-Füllung (eigenes Element) und ist dadurch unabhängig von
+                der Korpus-Transparenz immer zu 100% deckendes Signalweiß. Kontur: ein
+                hartkantiger, nicht verwaschener 1px-Umriss aus acht Richtungen (statt
+                eines einzelnen weich geblurrten Drop-Shadows) plus -webkit-text-stroke als
+                zusätzliche Schärfung auf unterstützten Browsern — dadurch bleibt die
+                Kontur "hauchfein, aber scharf und vollkommen deckend", wie gefordert,
+                statt zu verwaschen. */}
+            <span
+              className={`relative pointer-events-none leading-none text-white ${
+                String(number).length > 2 ? "text-[9px]" : "text-[12px]"
+              }`}
+              style={{
+                fontFamily: "Inter, Arial, sans-serif",
+                fontWeight: 900,
+                WebkitTextStroke: "0.6px #000000",
+                textShadow:
+                  "1px 1px 0 #000, -1px 1px 0 #000, 1px -1px 0 #000, -1px -1px 0 #000, 1px 0 0 #000, -1px 0 0 #000, 0 1px 0 #000, 0 -1px 0 #000",
+              }}
+            >
+              {number}
+            </span>
           </span>
         )}
       </span>
