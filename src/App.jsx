@@ -11637,73 +11637,209 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
         className="relative flex flex-col items-center drop-shadow-md"
         style={{ transform: `scale(${counterScale})`, transformOrigin: "50% 100%" }}
       >
-        {/* ANFORDERUNG "FARBGLEICHHEIT VON PIN UND BLICKRICHTUNG": der Sichtkegel nutzt
-            jetzt denselben Rotton wie der Pin-Körper (text-[#D32F2F] hier, fill-
-            [#D32F2F]/50 unten bei MapPin) statt des bisherigen neutralen Grautons
-            (text-slate-700) — keine Farbabweichung zwischen Kegel und Hauptpin mehr. Die
-            Opazität (0.5 Füllung / 0.6 Kontur, siehe ViewCone-Komponente oben) liegt
-            innerhalb des geforderten 40–60%-Korridors. */}
-        <ViewCone angle={pin.angle ?? 0} colorClass="text-[#D32F2F]" />
-        {pin.status === "offen" && !isDragging && (
-          <span className="absolute -top-1 h-7 w-7 animate-ping rounded-full bg-slate-900 opacity-30" />
-        )}
-        {/* ANFORDERUNG "KONTRASTERHÖHUNG BEI BEIBEHALTUNG DER TEILTRANSPARENZ": Grundton
-            Solid Red #D32F2F bleibt (siehe letzte Änderung), die Deckkraft des Korpus
-            geht aber von 100% auf 50% zurück (Mitte des geforderten 40–60%-Korridors) —
-            CAD-Linien/Maße scheinen dadurch wieder durch den Pin-Kopf durch. Die weiße
-            Kontur (stroke) bleibt bewusst voll deckend, damit die Pin-Silhouette selbst
-            auf hellen wie dunklen Plan-Hintergründen klar erkennbar bleibt — nur die
-            Flächenfüllung ist transparent, nicht die Kontur. Bei Hover/Fokus/Drag steigt
-            die Füllung leicht auf 65%, als dezentes Auswahl-Feedback, ohne die
-            Teiltransparenz ganz zu verlassen. */}
-        <MapPin
-          size={36}
-          strokeWidth={1.5}
-          className={`fill-[#D32F2F]/50 stroke-white transition-all duration-150 group-hover:scale-110 group-hover:fill-[#D32F2F]/65 group-hover:stroke-2 group-focus:fill-[#D32F2F]/65 group-focus:stroke-2 group-active:fill-[#D32F2F]/65 group-active:stroke-2 ${
-            isDragging ? "fill-[#D32F2F]/65 stroke-2" : ""
-          }`}
-          style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.35))" }}
-        />
-        {number != null && (
-          <span className="pointer-events-none absolute top-[7.2px] left-1/2 -translate-x-1/2 flex h-4 w-4 items-center justify-center">
-            {/* ANFORDERUNG "LEICHTER INNEN-GLOW": minimaler, kreisförmiger, milchiger
-                Weichzeichner direkt hinter der Ziffer, dämpft CAD-Linien genau unter der
-                Zahl ab, ohne den restlichen (halbtransparenten) Pin-Korpus zusätzlich
-                abzudunkeln — rein additiv, kein eigener Farbton, kein Einfluss auf die
-                Pin-Position. */}
-            <span
-              className="pointer-events-none absolute inset-0 rounded-full"
-              style={{
-                background: "radial-gradient(circle, rgba(255,255,255,0.6) 0%, rgba(255,255,255,0) 72%)",
-                filter: "blur(0.4px)",
-              }}
-            />
-            {/* ANFORDERUNG "ISOLATION DER ZIFFER / FARBANPASSUNG": die Zahl selbst liegt
-                AUSSERHALB der SVG-Füllung (eigenes Element) und ist dadurch unabhängig von
-                der Korpus-Transparenz immer zu 100% deckendes Signalweiß. Kontur: ein
-                hartkantiger, nicht verwaschener 1px-Umriss aus acht Richtungen (statt
-                eines einzelnen weich geblurrten Drop-Shadows) plus -webkit-text-stroke als
-                zusätzliche Schärfung auf unterstützten Browsern — dadurch bleibt die
-                Kontur "hauchfein, aber scharf und vollkommen deckend", wie gefordert,
-                statt zu verwaschen. */}
-            <span
-              className={`relative pointer-events-none leading-none text-white ${
-                String(number).length > 2 ? "text-[9px]" : "text-[12px]"
-              }`}
-              style={{
-                fontFamily: "Inter, Arial, sans-serif",
-                fontWeight: 900,
-                WebkitTextStroke: "0.6px #000000",
-                textShadow:
-                  "1px 1px 0 #000, -1px 1px 0 #000, 1px -1px 0 #000, -1px -1px 0 #000, 1px 0 0 #000, -1px 0 0 #000, 0 1px 0 #000, 0 -1px 0 #000",
-              }}
-            >
-              {number}
-            </span>
-          </span>
-        )}
+        <PinMarkerGlyph pin={pin} number={number} isDragging={isDragging} />
       </span>
     </button>
+  );
+}
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": das eigentliche visuelle
+// Erscheinungsbild eines Pins (Sichtkegel, Hinweisring, Pin-Kopf, Zahl mit Glow/
+// Kontur) war bisher direkt in PinMarker verdrahtet und damit untrennbar an dessen
+// Positionierungs-/Drag-Logik (button mit left/top in % + counterScale) gekoppelt.
+// Ausgelagert in eine eigene, reine Darstellungs-Komponente OHNE jede Positionierung,
+// damit exakt dasselbe Erscheinungsbild zusätzlich im neuen PinPlanCropThumbnail
+// (siehe unten, Pin-Detailansicht) wiederverwendet werden kann, statt die komplette
+// Marker-Optik dort ein zweites Mal nachzubauen (Single Source of Truth, keine
+// auseinanderlaufenden Kopien). PinMarker selbst bleibt unverändert in Verhalten/
+// Zero-Regression — nur die Darstellung wurde hierher verschoben, 1:1 gleicher Output.
+function PinMarkerGlyph({ pin, number, isDragging }) {
+  return (
+    <>
+      {/* ANFORDERUNG "FARBGLEICHHEIT VON PIN UND BLICKRICHTUNG": der Sichtkegel nutzt
+          denselben Rotton wie der Pin-Körper (text-[#D32F2F] hier, fill-[#D32F2F]/50
+          unten bei MapPin) statt eines neutralen Grautons (text-slate-700) — keine
+          Farbabweichung zwischen Kegel und Hauptpin. Die Opazität (0.5 Füllung / 0.6
+          Kontur, siehe ViewCone-Komponente oben) liegt innerhalb des geforderten
+          40–60%-Korridors. */}
+      <ViewCone angle={pin.angle ?? 0} colorClass="text-[#D32F2F]" />
+      {pin.status === "offen" && !isDragging && (
+        <span className="absolute -top-1 h-7 w-7 animate-ping rounded-full bg-slate-900 opacity-30" />
+      )}
+      {/* ANFORDERUNG "KONTRASTERHÖHUNG BEI BEIBEHALTUNG DER TEILTRANSPARENZ": Grundton
+          Solid Red #D32F2F, Deckkraft des Korpus bei 50% (Mitte des geforderten
+          40–60%-Korridors) — CAD-Linien/Maße scheinen dadurch durch den Pin-Kopf durch.
+          Die weiße Kontur (stroke) bleibt bewusst voll deckend, damit die Pin-Silhouette
+          selbst auf hellen wie dunklen Plan-Hintergründen klar erkennbar bleibt — nur die
+          Flächenfüllung ist transparent, nicht die Kontur. Bei Hover/Fokus/Drag steigt
+          die Füllung leicht auf 65%, als dezentes Auswahl-Feedback, ohne die
+          Teiltransparenz ganz zu verlassen. */}
+      <MapPin
+        size={36}
+        strokeWidth={1.5}
+        className={`fill-[#D32F2F]/50 stroke-white transition-all duration-150 group-hover:scale-110 group-hover:fill-[#D32F2F]/65 group-hover:stroke-2 group-focus:fill-[#D32F2F]/65 group-focus:stroke-2 group-active:fill-[#D32F2F]/65 group-active:stroke-2 ${
+          isDragging ? "fill-[#D32F2F]/65 stroke-2" : ""
+        }`}
+        style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.35))" }}
+      />
+      {number != null && (
+        <span className="pointer-events-none absolute top-[7.2px] left-1/2 -translate-x-1/2 flex h-4 w-4 items-center justify-center">
+          {/* ANFORDERUNG "LEICHTER INNEN-GLOW": minimaler, kreisförmiger, milchiger
+              Weichzeichner direkt hinter der Ziffer, dämpft CAD-Linien genau unter der
+              Zahl ab, ohne den restlichen (halbtransparenten) Pin-Korpus zusätzlich
+              abzudunkeln — rein additiv, kein eigener Farbton, kein Einfluss auf die
+              Pin-Position. */}
+          <span
+            className="pointer-events-none absolute inset-0 rounded-full"
+            style={{
+              background: "radial-gradient(circle, rgba(255,255,255,0.6) 0%, rgba(255,255,255,0) 72%)",
+              filter: "blur(0.4px)",
+            }}
+          />
+          {/* ANFORDERUNG "ISOLATION DER ZIFFER / FARBANPASSUNG": die Zahl selbst liegt
+              AUSSERHALB der SVG-Füllung (eigenes Element) und ist dadurch unabhängig von
+              der Korpus-Transparenz immer zu 100% deckendes Signalweiß. Kontur: ein
+              hartkantiger, nicht verwaschener 1px-Umriss aus acht Richtungen (statt
+              eines einzelnen weich geblurrten Drop-Shadows) plus -webkit-text-stroke als
+              zusätzliche Schärfung auf unterstützten Browsern — dadurch bleibt die
+              Kontur "hauchfein, aber scharf und vollkommen deckend", wie gefordert,
+              statt zu verwaschen. */}
+          <span
+            className={`relative pointer-events-none leading-none text-white ${
+              String(number).length > 2 ? "text-[9px]" : "text-[12px]"
+            }`}
+            style={{
+              fontFamily: "Inter, Arial, sans-serif",
+              fontWeight: 900,
+              WebkitTextStroke: "0.6px #000000",
+              textShadow:
+                "1px 1px 0 #000, -1px 1px 0 #000, 1px -1px 0 #000, -1px -1px 0 #000, 1px 0 0 #000, -1px 0 0 #000, 0 1px 0 #000, 0 -1px 0 #000",
+            }}
+          >
+            {number}
+          </span>
+        </span>
+      )}
+    </>
+  );
+}
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": kleiner, performanter
+// In-Memory-Cache für bereits geladene (volle, unkomprimierte) Planbilder, keyed nach
+// plan.image_url — verhindert einen erneuten Netzwerk-Request + erneutes Decodieren
+// jedes Mal, wenn innerhalb derselben Sitzung ein weiterer Pin DERSELBEN Skizze
+// geöffnet wird (typischer Workflow: mehrere Mängel eines Plans nacheinander
+// durchgehen). Lebt nur im Arbeitsspeicher des Tabs, kein IndexedDB/localStorage.
+const planImageDataUrlCache = new Map();
+async function loadFloorPlanImageCached(plan) {
+  if (!plan?.image_url) return null;
+  if (planImageDataUrlCache.has(plan.image_url)) {
+    return planImageDataUrlCache.get(plan.image_url);
+  }
+  const planKind = resolveFloorKind(plan);
+  const imgData = await loadFloorPlanImageWithRetry(plan.image_url, planKind);
+  planImageDataUrlCache.set(plan.image_url, imgData);
+  return imgData;
+}
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": Maße für den NEUEN,
+// client-seitigen Live-Ausschnitt in der Pin-Detailansicht (PinModal) — bewusst eigene,
+// vom PDF-Export getrennte Konstanten (dort: FLOOR_REPORT_PIN_CROP_*), da hier ein
+// kompaktes Bildschirm-Widget statt eines Millimeter-Maßes im PDF gebraucht wird.
+// PIN_CROP_MAX_OUTPUT_PX wird weiter unten zusätzlich mit devicePixelRatio
+// multipliziert (High-DPI/Retina), die CSS-Anzeigegröße selbst bleibt davon unberührt.
+const PIN_CROP_RATIO = 0.22;
+const PIN_CROP_MAX_OUTPUT_PX = 420;
+const PIN_CROP_QUALITY = 0.82;
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": kompaktes Orientierungs-
+// Widget für die Pin-Detailansicht — zeigt NUR den unmittelbaren Planbereich um GENAU
+// diesen einen Pin (automatisch auf dessen X/Y-Koordinate zentriert, siehe
+// cropImageDataUrl), mit GENAU dessen eigenem Marker (PinMarkerGlyph, identische Optik
+// wie auf der großen Planfläche) obendrauf gezeichnet. "Isolierte Pin-Visibility" ergibt
+// sich dabei automatisch aus der Architektur, nicht aus einem Filter: der Ausschnitt
+// wird aus dem ROHEN Planbild geschnitten (Pins sind nie Teil der Bilddatei, sondern
+// immer eine separate, pro Pin einzeln gerenderte Overlay-Ebene), und dieser
+// Komponente wird ausschließlich der EINE betroffene Pin als Prop übergeben — andere
+// Pins DERSELBEN Skizze werden hier nie geladen oder gerendert, können also auch nie
+// versehentlich auftauchen. Position/Ausrichtung des Quell-Pins werden an keiner Stelle
+// verändert, nur gelesen (pin.x/pin.y/pin.angle fließen unverändert in cropImageDataUrl
+// bzw. PinMarkerGlyph ein).
+function PinPlanCropThumbnail({ pin, plan, number }) {
+  const [state, setState] = useState({ status: "idle", dataUrl: null, markerX: 50, markerY: 50 });
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!plan?.image_url) {
+      setState({ status: "missing", dataUrl: null, markerX: 50, markerY: 50 });
+      return undefined;
+    }
+    setState((s) => (s.status === "ready" ? s : { ...s, status: "loading" }));
+    (async () => {
+      try {
+        const imgData = await loadFloorPlanImageCached(plan);
+        // High-DPI/Retina: die Ziel-Pixelgröße des Ausschnitts wird mit dem
+        // devicePixelRatio des Geräts multipliziert (gedeckelt auf max. 3x, auch auf
+        // sehr hochauflösenden Displays keine unnötig große Datenmenge) — die
+        // CSS-Anzeigegröße des Widgets (siehe className unten) bleibt davon unabhängig
+        // fix, nur die zugrunde liegende Bild-Pixeldichte steigt, dadurch bleibt der
+        // Ausschnitt auch beim Hineinzoomen/auf Retina-Displays gestochen scharf.
+        const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+        const cropped = await cropImageDataUrl(
+          imgData.dataUrl,
+          (pin.x ?? 50) / 100,
+          (pin.y ?? 50) / 100,
+          PIN_CROP_RATIO,
+          Math.round(PIN_CROP_MAX_OUTPUT_PX * dpr),
+          PIN_CROP_QUALITY
+        );
+        if (cancelled) return;
+        setState({ status: "ready", dataUrl: cropped.dataUrl, markerX: cropped.pinRatioX * 100, markerY: cropped.pinRatioY * 100 });
+      } catch (err) {
+        if (cancelled) return;
+        console.error("Grundriss-Ausschnitt für die Pin-Detailansicht konnte nicht erzeugt werden:", err);
+        setState({ status: "error", dataUrl: null, markerX: 50, markerY: 50 });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // pin.angle bewusst NICHT in den Dependencies: eine reine Blickrichtungs-Änderung
+    // dreht nur den (leichten) Sichtkegel auf dem bereits geladenen Ausschnitt neu,
+    // dafür muss nicht das komplette Planbild erneut geladen/zugeschnitten werden —
+    // PinMarkerGlyph liest pin.angle beim Rendern ohnehin live aus pin selbst.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plan?.image_url, pin.id, pin.x, pin.y]);
+
+  if (!plan?.image_url) return null;
+
+  return (
+    <div className="flex shrink-0 flex-col items-center gap-1.5 sm:items-start">
+      <div className="relative aspect-square w-28 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 shadow-sm sm:w-32">
+        {state.status === "ready" && state.dataUrl && (
+          <>
+            <img src={state.dataUrl} alt="Lage auf dem Plan" className="h-full w-full object-cover" draggable={false} />
+            <div
+              className="pointer-events-none absolute flex flex-col items-center"
+              style={{ left: `${state.markerX}%`, top: `${state.markerY}%`, transform: "scale(0.82)", transformOrigin: "50% 100%" }}
+            >
+              <PinMarkerGlyph pin={pin} number={number} isDragging={false} />
+            </div>
+          </>
+        )}
+        {state.status === "loading" && (
+          <div className="flex h-full w-full items-center justify-center">
+            <Loader2 size={18} className="animate-spin text-slate-300" />
+          </div>
+        )}
+        {state.status === "error" && (
+          <div className="flex h-full w-full items-center justify-center p-2 text-center text-[10px] leading-tight text-slate-400">
+            Ausschnitt nicht verfügbar
+          </div>
+        )}
+      </div>
+      <p className="text-center text-[10px] text-slate-400 sm:text-left">Lage auf dem Plan</p>
+    </div>
   );
 }
 
@@ -14045,9 +14181,12 @@ function PinModal({
             </div>
           </div>
 
-          {/* Blickrichtung / Aufnahmewinkel */}
-          <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
-            <AngleCompass value={draft.angle ?? 0} onChange={(deg) => update("angle", deg)} disabled={readOnly} />
+          {/* Lage auf dem Plan (Detail-Crop) + Blickrichtung / Aufnahmewinkel */}
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+            <PinPlanCropThumbnail pin={pin} plan={plan} number={pinNumber} />
+            <div className="flex-1 rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+              <AngleCompass value={draft.angle ?? 0} onChange={(deg) => update("angle", deg)} disabled={readOnly} />
+            </div>
           </div>
 
           {/* Description */}
