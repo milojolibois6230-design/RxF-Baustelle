@@ -3686,124 +3686,21 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     y = drawOnboardingInfoBox(doc, project, margin, y, contentWidth, pageHeight);
   }
 
-  // ---- 2. Planübersicht je Grundrissskizze mit nummerierten Pin-Markierungen -------
-  // Ein Geschoss kann mehrere Grundrisskizzen enthalten (siehe supabase_schema_v7);
-  // jede Skizze bekommt hier eine eigene Übersichtsseite mit IHREM eigenen Bild und
-  // NUR den Pins, die tatsächlich an dieser Skizze hängen (pin.plan) — so bleibt die
-  // Zuordnung Pin ↔ Position auf dem richtigen Plan eindeutig.
-  const plansWithPins = [];
-  const seenPlanIds = new Set();
-  for (const pin of numberedPins) {
-    if (pin.plan && !seenPlanIds.has(pin.plan.id)) {
-      seenPlanIds.add(pin.plan.id);
-      plansWithPins.push(pin.plan);
-    }
-  }
-  plansWithPins.sort((a, b) => {
-    const floorA = floors.find((f) => f.id === a.floor_id)?.name || "";
-    const floorB = floors.find((f) => f.id === b.floor_id)?.name || "";
-    return floorA !== floorB ? floorA.localeCompare(floorB) : a.name.localeCompare(b.name);
-  });
-
-  for (const p of plansWithPins) {
-    const parentFloor = floors.find((f) => f.id === p.floor_id);
-    doc.addPage();
-    doc.setFontSize(14);
-    bold();
-    doc.text(`${parentFloor?.name ? `${parentFloor.name} — ` : ""}${p.name}`, margin, 20);
-    normal();
-    doc.setFontSize(10);
-
-    const planPins = numberedPins.filter((pin) => pin.plan?.id === p.id);
-    const planKind = resolveFloorKind(p);
-    let imgRect = null;
-    try {
-      // SVG-Grundrisse werden hier wie Raster-Bilder behandelt: loadImageAsDataUrl
-      // lädt sie unverändert über Image().naturalWidth/-Height (Browser rastern SVGs
-      // beim Dekodieren automatisch anhand ihres viewBox/width/height) — das native
-      // Vektor-Rendering (siehe SvgPlanCanvas) gilt ausschließlich für die interaktive
-      // Planansicht, PDF-Seiten sind selbst bereits eine feste, gedruckte Auflösung.
-      // loadFloorPlanImageWithRetry (siehe dort) versucht bei einem Ladefehler einmal
-      // erneut, bevor auf den Text-Fallback unten ausgewichen wird (GRUNDRISS-GARANTIE).
-      let imgData = null;
-      if (planKind === "pdf" || planKind === "image" || planKind === "svg") {
-        imgData = await loadFloorPlanImageWithRetry(p.image_url, planKind);
-      }
-      if (imgData) {
-        // Vor dem Einbetten auf PDF-taugliche Auflösung herunterskalieren & als JPEG
-        // komprimieren (siehe compressImageDataUrl) — entscheidend für die Dateigröße.
-        imgData = await compressImageDataUrl(imgData.dataUrl, PDF_PLAN_MAX_WIDTH, PDF_PLAN_MAX_HEIGHT, PDF_PLAN_JPEG_QUALITY);
-        const availableW = contentWidth;
-        const availableH = pageHeight - 35 - margin;
-        const ratio = Math.min(availableW / imgData.width, availableH / imgData.height);
-        const w = imgData.width * ratio;
-        const h = imgData.height * ratio;
-        const x = margin + (availableW - w) / 2;
-        const imgY = 28;
-        doc.addImage(imgData.dataUrl, "JPEG", x, imgY, w, h);
-        imgRect = { x, y: imgY, w, h };
-      }
-    } catch (err) {
-      console.error(`Grundrissskizze "${p.name}" konnte nicht in den PDF-Export geladen werden:`, err);
-    }
-
-    if (imgRect) {
-      planPins.forEach((pin) => {
-        const px = imgRect.x + (pin.x / 100) * imgRect.w;
-        const py = imgRect.y + (pin.y / 100) * imgRect.h;
-        const rgb = PDF_STATUS_RGB[pin.status] || PDF_STATUS_RGB.offen;
-        drawPdfViewCone(doc, px, py, pin.angle, rgb);
-        doc.setFillColor(...rgb);
-        doc.circle(px, py, 3, "F");
-        // Etwas kleinere Schrift bei längeren Unter-Nummern (z.B. "12.3" für per
-        // "Duplizieren" erzeugte Kopien, siehe computePinNumberById), damit die Nummer
-        // im kleinen Kreis lesbar bleibt.
-        doc.setFontSize(String(pin.exportNumber).length > 2 ? 5.3 : 7);
-        doc.setTextColor(255, 255, 255);
-        doc.text(String(pin.exportNumber), px, py + 1, { align: "center" });
-        doc.setTextColor(0, 0, 0);
-        doc.setFontSize(10);
-      });
-    } else {
-      // CAD-Grundriss oder Ladefehler: keine Plandarstellung möglich (siehe
-      // CadBlueprintPlan) — stattdessen einfache nummerierte Liste als Fallback.
-      doc.text("Grundriss konnte nicht dargestellt werden (CAD-Format oder Ladefehler).", margin, 32);
-      let listY = 42;
-      planPins.forEach((pin) => {
-        doc.text(`${pin.exportNumber}. ${pin.title}`, margin, listY);
-        listY += 6;
-      });
-    }
-  }
-
-  // Pins aus Altbeständen ohne zugeordnete Grundrissskizze (vor Einführung von
-  // supabase_schema_v7) können nicht visuell auf einem Plan verortet werden, tauchen
-  // aber — damit nichts verloren geht — als einfache Liste UND vollständig in der
-  // Detaildokumentation (Schritt 3 unten) auf.
-  const orphanPins = numberedPins.filter((pin) => !pin.plan);
-  if (orphanPins.length > 0) {
-    doc.addPage();
-    doc.setFontSize(14);
-    bold();
-    doc.text("Pins ohne zugeordnete Grundrissskizze", margin, 20);
-    normal();
-    doc.setFontSize(9);
-    doc.text(
-      "Diese Pins stammen aus Altbeständen vor Einführung der Grundrissskizzen-Ebene und sind aktuell keiner Skizze zugeordnet.",
-      margin,
-      28,
-      { maxWidth: contentWidth }
-    );
-    doc.setFontSize(10);
-    let listY = 40;
-    orphanPins.forEach((pin) => {
-      doc.text(`${pin.exportNumber}. ${pin.title} (${pin.floor?.name || "–"})`, margin, listY);
-      listY += 6;
-    });
-  }
-
-  // ---- 3. Detaildokumentation je Pin ------------------------------------------------
-  for (const pin of numberedPins) {
+  // ANFORDERUNG "KRITISCHER FIX FÜR PDF-GENERATOR: DIE SCHLEIFENSTRUKTUR IST FALSCH":
+  // zeichnet EINE vollständige Mängel-Detailseite (Stammdaten, Beschreibung,
+  // Planausschnitt, Fotos) für genau EINEN Pin. Ausgelagert in eine lokale Funktion,
+  // damit sie wortgleich sowohl im kombinierten Plan-für-Plan-Durchlauf unten
+  // (direkt im Anschluss an die jeweilige Planübersicht) als auch für die
+  // Altbestand-Pins ohne zugeordnete Skizze (siehe orphanPins weiter unten) verwendet
+  // werden kann — vorher liefen hier zwei getrennte Phasen (erst ALLE
+  // Planübersichten, danach ALLE Pin-Detailseiten projektweit am Stück), was auf der
+  // Baustelle die Zuordnung zwischen einer Skizze und ihren eigenen Mängeln im PDF
+  // unnötig erschwerte. rawPlanImageDataUrl (optional) ist die rohe, unkomprimierte
+  // Planbildquelle DIESER Skizze für den Planausschnitt je Pin (siehe
+  // cropImageDataUrl) — bleibt null für Altbestand-Pins ohne Skizze, der Ausschnitt
+  // zeigt dann den bereits an anderer Stelle etablierten "Kein Grundriss verfügbar"-
+  // Platzhalter.
+  const drawPinDetailPage = async (pin, rawPlanImageDataUrl) => {
     doc.addPage();
     doc.setFontSize(14);
     bold();
@@ -3838,6 +3735,67 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     doc.text(descLines, margin, dy);
     dy += descLines.length * 5 + 4;
 
+    // ANFORDERUNG "PLANAUSSCHNITT (CROP)": dieselbe Technik wie im Geschoss-/
+    // Sammelbericht (siehe FLOOR_REPORT_PIN_CROP_* bei drawFloorPinsReportSection) —
+    // bewusst dieselben, bereits dort etablierten Maße/Konstanten wiederverwendet,
+    // damit alle PDF-Exporte optisch konsistent bleiben.
+    if (dy + 4.5 + FLOOR_REPORT_PIN_CROP_SIZE_MM > pageHeight - margin) {
+      doc.addPage();
+      dy = margin;
+    }
+    bold();
+    doc.text("Lage auf dem Plan:", margin, dy);
+    dy += 5.5;
+    normal();
+    doc.setDrawColor(226, 232, 240);
+    doc.setFillColor(248, 250, 252);
+    doc.roundedRect(margin, dy, FLOOR_REPORT_PIN_CROP_SIZE_MM, FLOOR_REPORT_PIN_CROP_SIZE_MM, 2, 2, "FD");
+    if (rawPlanImageDataUrl) {
+      try {
+        const cropped = await cropImageDataUrl(
+          rawPlanImageDataUrl,
+          (pin.x ?? 50) / 100,
+          (pin.y ?? 50) / 100,
+          FLOOR_REPORT_PIN_CROP_RATIO,
+          FLOOR_REPORT_PIN_CROP_MAX_OUTPUT_PX,
+          FLOOR_REPORT_PIN_CROP_QUALITY
+        );
+        const cropRatio = Math.min(FLOOR_REPORT_PIN_CROP_SIZE_MM / cropped.width, FLOOR_REPORT_PIN_CROP_SIZE_MM / cropped.height);
+        const cropW = cropped.width * cropRatio;
+        const cropH = cropped.height * cropRatio;
+        const cropImgX = margin + (FLOOR_REPORT_PIN_CROP_SIZE_MM - cropW) / 2;
+        const cropImgY = dy + (FLOOR_REPORT_PIN_CROP_SIZE_MM - cropH) / 2;
+        doc.addImage(cropped.dataUrl, "JPEG", cropImgX, cropImgY, cropW, cropH);
+        const markerX = cropImgX + cropped.pinRatioX * cropW;
+        const markerY = cropImgY + cropped.pinRatioY * cropH;
+        drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB);
+        doc.setFillColor(255, 255, 255);
+        doc.circle(markerX, markerY, 2.6, "F");
+        doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
+        doc.circle(markerX, markerY, 2.2, "F");
+      } catch (err) {
+        console.error(`Planausschnitt für Pin "${pin.exportNumber}" konnte nicht erzeugt werden:`, err);
+        doc.setFontSize(7.5);
+        doc.setTextColor(100, 116, 139);
+        doc.text("Ausschnitt nicht verfügbar", margin + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, dy + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, {
+          align: "center",
+          maxWidth: FLOOR_REPORT_PIN_CROP_SIZE_MM - 4,
+        });
+        doc.setTextColor(0, 0, 0);
+        doc.setFontSize(10);
+      }
+    } else {
+      doc.setFontSize(7.5);
+      doc.setTextColor(100, 116, 139);
+      doc.text("Kein Grundriss verfügbar", margin + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, dy + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, {
+        align: "center",
+        maxWidth: FLOOR_REPORT_PIN_CROP_SIZE_MM - 4,
+      });
+      doc.setTextColor(0, 0, 0);
+      doc.setFontSize(10);
+    }
+    dy += FLOOR_REPORT_PIN_CROP_SIZE_MM + 6;
+
     // GUARANTEED UNIFORM IMAGE RESIZING: 2-Spalten-Raster mit fester Zeilenhöhe (siehe
     // PDF_PHOTO_GRID_COLS/PDF_PHOTO_GRID_ROW_HEIGHT_MM), seitenübergreifend falls nötig.
     // Fotos DIESES Pins werden vorab parallel geladen und auf ein einheitliches
@@ -3847,6 +3805,10 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     // Platzhalter, der Rest des Berichts bleibt unberührt.
     const photos = pin.pin_photos || [];
     if (photos.length > 0) {
+      if (dy + 6 > pageHeight - margin) {
+        doc.addPage();
+        dy = margin;
+      }
       bold();
       doc.text("Fotos:", margin, dy);
       dy += 6;
@@ -3877,6 +3839,153 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     // Modal). Alle drei PDF-Exportfunktionen (Gesamt-, Geschoss- und Einzelpin-Export)
     // ignorieren pin_activity_log konsequent; die anderen beiden hatten ohnehin nie
     // einen Historie-Abschnitt gedruckt.
+  };
+
+  // ---- 2. + 3. KOMBINIERT, JE SKIZZE: Planübersicht MIT allen ihren Pins, DIREKT
+  // GEFOLGT von genau den Mängel-Detailseiten dieser einen Skizze, bevor die nächste
+  // Skizze beginnt — zu keinem Zeitpunkt werden mehr erst alle Planübersichten
+  // gesammelt und die Mängel-Detailseiten ans Ende des gesamten Dokuments verschoben.
+  // Ein Geschoss kann mehrere Grundrisskizzen enthalten (siehe supabase_schema_v7);
+  // jede Skizze bekommt hier eine eigene Übersichtsseite mit IHREM eigenen Bild und
+  // NUR den Pins, die tatsächlich an dieser Skizze hängen (pin.plan) — so bleibt die
+  // Zuordnung Pin ↔ Position auf dem richtigen Plan eindeutig. Die globale,
+  // fortlaufende Nummerierung (exportNumber, siehe projectPinNumberById oben) bleibt
+  // dabei unverändert über das gesamte Projekt hinweg bestehen — nur die REIHENFOLGE
+  // der Abschnitte im Dokument wird jetzt je Skizze gebündelt statt in zwei globalen
+  // Phasen.
+  const plansWithPins = [];
+  const seenPlanIds = new Set();
+  for (const pin of numberedPins) {
+    if (pin.plan && !seenPlanIds.has(pin.plan.id)) {
+      seenPlanIds.add(pin.plan.id);
+      plansWithPins.push(pin.plan);
+    }
+  }
+  plansWithPins.sort((a, b) => {
+    const floorA = floors.find((f) => f.id === a.floor_id)?.name || "";
+    const floorB = floors.find((f) => f.id === b.floor_id)?.name || "";
+    return floorA !== floorB ? floorA.localeCompare(floorB) : a.name.localeCompare(b.name);
+  });
+
+  for (const p of plansWithPins) {
+    const parentFloor = floors.find((f) => f.id === p.floor_id);
+    doc.addPage();
+    doc.setFontSize(14);
+    bold();
+    doc.text(`${parentFloor?.name ? `${parentFloor.name} — ` : ""}${p.name}`, margin, 20);
+    normal();
+    doc.setFontSize(10);
+
+    const planPins = numberedPins.filter((pin) => pin.plan?.id === p.id);
+    const planKind = resolveFloorKind(p);
+    let imgRect = null;
+    // ANFORDERUNG "PLANAUSSCHNITT (CROP)": hält die rohe, unkomprimierte Planbild-
+    // Datenquelle dieser Skizze fest, damit die direkt im Anschluss gezeichneten
+    // Pin-Detailseiten (siehe drawPinDetailPage oben) ihren jeweiligen Planausschnitt
+    // daraus erzeugen können, ohne den Plan je Pin erneut laden zu müssen.
+    let rawPlanImageDataUrl = null;
+    try {
+      // SVG-Grundrisse werden hier wie Raster-Bilder behandelt: loadImageAsDataUrl
+      // lädt sie unverändert über Image().naturalWidth/-Height (Browser rastern SVGs
+      // beim Dekodieren automatisch anhand ihres viewBox/width/height) — das native
+      // Vektor-Rendering (siehe SvgPlanCanvas) gilt ausschließlich für die interaktive
+      // Planansicht, PDF-Seiten sind selbst bereits eine feste, gedruckte Auflösung.
+      // loadFloorPlanImageWithRetry (siehe dort) versucht bei einem Ladefehler einmal
+      // erneut, bevor auf den Text-Fallback unten ausgewichen wird (GRUNDRISS-GARANTIE).
+      let imgData = null;
+      if (planKind === "pdf" || planKind === "image" || planKind === "svg") {
+        imgData = await loadFloorPlanImageWithRetry(p.image_url, planKind);
+      }
+      if (imgData) {
+        rawPlanImageDataUrl = imgData.dataUrl;
+        // Vor dem Einbetten auf PDF-taugliche Auflösung herunterskalieren & als JPEG
+        // komprimieren (siehe compressImageDataUrl) — entscheidend für die Dateigröße.
+        imgData = await compressImageDataUrl(imgData.dataUrl, PDF_PLAN_MAX_WIDTH, PDF_PLAN_MAX_HEIGHT, PDF_PLAN_JPEG_QUALITY);
+        const availableW = contentWidth;
+        const availableH = pageHeight - 35 - margin;
+        const ratio = Math.min(availableW / imgData.width, availableH / imgData.height);
+        const w = imgData.width * ratio;
+        const h = imgData.height * ratio;
+        const x = margin + (availableW - w) / 2;
+        const imgY = 28;
+        doc.addImage(imgData.dataUrl, "JPEG", x, imgY, w, h);
+        imgRect = { x, y: imgY, w, h };
+      }
+    } catch (err) {
+      console.error(`Grundrissskizze "${p.name}" konnte nicht in den PDF-Export geladen werden:`, err);
+    }
+
+    if (imgRect) {
+      // ANFORDERUNG "Pins auf den Plänen bleiben monochrom / farblos": dieselbe
+      // neutrale Markerfarbe (PDF_PIN_NEUTRAL_RGB) mit weißem Kontrast-Ring wie im
+      // Geschoss-/Sammelbericht — die Statusfarbe (PDF_STATUS_RGB) bleibt unverändert
+      // nur noch für Status-Badges/Legenden anderer Berichtstypen reserviert.
+      planPins.forEach((pin) => {
+        const px = imgRect.x + (pin.x / 100) * imgRect.w;
+        const py = imgRect.y + (pin.y / 100) * imgRect.h;
+        drawPdfViewCone(doc, px, py, pin.angle, PDF_PIN_NEUTRAL_RGB);
+        doc.setFillColor(255, 255, 255);
+        doc.circle(px, py, 3.5, "F");
+        doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
+        doc.circle(px, py, 3, "F");
+        // Etwas kleinere Schrift bei längeren Unter-Nummern (z.B. "12.3" für per
+        // "Duplizieren" erzeugte Kopien, siehe computePinNumberById), damit die Nummer
+        // im kleinen Kreis lesbar bleibt.
+        doc.setFontSize(String(pin.exportNumber).length > 2 ? 5.3 : 7);
+        doc.setTextColor(255, 255, 255);
+        doc.text(String(pin.exportNumber), px, py + 1, { align: "center" });
+        doc.setTextColor(0, 0, 0);
+        doc.setFontSize(10);
+      });
+    } else {
+      // CAD-Grundriss oder Ladefehler: keine Plandarstellung möglich (siehe
+      // CadBlueprintPlan) — stattdessen einfache nummerierte Liste als Fallback.
+      doc.text("Grundriss konnte nicht dargestellt werden (CAD-Format oder Ladefehler).", margin, 32);
+      let listY = 42;
+      planPins.forEach((pin) => {
+        doc.text(`${pin.exportNumber}. ${pin.title}`, margin, listY);
+        listY += 6;
+      });
+    }
+
+    // ERST WENN DIE PLANÜBERSICHT DIESER SKIZZE STEHT, folgen direkt im Anschluss
+    // ihre eigenen Mängel-Detailseiten — danach erst beginnt die nächste Skizze
+    // (nächste Schleifeniteration) mit ihrer eigenen Planübersicht.
+    for (const pin of planPins) {
+      await drawPinDetailPage(pin, rawPlanImageDataUrl);
+    }
+  }
+
+  // Pins aus Altbeständen ohne zugeordnete Grundrissskizze (vor Einführung von
+  // supabase_schema_v7) können nicht visuell auf einem Plan verortet werden, tauchen
+  // aber — damit nichts verloren geht — als einfache Liste UND vollständig mit eigener
+  // Detailseite auf (siehe drawPinDetailPage oben, hier ohne Planausschnitt, da keine
+  // Skizze zugeordnet ist). Bewusst als letzter, separater Abschnitt NACH allen
+  // skizzenzugeordneten Pins, da sich Altbestand-Pins keiner Sequenz-Position
+  // zuordnen lassen.
+  const orphanPins = numberedPins.filter((pin) => !pin.plan);
+  if (orphanPins.length > 0) {
+    doc.addPage();
+    doc.setFontSize(14);
+    bold();
+    doc.text("Pins ohne zugeordnete Grundrissskizze", margin, 20);
+    normal();
+    doc.setFontSize(9);
+    doc.text(
+      "Diese Pins stammen aus Altbeständen vor Einführung der Grundrissskizzen-Ebene und sind aktuell keiner Skizze zugeordnet.",
+      margin,
+      28,
+      { maxWidth: contentWidth }
+    );
+    doc.setFontSize(10);
+    let listY = 40;
+    orphanPins.forEach((pin) => {
+      doc.text(`${pin.exportNumber}. ${pin.title} (${pin.floor?.name || "–"})`, margin, listY);
+      listY += 6;
+    });
+    for (const pin of orphanPins) {
+      await drawPinDetailPage(pin, null);
+    }
   }
 
   const fileName = `${sanitizeFileNamePart(project.name)}_Baudokumentation_${new Date().toISOString().slice(0, 10)}.pdf`;
