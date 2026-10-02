@@ -704,6 +704,38 @@ const FLOOR_UPLOAD_ACCEPT =
 const FLOOR_UPLOAD_HINT = "Grundriss hochladen (SVG, PNG, JPG, PDF, DWG, DXF)";
 
 // ----------------------------------------------------------------------------------
+// ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT (GRUNDRISSE, WERKPLÄNE, MONTAGEPLÄNE)"
+// ----------------------------------------------------------------------------------
+// Jede Grundrissskizze/jeder Plan eines Geschosses gehört ab sofort zu genau einer von
+// drei Kategorien (floor_plans.category, siehe supabase_schema_v21_plan_categories.sql).
+// "grundriss" bleibt dabei bewusst der DEFAULT- und FALLBACK-Wert — sowohl auf
+// Datenbankebene (not null default 'grundriss', siehe Migration) als auch hier
+// clientseitig über getPlanCategory(): ein vor dieser Erweiterung angelegter oder rein
+// offline zwischengespeicherter Plan-Datensatz ohne das Feld wird automatisch als
+// "Grundriss / Bestand" behandelt, exakt wie in der ANFORDERUNG unter "FALLBACK /
+// ABWÄRTSKOMPATIBILITÄT" gefordert — keine Bestandsdaten verschwinden dadurch aus der
+// Übersicht oder verlieren ihre Pins.
+const PLAN_CATEGORY_OPTIONS = [
+  { value: "grundriss", label: "Grundrisse / Bestand", emoji: "🗺️" },
+  { value: "werkplan", label: "Werkpläne", emoji: "📐" },
+  { value: "montageplan", label: "Montagepläne", emoji: "🛠️" },
+];
+const PLAN_CATEGORY_META = Object.fromEntries(PLAN_CATEGORY_OPTIONS.map((c) => [c.value, c]));
+
+function getPlanCategory(plan) {
+  const value = plan?.category;
+  return PLAN_CATEGORY_META[value] ? value : "grundriss";
+}
+
+// Nur in der Kategorie "Grundrisse / Bestand" steht das volle Mängel-/Pin-Setzen zur
+// Verfügung (siehe ANFORDERUNG Punkt 3) — Werkpläne/Montagepläne dienen ausschließlich
+// als hochauflösender Referenz-Viewer mit vollem Touch-Zoom/Pan (siehe FloorPlanView,
+// handlePlanClick/handleAddPlanNote in App).
+function planAllowsPins(plan) {
+  return getPlanCategory(plan) === "grundriss";
+}
+
+// ----------------------------------------------------------------------------------
 // PLATZHALTER-COVERFOTOS FÜR PROJEKT-KACHELN OHNE EIGENES GRUNDRISSBILD
 // ----------------------------------------------------------------------------------
 // Feste, kuratierte Auswahl generischer Architektur-/Baustellen-Fotos (Unsplash,
@@ -1458,27 +1490,32 @@ async function reorderFloors(orderedFloors) {
 // Grundrisskizzen (Ebene 3) — ein Geschoss kann beliebig viele davon enthalten.
 // createFloorPlanSketch benötigt zwingend eine Datei (eine Skizze ohne Plan wäre
 // nutzlos), updateFloorPlanSketch lässt die Datei wie zuvor bei Etagen optional.
-async function createFloorPlanSketch(floorId, projectId, name, file, onStatusMessage) {
+async function createFloorPlanSketch(floorId, projectId, name, file, onStatusMessage, category = "grundriss") {
   const { publicUrl, fileType, tileManifest } = await uploadFloorPlan(projectId, file, onStatusMessage);
   const { data, error } = await supabase
     .from("floor_plans")
     // tile_manifest (siehe supabase_schema_v18_floor_plan_tiles.sql) bleibt bei PDF/
     // CAD/SVG bzw. bei fehlgeschlagener Kachel-Erzeugung schlicht null — TiledPlanImage
-    // fällt dann zuverlässig auf image_url als reines Fallback-Bild zurück.
-    .insert({ floor_id: floorId, name, image_url: publicUrl, file_type: fileType, tile_manifest: tileManifest })
+    // fällt dann zuverlässig auf image_url als reines Fallback-Bild zurück. category
+    // (siehe supabase_schema_v21_plan_categories.sql/getPlanCategory) wird beim Anlegen
+    // IMMER explizit mitgeschickt — der Aufrufer (handleAddFloorPlanSketch in App) füllt
+    // ihn automatisch mit der aktuell aktiven Tab-Kategorie der Skizzenübersicht.
+    .insert({ floor_id: floorId, name, image_url: publicUrl, file_type: fileType, tile_manifest: tileManifest, category })
     .select()
     .single();
   if (error) throw error;
   return data;
 }
 
-// Aktualisiert Name und/oder Datei einer bestehenden Grundrisskizze. Die Datei ist
-// optional: wird keine neue Datei übergeben, bleiben image_url/file_type/tile_manifest
-// unverändert und nur der Name wird aktualisiert. Die alte Datei im Storage bleibt beim
-// Austausch technisch bedingt liegen (analog zu deleteProject() oben) — dasselbe gilt
-// für eine dabei verwaiste alte Kachel-Pyramide im Bucket "floor-plan-tiles".
-async function updateFloorPlanSketch(planId, projectId, name, file, onStatusMessage) {
+// Aktualisiert Name, Kategorie und/oder Datei einer bestehenden Grundrisskizze. Die
+// Datei ist optional: wird keine neue Datei übergeben, bleiben image_url/file_type/
+// tile_manifest unverändert und nur Name/Kategorie werden aktualisiert. Die alte Datei
+// im Storage bleibt beim Austausch technisch bedingt liegen (analog zu deleteProject()
+// oben) — dasselbe gilt für eine dabei verwaiste alte Kachel-Pyramide im Bucket
+// "floor-plan-tiles".
+async function updateFloorPlanSketch(planId, projectId, name, file, onStatusMessage, category) {
   const fields = { name };
+  if (category) fields.category = category;
   if (file) {
     const { publicUrl, fileType, tileManifest } = await uploadFloorPlan(projectId, file, onStatusMessage);
     fields.image_url = publicUrl;
@@ -2139,6 +2176,218 @@ function cachePlanNotesOffline(planId, notes) {
 }
 function readCachedPlanNotes(planId) {
   return readJsonStorage(OFFLINE_CACHE_KEY, {}).notesByPlan?.[planId] || null;
+}
+
+// ----------------------------------------------------------------------------------
+// ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS
+// (ZERO-LATENCY & OFFLINE-READ)"
+// ----------------------------------------------------------------------------------
+// Eigenständiges IndexedDB-Modul (Datenbank "BauleiterPWA_DB"), bewusst UNABHÄNGIG
+// von den beiden bereits bestehenden Cache-Mechanismen oben/unten:
+//   - Der Lese-Cache direkt oberhalb (OFFLINE_CACHE_KEY, localStorage) dient
+//     AUSSCHLIESSLICH als Fallback, WENN ein Netzwerk-Request fehlschlägt — beim
+//     normalen Öffnen einer Etage/Skizze mit bestehender Verbindung wird er gar
+//     nicht gelesen, es wird immer zuerst der Server abgefragt.
+//   - Der weiter unten folgende Offline-Asset-Cache (ASSET_CACHE_DB_NAME, ebenfalls
+//     IndexedDB) speichert ausschließlich BINÄRDATEN einzelner Bild-/PDF-URLs
+//     (Blobs), nicht die JSON-Metadaten der Skizzen/Pins selbst.
+// Dieses Modul hier verfolgt ein drittes, eigenes Ziel: den zuletzt gesehenen Stand
+// der Grundriss-Skizzen und Pins eines Geschosses SOFORT anzuzeigen, noch BEVOR
+// überhaupt ein Netzwerk-Request losgeht (Zero-Latency) — nicht erst als Reaktion
+// auf einen Fehlschlag. Kombiniert mit einem im Hintergrund weiterlaufenden
+// Server-Abgleich ergibt das eine klassische Stale-While-Revalidate-Strategie: der
+// zuletzt bekannte Stand ist sofort da, ein aktuellerer Stand ersetzt ihn kurz
+// danach unauffällig, sobald er eintrifft (siehe die beiden Lade-Effekte für
+// floorPlans/pins in App() weiter unten). Wirft nie einen Fehler nach außen — jede
+// Funktion fängt IndexedDB-Fehler (Speicherplatz voll, privater Modus, Browser ohne
+// IndexedDB) selbst ab und liefert im Fehlerfall lediglich null/undefined, exakt wie
+// beim bereits bestehenden Offline-Asset-Cache.
+const IDB_DB_NAME = "BauleiterPWA_DB";
+const IDB_DB_VERSION = 1;
+const IDB_SKETCHES_STORE = "sketches";
+const IDB_PINS_STORE = "pins";
+
+let baudocIdbPromise = null;
+function openBaudocIdb() {
+  if (typeof indexedDB === "undefined") {
+    return Promise.reject(new Error("IndexedDB ist in dieser Umgebung nicht verfügbar."));
+  }
+  if (baudocIdbPromise) return baudocIdbPromise;
+  baudocIdbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(IDB_DB_NAME, IDB_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      // "sketches": ein Datensatz je Grundrissskizze (keyPath "id" = plan.id), mit
+      // einem Index auf "floorId" — nötig, um beim Wechsel auf ein GESCHOSS (nicht
+      // nur eine einzelne Skizze) alle zugehörigen Skizzen in einem Rutsch aus dem
+      // Cache zu lesen (siehe getSketchesForFloorFromIDB unten).
+      if (!db.objectStoreNames.contains(IDB_SKETCHES_STORE)) {
+        const store = db.createObjectStore(IDB_SKETCHES_STORE, { keyPath: "id" });
+        store.createIndex("floorId", "floorId", { unique: false });
+      }
+      // "pins": ein Datensatz je Skizze, unter dem KOMPLETTEN, zuletzt bekannten
+      // Pins-Array dieser Skizze (keyPath "floorId" — in der Praxis aufgerufen mit
+      // der ID der aktuell geöffneten Grundrissskizze, siehe savePinsToIDB unten).
+      if (!db.objectStoreNames.contains(IDB_PINS_STORE)) {
+        db.createObjectStore(IDB_PINS_STORE, { keyPath: "floorId" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => {
+      baudocIdbPromise = null;
+      reject(request.error || new Error('IndexedDB "BauleiterPWA_DB" konnte nicht geöffnet werden.'));
+    };
+  });
+  return baudocIdbPromise;
+}
+
+// ---- "sketches"-Store -------------------------------------------------------------
+
+// Speichert genau EINE Grundrissskizze unter ihrer ID. blobOrUrlData ist bewusst
+// generisch benannt und wird unverändert (als "data"-Feld) abgelegt — in dieser App
+// wird hier der komplette Skizzen-Datensatz übergeben (inkl. image_url/tile_manifest
+// etc.), NICHT die Bildpixel selbst (die laufen bereits über den bestehenden
+// Offline-Asset-Cache, siehe cacheAssetBlob/useOfflineCapableAssetUrl oben) — die
+// Funktion würde aber unverändert auch mit einem echten Blob als zweitem Argument
+// funktionieren, falls das künftig gebraucht wird.
+async function saveSketchToIDB(sketchId, blobOrUrlData) {
+  if (!sketchId) return;
+  try {
+    const db = await openBaudocIdb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readwrite");
+      tx.objectStore(IDB_SKETCHES_STORE).put({
+        id: sketchId,
+        floorId: blobOrUrlData?.floor_id ?? blobOrUrlData?.floorId ?? null,
+        data: blobOrUrlData,
+        cachedAt: Date.now(),
+      });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizze "${sketchId}" konnte nicht zwischengespeichert werden:`, err);
+  }
+}
+
+async function getSketchFromIDB(sketchId) {
+  if (!sketchId) return null;
+  try {
+    const db = await openBaudocIdb();
+    const record = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readonly");
+      const req = tx.objectStore(IDB_SKETCHES_STORE).get(sketchId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    return record?.data ?? null;
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizze "${sketchId}" konnte nicht gelesen werden:`, err);
+    return null;
+  }
+}
+
+// Geschossweite Bulk-Varianten der beiden Funktionen oben — zusätzlich zu den in der
+// ANFORDERUNG benannten Funktionen, aber auf denselben "sketches"-Store aufgesetzt:
+// "Beim Wechsel auf ein GESCHOSS" (siehe ANFORDERUNG Punkt 2) müssen ALLE Skizzen
+// dieses Geschosses aus dem Cache kommen, nicht nur eine einzelne per ID — ohne diese
+// beiden Hilfsfunktionen ließe sich die geforderte Zero-Latency-Anzeige der
+// Skizzen-Übersicht (SketchOverview) nicht abbilden. saveSketchesForFloorToIDB
+// ERSETZT beim Speichern immer den kompletten, zuvor für dieses Geschoss
+// zwischengespeicherten Bestand (statt nur zu ergänzen), damit z.B. eine
+// zwischenzeitlich gelöschte Skizze nicht dauerhaft als Karteileiche im Cache
+// hängen bleibt.
+async function saveSketchesForFloorToIDB(floorId, sketches) {
+  if (!floorId) return;
+  try {
+    const db = await openBaudocIdb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readwrite");
+      const store = tx.objectStore(IDB_SKETCHES_STORE);
+      const index = store.index("floorId");
+      const cursorReq = index.openCursor(IDBKeyRange.only(floorId));
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (cursor) {
+          store.delete(cursor.primaryKey);
+          cursor.continue();
+        } else {
+          const now = Date.now();
+          for (const sketch of sketches || []) {
+            if (!sketch?.id) continue;
+            store.put({ id: sketch.id, floorId, data: sketch, cachedAt: now });
+          }
+        }
+      };
+      cursorReq.onerror = () => reject(cursorReq.error);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizzen für Geschoss "${floorId}" konnten nicht zwischengespeichert werden:`, err);
+  }
+}
+
+async function getSketchesForFloorFromIDB(floorId) {
+  if (!floorId) return null;
+  try {
+    const db = await openBaudocIdb();
+    const records = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readonly");
+      const index = tx.objectStore(IDB_SKETCHES_STORE).index("floorId");
+      const req = index.getAll(IDBKeyRange.only(floorId));
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    if (!records || records.length === 0) return null;
+    return records.map((r) => r.data);
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizzen für Geschoss "${floorId}" konnten nicht gelesen werden:`, err);
+    return null;
+  }
+}
+
+// ---- "pins"-Store -------------------------------------------------------------
+// Ein Datensatz je Grundrissskizze (Parameter heißt gemäß ANFORDERUNG "floorId",
+// aufgerufen wird er in dieser App aber mit der ID der aktuell geöffneten
+// GRUNDRISSSKIZZE/selectedFloorPlanId — exakt dieselbe Granularität, mit der auch
+// der bereits bestehende cachePinsOffline/readCachedPins arbeitet, siehe oben: Pins
+// hängen fachlich an pins.plan_id, nicht direkt an einem Geschoss mit mehreren
+// Skizzen). Speichert bewusst das GESAMTE Array unter einem Schlüssel statt
+// einzelner Pin-Datensätze — savePinsToIDB wird ohnehin immer mit dem kompletten,
+// aktuellen Pins-Stand einer Skizze aufgerufen (siehe die synchronisierenden
+// useEffects in App() weiter unten), ein Diffing auf Einzel-Pin-Ebene wäre hier
+// unnötige Komplexität.
+async function savePinsToIDB(floorId, pinsArray) {
+  if (!floorId) return;
+  try {
+    const db = await openBaudocIdb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_PINS_STORE, "readwrite");
+      tx.objectStore(IDB_PINS_STORE).put({ floorId, pins: pinsArray || [], cachedAt: Date.now() });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn(`IndexedDB: Pins für "${floorId}" konnten nicht zwischengespeichert werden:`, err);
+  }
+}
+
+async function getPinsFromIDB(floorId) {
+  if (!floorId) return null;
+  try {
+    const db = await openBaudocIdb();
+    const record = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_PINS_STORE, "readonly");
+      const req = tx.objectStore(IDB_PINS_STORE).get(floorId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    return record?.pins ?? null;
+  } catch (err) {
+    console.warn(`IndexedDB: Pins für "${floorId}" konnten nicht gelesen werden:`, err);
+    return null;
+  }
 }
 
 // ---- Synchronisations-Warteschlange (Abschnitt 15.2/15.3) ------------------------
@@ -9032,7 +9281,7 @@ function FloorUploadFileTypeIcon({ kind, size = 15 }) {
 // davon vor dem Speichern wieder zu entfernen. Der Upload selbst läuft sequenziell
 // (siehe App -> handleAddFloorPlanSketch), mit einem fortlaufenden "Lade Skizze X von
 // Y hoch…"-Fortschrittshinweis.
-function NewFloorPlanModal({ floor, onClose, onSave }) {
+function NewFloorPlanModal({ floor, activeCategory = "grundriss", onClose, onSave }) {
   const [name, setName] = useState("");
   const [files, setFiles] = useState([]); // File[]
   const [previewUrl, setPreviewUrl] = useState(null); // nur relevant bei genau einer Datei
@@ -9182,6 +9431,15 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
         </div>
 
         <div className={MODAL_BODY_SCROLL}>
+          {/* ANFORDERUNG "UPLOAD & AUTOMATISCHE ZUORDNUNG": jede hier hochgeladene Datei
+              wird automatisch der aktuell aktiven Tab-Kategorie der Skizzenübersicht
+              zugewiesen (siehe activeCategory-Prop/handleAddFloorPlanSketch in App) — rein
+              informativ, nicht veränderbar in diesem Modal, damit das Hochladen schnell
+              und unkompliziert bleibt. */}
+          <p className="flex items-center gap-1.5 rounded-lg bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-600 ring-1 ring-inset ring-slate-200">
+            <span>{PLAN_CATEGORY_META[activeCategory]?.emoji}</span>
+            Wird hinzugefügt zu: {PLAN_CATEGORY_META[activeCategory]?.label || PLAN_CATEGORY_META.grundriss.label}
+          </p>
           {files.length <= 1 && (
             <div>
               <FieldLabel>Name der Grundrissskizze</FieldLabel>
@@ -9356,6 +9614,13 @@ function NewFloorPlanModal({ floor, onClose, onSave }) {
 
 function EditFloorPlanModal({ plan, onClose, onSave }) {
   const [name, setName] = useState(plan?.name || "");
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": erlaubt das nachträgliche Umhängen
+  // eines Plans in eine andere Kategorie, falls er beim Hochladen versehentlich dem
+  // falschen Tab zugeordnet wurde — ohne diese Möglichkeit ließe sich das sonst nur
+  // über Löschen und erneutes Hochladen korrigieren. getPlanCategory() liefert bei
+  // Bestandsdaten ohne das Feld bewusst "grundriss" als Ausgangswert (siehe dortiger
+  // Kommentar).
+  const [category, setCategory] = useState(() => getPlanCategory(plan));
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
   const [fileKind, setFileKind] = useState(null); // "image" | "pdf" | "cad"
@@ -9407,7 +9672,7 @@ function EditFloorPlanModal({ plan, onClose, onSave }) {
     try {
       // file ist bewusst optional: onSave(name, null) aktualisiert nur den Namen und
       // lässt die bestehende Skizzen-Datei unangetastet.
-      await onSave(name.trim(), file, setCompressionNotice);
+      await onSave(name.trim(), file, setCompressionNotice, category);
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
       console.error("Grundrissskizze konnte nicht aktualisiert werden:", err);
@@ -9445,6 +9710,33 @@ function EditFloorPlanModal({ plan, onClose, onSave }) {
               placeholder="z.B. Grundriss Gesamt / Bereich A Nord"
               className={TEXT_INPUT_CLASS}
             />
+          </div>
+
+          <div>
+            <FieldLabel>Kategorie</FieldLabel>
+            <div className="flex flex-wrap gap-2">
+              {PLAN_CATEGORY_OPTIONS.map((opt) => {
+                const active = category === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setCategory(opt.value)}
+                    disabled={submitting}
+                    className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 ring-inset transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                      active ? "bg-red-50 text-[#FF2A00] ring-red-200" : "bg-white text-slate-500 ring-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <span>{opt.emoji}</span> {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            {category !== "grundriss" && (
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                Reiner Referenz-Viewer — in dieser Kategorie können keine Mängel-Pins gesetzt werden.
+              </p>
+            )}
           </div>
 
           <div>
@@ -10488,6 +10780,8 @@ function SketchOverview({
   floor,
   plans,
   loading,
+  activeCategory = "grundriss",
+  onChangeCategory,
   onBack,
   onOpenPlan,
   onOpenAddPlan,
@@ -10496,6 +10790,18 @@ function SketchOverview({
   onOpenExportModal,
   readOnly = false,
 }) {
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": rein clientseitige Filterung der
+  // bereits vollständig geladenen plans-Liste nach der aktiven Tab-Kategorie — keine
+  // eigene Nachlade-Anfrage je Tab-Wechsel nötig, dadurch bleibt der Wechsel exakt so
+  // "Zero-Latency" wie die bereits bestehende IndexedDB-Stale-While-Revalidate-Anzeige
+  // der gesamten Liste (siehe ANFORDERUNG Punkt 4). getPlanCategory() liefert für
+  // Bestandsdaten ohne das Feld automatisch "grundriss" zurück (Abwärtskompatibilität).
+  const categoryCounts = Object.fromEntries(
+    PLAN_CATEGORY_OPTIONS.map((opt) => [opt.value, plans.filter((p) => getPlanCategory(p) === opt.value).length])
+  );
+  const visiblePlans = plans.filter((p) => getPlanCategory(p) === activeCategory);
+  const activeCategoryMeta = PLAN_CATEGORY_META[activeCategory] || PLAN_CATEGORY_META.grundriss;
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <button
@@ -10505,7 +10811,7 @@ function SketchOverview({
         <ChevronLeft size={17} /> Zurück zur Geschossübersicht
       </button>
 
-      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{floor?.name}</h1>
           <p className="text-sm text-slate-500">
@@ -10516,9 +10822,11 @@ function SketchOverview({
           {/* ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": eigener,
               zusätzlicher Button neben dem bisherigen "Neue Grundrissskizze
               hinzufügen" — öffnet SketchExportModal, in dem gezielt einzelne Skizzen
-              dieses Geschosses für EINEN gemeinsamen PDF-Sammelbericht ausgewählt
-              werden können. Nur sichtbar, wenn überhaupt Skizzen vorhanden sind. */}
-          {plans.length > 0 && (
+              DER AKTUELL SICHTBAREN KATEGORIE für EINEN gemeinsamen PDF-Sammelbericht
+              ausgewählt werden können (mit Mängel-/Pin-Daten ist ohnehin nur die
+              Kategorie "Grundrisse" sinnvoll befüllt). Nur sichtbar, wenn in dieser
+              Kategorie überhaupt Skizzen vorhanden sind. */}
+          {visiblePlans.length > 0 && (
             <button
               onClick={onOpenExportModal}
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-600 shadow-sm transition hover:border-[#FF2A00] hover:text-[#FF2A00]"
@@ -10530,16 +10838,44 @@ function SketchOverview({
             onClick={onOpenAddPlan}
             className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
           >
-            <Plus size={16} /> Neue Grundrissskizze hinzufügen
+            <Plus size={16} /> {activeCategoryMeta.emoji} {activeCategoryMeta.label} hinzufügen
           </button>
         </div>
+      </div>
+
+      {/* ANFORDERUNG "TAB-SEGMENTIERUNG IM GESCHOSS": prägnante Tab-Leiste direkt über
+          der Planansicht, mit dynamischen Zähler-Badges je Kategorie. "Grundrisse /
+          Bestand" ist Default/Aktiv, siehe activeCategory-Default-Wert oben/in App. */}
+      <div className="mb-6 flex flex-wrap gap-1.5 rounded-xl bg-slate-100 p-1.5">
+        {PLAN_CATEGORY_OPTIONS.map((opt) => {
+          const active = activeCategory === opt.value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => onChangeCategory?.(opt.value)}
+              className={`inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                active ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"
+              }`}
+            >
+              <span>{opt.emoji}</span> {opt.label}
+              <span
+                className={`inline-flex min-w-5 items-center justify-center rounded-full px-1.5 py-0.5 text-[11px] font-bold ${
+                  active ? "bg-red-50 text-[#FF2A00]" : "bg-slate-200 text-slate-500"
+                }`}
+              >
+                {categoryCounts[opt.value]}
+              </span>
+            </button>
+          );
+        })}
       </div>
 
       {loading ? (
         <LoadingBlock label="Grundrisskizzen werden geladen…" />
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-          {plans.map((plan) => {
+          {visiblePlans.map((plan) => {
             const planPins = plan.pins || [];
             const open = planPins.filter((p) => p.status === "offen").length;
             const inProgress = planPins.filter((p) => p.status === "bearbeitung").length;
@@ -10646,12 +10982,26 @@ function SketchOverview({
             className="flex min-h-[104px] flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed border-slate-300 text-slate-400 transition hover:border-[#FF2A00] hover:bg-red-50/40 hover:text-[#FF2A00] sm:min-h-[120px]"
           >
             <UploadCloud size={22} />
-            <span className="text-xs font-semibold">Grundrissskizze hinzufügen</span>
+            <span className="text-xs font-semibold">
+              {activeCategoryMeta.emoji} {activeCategoryMeta.label} hinzufügen
+            </span>
           </button>
 
+          {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": zwei unterschiedliche Leerzustände —
+              das Geschoss hat insgesamt noch gar keine Pläne (plans.length === 0, Hinweis
+              bezieht sich bewusst weiter auf Pins, da das nur bei "Grundrisse" relevant ist),
+              oder es gibt zwar Pläne im Geschoss, aber keine in der aktuell aktiven Kategorie
+              (visiblePlans.length === 0 bei plans.length > 0) — dafür ein eigener, kategorie-
+              bezogener Hinweistext ohne Pin-Erwähnung, da Werkpläne/Montagepläne reine
+              Referenzansichten ohne Pin-Funktion sind. */}
           {!loading && plans.length === 0 && (
             <p className="col-span-full text-xs text-slate-400">
               Für dieses Geschoss ist noch keine Grundrissskizze hinterlegt. Füge oben eine erste Skizze hinzu, um Pins setzen zu können.
+            </p>
+          )}
+          {!loading && plans.length > 0 && visiblePlans.length === 0 && (
+            <p className="col-span-full text-xs text-slate-400">
+              In der Kategorie {activeCategoryMeta.emoji} {activeCategoryMeta.label} sind noch keine Pläne hinterlegt. Füge oben einen ersten Plan hinzu.
             </p>
           )}
         </div>
@@ -11673,6 +12023,15 @@ function FloorPlanView({
             <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{plan.name}</h1>
             {isCad && <CadBadge ext={fileExt} />}
             {isSvg && <VectorPlanBadge />}
+            {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: sichtbarer Hinweis direkt
+                am Titel, warum in "Werkpläne"/"Montagepläne" kein Pin durch Long Press
+                entsteht — Zoom/Pan bleiben hier uneingeschränkt nutzbar, nur die
+                Mängel-Pin-Anlage ist bewusst deaktiviert (siehe planAllowsPins). */}
+            {!planAllowsPins(plan) && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-500 ring-1 ring-inset ring-slate-200">
+                {PLAN_CATEGORY_META[getPlanCategory(plan)]?.emoji} Referenzansicht — keine Pin-Anlage
+              </span>
+            )}
             {/* Ersetzt den früheren langen Fließtext-Hinweis über dem Grundriss (siehe
                 FloorPlanHelpModal weiter unten) — direkt neben dem Titel der
                 Grundrissskizze, wie angefordert. */}
@@ -11699,7 +12058,11 @@ function FloorPlanView({
           <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700 ring-1 ring-inset ring-emerald-200">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> {done} erledigt
           </span>
-          {session && (
+          {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: Notiz-Modus-Umschalter nur
+              in der Kategorie "Grundrisse" anzeigen — in "Werkpläne"/"Montagepläne" gibt es
+              ohnehin keine Möglichkeit, eine Notiz zu platzieren (siehe planAllowsPins-Guard
+              in handleAddPlanNote), der Button würde dort nur verwirren. */}
+          {session && planAllowsPins(plan) && (
             <button
               type="button"
               onClick={() => setNoteMode((v) => !v)}
@@ -13770,6 +14133,11 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState(null);
   const [selectedFloorId, setSelectedFloorId] = useState(null);
   const [selectedFloorPlanId, setSelectedFloorPlanId] = useState(null);
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": aktuell aktiver Tab in der
+  // Skizzenübersicht (SketchOverview) eines Geschosses. "grundriss" ist Default, siehe
+  // ANFORDERUNG Punkt 1. Wird unten per Effekt bei jedem Geschosswechsel zurückgesetzt,
+  // damit ein neu geöffnetes Geschoss immer mit "Grundrisse / Bestand" startet.
+  const [activeSketchCategory, setActiveSketchCategory] = useState("grundriss");
   const [query, setQuery] = useState("");
   const [modalState, setModalState] = useState(null); // { pinId, isNew }
   const [noteModalState, setNoteModalState] = useState(null); // { noteId, isNew }
@@ -14029,6 +14397,18 @@ function App() {
     };
   }, [selectedProjectId]);
 
+  // ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS": Stale-
+  // While-Revalidate — der IndexedDB-Cache (siehe getSketchesForFloorFromIDB oben)
+  // wird IMMER zuerst geprüft, unabhängig vom Online-Status, und bei einem Treffer
+  // SOFORT gerendert (Zero-Latency, kein Lade-Spinner). Der anschließende
+  // Server-Request läuft in JEDEM Fall trotzdem weiter im Hintergrund und ersetzt
+  // den angezeigten Stand, sobald er eintrifft — ein Netzwerkfehler NACH einem
+  // bereits erfolgten Cache-Treffer wird deshalb bewusst nicht mehr als harter
+  // Fehler gemeldet (der Nutzer sieht ja bereits einen validen, nur ggf. leicht
+  // veralteten Stand), sondern nur als Konsolenwarnung. Der bereits bestehende
+  // localStorage-Fallback (readCachedFloorPlans) bleibt unverändert als zweite
+  // Sicherheitsnetz-Ebene bestehen, für den Fall, dass weder IndexedDB noch das
+  // Netzwerk etwas liefern.
   useEffect(() => {
     if (!selectedFloorId) {
       setFloorPlans([]);
@@ -14036,22 +14416,41 @@ function App() {
     }
     let cancelled = false;
     (async () => {
-      setLoadingFloorPlans(true);
+      let servedFromIdb = false;
+      try {
+        const idbSketches = await getSketchesForFloorFromIDB(selectedFloorId);
+        if (!cancelled && idbSketches && idbSketches.length > 0) {
+          setFloorPlans(idbSketches);
+          setLoadingFloorPlans(false);
+          servedFromIdb = true;
+        }
+      } catch (err) {
+        console.warn("IndexedDB-Zwischenspeicher für Grundrisskizzen konnte nicht gelesen werden:", err);
+      }
+      if (!servedFromIdb && !cancelled) setLoadingFloorPlans(true);
       try {
         if (!isOnline()) throw new Error("Keine Internetverbindung.");
         const data = await fetchFloorPlansWithPinSummary(selectedFloorId);
         if (!cancelled) {
           setFloorPlans(data);
           cacheFloorPlansOffline(selectedFloorId, data);
+          saveSketchesForFloorToIDB(selectedFloorId, data);
         }
       } catch (err) {
-        const cached = readCachedFloorPlans(selectedFloorId);
-        if (cached) {
-          console.warn("Grundrisskizzen konnten nicht live geladen werden, verwende Offline-Cache:", err);
-          if (!cancelled) setFloorPlans(cached);
+        if (servedFromIdb) {
+          console.warn(
+            "Grundrisskizzen konnten im Hintergrund nicht aktualisiert werden, zuletzt zwischengespeicherter Stand (IndexedDB) bleibt sichtbar:",
+            err
+          );
         } else {
-          console.error("Grundrisskizzen konnten nicht geladen werden:", err);
-          if (!cancelled) setGlobalError("Grundrisskizzen konnten nicht geladen werden. Bitte erneut versuchen.");
+          const cached = readCachedFloorPlans(selectedFloorId);
+          if (cached) {
+            console.warn("Grundrisskizzen konnten nicht live geladen werden, verwende Offline-Cache:", err);
+            if (!cancelled) setFloorPlans(cached);
+          } else {
+            console.error("Grundrisskizzen konnten nicht geladen werden:", err);
+            if (!cancelled) setGlobalError("Grundrisskizzen konnten nicht geladen werden. Bitte erneut versuchen.");
+          }
         }
       } finally {
         if (!cancelled) setLoadingFloorPlans(false);
@@ -14062,6 +14461,19 @@ function App() {
     };
   }, [selectedFloorId]);
 
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": bei jedem Geschosswechsel zurück auf den
+  // Default-Tab "Grundrisse / Bestand" springen, damit nicht versehentlich der zuletzt
+  // in einem anderen Geschoss aktive Tab (z.B. "Werkpläne") übernommen wird, obwohl das
+  // neue Geschoss in dieser Kategorie eventuell noch leer ist.
+  useEffect(() => {
+    setActiveSketchCategory("grundriss");
+  }, [selectedFloorId]);
+
+  // ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS": exakt
+  // dieselbe Stale-While-Revalidate-Strategie wie beim floorPlans-Effekt oben, hier
+  // für die Pins der gerade geöffneten Grundrissskizze (siehe getPinsFromIDB/
+  // savePinsToIDB oben — aufgerufen mit selectedFloorPlanId als Schlüssel, siehe
+  // Kommentar am "pins"-Store).
   useEffect(() => {
     if (!selectedFloorPlanId) {
       setPins([]);
@@ -14070,22 +14482,41 @@ function App() {
     }
     let cancelled = false;
     (async () => {
-      setLoadingPins(true);
+      let pinsServedFromIdb = false;
+      try {
+        const idbPins = await getPinsFromIDB(selectedFloorPlanId);
+        if (!cancelled && idbPins && idbPins.length > 0) {
+          setPins(idbPins);
+          setLoadingPins(false);
+          pinsServedFromIdb = true;
+        }
+      } catch (err) {
+        console.warn("IndexedDB-Zwischenspeicher für Pins konnte nicht gelesen werden:", err);
+      }
+      if (!pinsServedFromIdb && !cancelled) setLoadingPins(true);
       try {
         if (!isOnline()) throw new Error("Keine Internetverbindung.");
         const data = await fetchPinsWithDetails(selectedFloorPlanId);
         if (!cancelled) {
           setPins(data);
           cachePinsOffline(selectedFloorPlanId, data);
+          savePinsToIDB(selectedFloorPlanId, data);
         }
       } catch (err) {
-        const cached = readCachedPins(selectedFloorPlanId);
-        if (cached) {
-          console.warn("Pins konnten nicht live geladen werden, verwende Offline-Cache:", err);
-          if (!cancelled) setPins(cached);
+        if (pinsServedFromIdb) {
+          console.warn(
+            "Pins konnten im Hintergrund nicht aktualisiert werden, zuletzt zwischengespeicherter Stand (IndexedDB) bleibt sichtbar:",
+            err
+          );
         } else {
-          console.error("Pins konnten nicht geladen werden:", err);
-          if (!cancelled) setGlobalError("Pins konnten nicht geladen werden. Bitte erneut versuchen.");
+          const cached = readCachedPins(selectedFloorPlanId);
+          if (cached) {
+            console.warn("Pins konnten nicht live geladen werden, verwende Offline-Cache:", err);
+            if (!cancelled) setPins(cached);
+          } else {
+            console.error("Pins konnten nicht geladen werden:", err);
+            if (!cancelled) setGlobalError("Pins konnten nicht geladen werden. Bitte erneut versuchen.");
+          }
         }
       } finally {
         if (!cancelled) setLoadingPins(false);
@@ -14127,6 +14558,19 @@ function App() {
   useEffect(() => {
     if (selectedFloorId) cacheFloorPlansOffline(selectedFloorId, floorPlans);
   }, [floorPlans, selectedFloorId]);
+  // ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS": exakt
+  // dasselbe Prinzip, jetzt zusätzlich auch in den neuen IndexedDB-Cache gespiegelt
+  // ("sofort synchron aktualisiert" bei JEDER Änderung — Anlegen, Bearbeiten,
+  // Löschen, Duplizieren, Foto hinzufügen/entfernen, Offline-Synchronisation, …
+  // laufen alle über genau diese beiden State-Setter, ein einzelner zentraler Effekt
+  // je Ressource deckt dadurch automatisch JEDEN Mutationspfad ab, ohne dass jede
+  // einzelne Aktion selbst um einen IndexedDB-Schreibzugriff ergänzt werden müsste).
+  useEffect(() => {
+    if (selectedFloorId) saveSketchesForFloorToIDB(selectedFloorId, floorPlans);
+  }, [floorPlans, selectedFloorId]);
+  useEffect(() => {
+    if (selectedFloorPlanId) savePinsToIDB(selectedFloorPlanId, pins);
+  }, [pins, selectedFloorPlanId]);
   useEffect(() => {
     if (selectedFloorPlanId) cachePinsOffline(selectedFloorPlanId, pins);
   }, [pins, selectedFloorPlanId]);
@@ -14699,7 +15143,12 @@ function App() {
         selectedProjectId,
         name,
         file,
-        (statusMessage) => onProgress?.(i + 1, entries.length, statusMessage)
+        (statusMessage) => onProgress?.(i + 1, entries.length, statusMessage),
+        // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": neue Uploads werden automatisch der
+        // gerade im Tab aktiven Kategorie zugeordnet (Punkt 2) — ohne diese Übergabe würde
+        // createFloorPlanSketch stillschweigend auf seinen Default "grundriss" zurückfallen,
+        // unabhängig davon, in welchem Tab der Nutzer tatsächlich hochgeladen hat.
+        activeSketchCategory
       );
       // Jede erfolgreich gespeicherte Skizze wird SOFORT übernommen (nicht erst nach
       // der gesamten Batch) — schlägt eine spätere Datei fehl, bleiben die bereits
@@ -14757,10 +15206,15 @@ function App() {
     setEditFloorPlanModalState({ plan });
   };
 
-  const handleUpdateFloorPlanSketch = async (name, file, onStatusMessage) => {
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": EditFloorPlanModal übergibt zusätzlich die
+  // (ggf. geänderte) Kategorie als 4. Argument — ermöglicht die nachträgliche Umkategori-
+  // sierung eines Plans (z.B. versehentlich als "Grundriss" hochgeladener Werkplan), ohne
+  // dass dafür Löschen+Neu-Hochladen nötig wäre. category ist optional/undefined-sicher,
+  // siehe updateFloorPlanSketch (fields.category wird nur bei truthy-Wert gesetzt).
+  const handleUpdateFloorPlanSketch = async (name, file, onStatusMessage, category) => {
     if (!editFloorPlanModalState || !selectedProjectId) return;
     const planId = editFloorPlanModalState.plan.id;
-    const updated = await updateFloorPlanSketch(planId, selectedProjectId, name, file, onStatusMessage);
+    const updated = await updateFloorPlanSketch(planId, selectedProjectId, name, file, onStatusMessage, category);
     setFloorPlans((prev) => prev.map((fp) => (fp.id === planId ? { ...fp, ...updated } : fp)));
     setEditFloorPlanModalState(null);
     // Fehler werden NICHT hier gefangen: EditFloorPlanModal wartet auf dieses Promise
@@ -14950,6 +15404,12 @@ function App() {
 
   const handlePlanClick = async (x, y) => {
     if (!floor || !plan || creatingPin) return;
+    // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: Pin-Anlage ist ausschließlich in
+    // der Kategorie "Grundrisse" erlaubt — Werkpläne/Montagepläne dienen ungestört als
+    // reine Referenzansicht. Die Prüfung sitzt bewusst hier auf App-Ebene (nicht nur als
+    // UI-Hinweis in FloorPlanView), damit sie unabhängig vom jeweiligen UI-Zustand
+    // zuverlässig greift.
+    if (!planAllowsPins(plan)) return;
     if (!requireAuth()) return;
     setCreatingPin(true);
     setGlobalError(null);
@@ -15248,6 +15708,11 @@ function App() {
 
   const handleAddPlanNote = async (x, y) => {
     if (!plan || creatingNote) return;
+    // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: dieselbe Einschränkung wie bei
+    // handlePlanClick — Notizen zählen als Markierung auf dem Plan und sind damit ebenso
+    // nur in der Kategorie "Grundrisse" sinnvoll, Werkpläne/Montagepläne bleiben reiner
+    // Referenz-Viewer.
+    if (!planAllowsPins(plan)) return;
     if (!requireAuth()) return;
     if (!requireOnline("Eine Notiz kann")) return;
     setCreatingNote(true);
@@ -15691,6 +16156,8 @@ function App() {
           floor={floor}
           plans={floorPlans}
           loading={loadingFloorPlans}
+          activeCategory={activeSketchCategory}
+          onChangeCategory={setActiveSketchCategory}
           onBack={() => setScreen("floors")}
           onOpenPlan={openFloorPlanSketch}
           onOpenAddPlan={openFloorPlanModal}
@@ -15791,13 +16258,23 @@ function App() {
       )}
 
       {floorPlanModalOpen && (
-        <NewFloorPlanModal floor={floor} onClose={() => setFloorPlanModalOpen(false)} onSave={handleAddFloorPlanSketch} />
+        <NewFloorPlanModal
+          floor={floor}
+          activeCategory={activeSketchCategory}
+          onClose={() => setFloorPlanModalOpen(false)}
+          onSave={handleAddFloorPlanSketch}
+        />
       )}
 
       {sketchExportModalOpen && floor && (
         <SketchExportModal
           floor={floor}
-          plans={floorPlans}
+          // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": der PDF-Sammelexport bekommt nur die
+          // Skizzen der aktuell aktiven Kategorie — Mängel-/Pin-Tabellen im PDF-Bericht sind
+          // ohnehin nur für "Grundrisse" sinnvoll befüllt, Werkpläne/Montagepläne haben keine
+          // Pins. getPlanCategory() sorgt für die gleiche Abwärtskompatibilität wie überall
+          // sonst (Bestandsdaten ohne category-Feld gelten als "grundriss").
+          plans={floorPlans.filter((p) => getPlanCategory(p) === activeSketchCategory)}
           project={project}
           onClose={() => setSketchExportModalOpen(false)}
           onExport={handleExportSelectedSketchesPdf}
