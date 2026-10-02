@@ -716,7 +716,7 @@ const FLOOR_UPLOAD_HINT = "Grundriss hochladen (SVG, PNG, JPG, PDF, DWG, DXF)";
 // ABWÄRTSKOMPATIBILITÄT" gefordert — keine Bestandsdaten verschwinden dadurch aus der
 // Übersicht oder verlieren ihre Pins.
 const PLAN_CATEGORY_OPTIONS = [
-  { value: "grundriss", label: "Grundrisse / Bestand", emoji: "🗺️" },
+  { value: "grundriss", label: "Grundrisse", emoji: "🗺️" },
   { value: "werkplan", label: "Werkpläne", emoji: "📐" },
   { value: "montageplan", label: "Montagepläne", emoji: "🛠️" },
 ];
@@ -10811,42 +10811,20 @@ function SketchOverview({
         <ChevronLeft size={17} /> Zurück zur Geschossübersicht
       </button>
 
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{floor?.name}</h1>
-          <p className="text-sm text-slate-500">
-            Grundrisskizzen dieses Geschosses — jede Skizze hat ihre eigenen Pins und Mängel.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {/* ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": eigener,
-              zusätzlicher Button neben dem bisherigen "Neue Grundrissskizze
-              hinzufügen" — öffnet SketchExportModal, in dem gezielt einzelne Skizzen
-              DER AKTUELL SICHTBAREN KATEGORIE für EINEN gemeinsamen PDF-Sammelbericht
-              ausgewählt werden können (mit Mängel-/Pin-Daten ist ohnehin nur die
-              Kategorie "Grundrisse" sinnvoll befüllt). Nur sichtbar, wenn in dieser
-              Kategorie überhaupt Skizzen vorhanden sind. */}
-          {visiblePlans.length > 0 && (
-            <button
-              onClick={onOpenExportModal}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-600 shadow-sm transition hover:border-[#FF2A00] hover:text-[#FF2A00]"
-            >
-              <FileDown size={16} /> Skizzen für PDF auswählen
-            </button>
-          )}
-          <button
-            onClick={onOpenAddPlan}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
-          >
-            <Plus size={16} /> {activeCategoryMeta.emoji} {activeCategoryMeta.label} hinzufügen
-          </button>
-        </div>
+      <div className="mb-4">
+        <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{floor?.name}</h1>
+        <p className="text-sm text-slate-500">
+          Grundrisskizzen dieses Geschosses — jede Skizze hat ihre eigenen Pins und Mängel.
+        </p>
       </div>
 
-      {/* ANFORDERUNG "TAB-SEGMENTIERUNG IM GESCHOSS": prägnante Tab-Leiste direkt über
-          der Planansicht, mit dynamischen Zähler-Badges je Kategorie. "Grundrisse /
-          Bestand" ist Default/Aktiv, siehe activeCategory-Default-Wert oben/in App. */}
-      <div className="mb-6 flex flex-wrap gap-1.5 rounded-xl bg-slate-100 p-1.5">
+      {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" (Korrektur Platzierung): die
+          Tab-Leiste steht ausdrücklich DIREKT OBERHALB der Buttons "Neuen Grundriss
+          hinzufügen"/"Mängel zu PDF exportieren" — als erstes, prominentes
+          Navigationselement in der Geschossansicht, nicht erst darunter. Prägnante
+          Tab-Leiste mit dynamischen Zähler-Badges je Kategorie. "Grundrisse" ist
+          Default/Aktiv, siehe activeCategory-Default-Wert oben/in App. */}
+      <div className="mb-4 flex flex-wrap gap-1.5 rounded-xl bg-slate-100 p-1.5">
         {PLAN_CATEGORY_OPTIONS.map((opt) => {
           const active = activeCategory === opt.value;
           return (
@@ -10869,6 +10847,30 @@ function SketchOverview({
             </button>
           );
         })}
+      </div>
+
+      <div className="mb-6 flex flex-wrap items-center justify-end gap-2">
+        {/* ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": eigener,
+            zusätzlicher Button neben dem bisherigen "Neue Grundrissskizze
+            hinzufügen" — öffnet SketchExportModal, in dem gezielt einzelne Skizzen
+            DER AKTUELL SICHTBAREN KATEGORIE für EINEN gemeinsamen PDF-Sammelbericht
+            ausgewählt werden können (mit Mängel-/Pin-Daten ist ohnehin nur die
+            Kategorie "Grundrisse" sinnvoll befüllt). Nur sichtbar, wenn in dieser
+            Kategorie überhaupt Skizzen vorhanden sind. */}
+        {visiblePlans.length > 0 && (
+          <button
+            onClick={onOpenExportModal}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-600 shadow-sm transition hover:border-[#FF2A00] hover:text-[#FF2A00]"
+          >
+            <FileDown size={16} /> Skizzen für PDF auswählen
+          </button>
+        )}
+        <button
+          onClick={onOpenAddPlan}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+        >
+          <Plus size={16} /> {activeCategoryMeta.emoji} {activeCategoryMeta.label} hinzufügen
+        </button>
       </div>
 
       {loading ? (
@@ -11126,9 +11128,17 @@ function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, v
         onClick(pin);
       }}
       style={{ left: `${pin.x}%`, top: `${pin.y}%`, touchAction: draggable ? "none" : undefined }}
-      className={`absolute z-10 -translate-x-1/2 -translate-y-full focus:outline-none ${
-        draggable ? "cursor-pointer active:cursor-grabbing" : ""
-      } ${isDragging ? "opacity-70" : ""}`}
+      // ANFORDERUNG "PIN-TRANSPARENZ FÜR BESSERE PLAN-LESEBARKEIT": Pins verdecken die
+      // darunterliegende Zeichnung nicht mehr vollständig — Standard-Deckkraft ca. 70%
+      // (opacity-70), beim Hovern (Maus), Antippen/Fokussieren (Touch/Tastatur) oder
+      // während des Verschiebens (isDragging, entspricht "Auswählen") steigt sie auf
+      // 100%. Bewusst genau EIN statischer Opacity-Wert pro Render (Ternary statt zweier
+      // gleichzeitig anwendbarer Utility-Klassen), damit Tailwinds Kaskade nicht von der
+      // Reihenfolge der generierten Utilities abhängt. Kontur/Form selbst bleiben
+      // unverändert scharf (nur Deckkraft, kein Weichzeichnen/Blur).
+      className={`absolute z-10 -translate-x-1/2 -translate-y-full transition-opacity duration-150 focus:outline-none hover:opacity-100 focus:opacity-100 active:opacity-100 ${
+        isDragging ? "opacity-100" : "opacity-70"
+      } ${draggable ? "cursor-pointer active:cursor-grabbing" : ""}`}
       title={`${pin.title} (${pin.angle ?? 0}°)${draggable ? " — gedrückt halten zum Verschieben" : ""}`}
     >
       <span
