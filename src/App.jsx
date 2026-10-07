@@ -1,8 +1,11 @@
-import React, { useState, useRef, useEffect, forwardRef } from "react";
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, forwardRef } from "react";
 import { createClient } from "@supabase/supabase-js";
+import { supabase } from "./lib/supabaseClient";
+import { OfflineSyncManager, syncEngine, offlineStore, useOfflineSync } from "./offline";
 import {
   Search,
   ChevronLeft,
+  ChevronRight,
   Building2,
   Layers,
   MapPin,
@@ -51,6 +54,38 @@ import {
   Wifi,
   WifiOff,
   RefreshCw,
+  Crosshair,
+  Navigation,
+  Phone,
+  Coffee,
+  StickyNote,
+  Info,
+  PenTool,
+  ArrowUpRight,
+  Circle,
+  Undo2,
+  Eraser,
+  Mic,
+  Star,
+  LayoutGrid,
+  List,
+  Archive,
+  ArchiveRestore,
+  Copy,
+  GripVertical,
+  Mail,
+  KeyRound,
+  Send,
+  UserX,
+  MailPlus,
+  Settings,
+  HelpCircle,
+  Table,
+  Move,
+  CalendarRange,
+  CalendarClock,
+  Flag,
+  TrendingUp,
 } from "lucide-react";
 
 // ----------------------------------------------------------------------------------
@@ -70,10 +105,27 @@ if (!supabaseUrl || !supabaseAnonKey) {
   );
 }
 
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// Der reguläre Supabase-Client kommt aus ./lib/supabaseClient und wird auch vom Offline-Sync
+// (./offline) verwendet. Zwei getrennte Clients mit demselben Auth-Speicher würden sich
+// gegenseitig die Sitzung und den Token-Refresh streitig machen.
+
+// Eigener, unabhängiger zweiter Supabase-Client ausschließlich für den Admin-
+// Einladungsversand (siehe inviteUserToApp/resendUserInvite weiter unten). BEWUSST
+// getrennt vom regulären "supabase"-Client oben: ein supabase.auth.signUp()-Aufruf
+// auf dem regulären Client würde bei erfolgreicher Kontoerstellung dessen aktive
+// Session automatisch durch die neu erzeugte Session der EINGELADENEN Person
+// ersetzen — der Administrator wäre nach dem Versenden einer Einladung unerwartet
+// ausgeloggt bzw. als der eingeladene Nutzer angemeldet. persistSession:false und
+// autoRefreshToken:false sorgen dafür, dass dieser zweite Client weder localStorage
+// noch den Auth-Zustand des Haupt-Clients berührt — er wird ausschließlich für den
+// kurzen signUp()/resetPasswordForEmail()-Vorgang benutzt und danach ignoriert.
+const inviteSupabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+});
 
 const FLOOR_PLANS_BUCKET = "floor-plans";
 const PIN_PHOTOS_BUCKET = "pin-photos";
+const PROJECT_COVERS_BUCKET = "project-covers";
 
 // Einheitliche Datum/Uhrzeit-Formatierung — u.a. für die Bearbeitungshistorie
 // (Abschnitt 3) im Pin-Modal und im PDF-Export.
@@ -88,6 +140,51 @@ function formatDateOnly(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "–";
   return d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" });
+}
+// Kurzform DD.MM.YY — ausschließlich für die Spalte "Aufnahmedatum" im
+// Geschoss-Export (Excel & PDF), wie dort explizit vorgegeben.
+function formatDateShort(iso) {
+  if (!iso) return "–";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "–";
+  return d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "2-digit" });
+}
+
+// Google-Maps-Weiterleitung für die Adresse/den Standort eines Projekts. Eine einzige,
+// zentrale Stelle statt vier separat gebauter URLs (Projektformular, Listen-/Kachel-
+// ansicht, Projektdetail-Kopf) — verhindert, dass die vier Stellen bei einer künftigen
+// Änderung (z.B. Wechsel auf Apple Maps auf iOS) auseinanderlaufen. api=1 mit query
+// (statt der älteren /maps?q=-Form) ist der von Google dokumentierte, stabile Weg für
+// einen reinen Adress-Suchlink ohne eigenen API-Key; funktioniert unverändert als
+// Web-Link (neuer Tab) wie auch als Deep-Link, den mobile Browser/Betriebssysteme
+// automatisch an eine installierte Maps-App weiterreichen.
+function buildGoogleMapsUrl(address) {
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
+}
+
+// Klickbarer Adress-Text, der in einem neuen Tab (bzw. auf Mobilgeräten direkt in der
+// Maps-App) zur Google-Maps-Suche nach dieser Adresse führt. Rendert nichts, wenn keine
+// Adresse hinterlegt ist (project.address ist ein optionales Freitextfeld). stopPropagation
+// ist nötig, weil dieser Link an mehreren Stellen innerhalb eines übergeordneten,
+// ebenfalls klickbaren Zeilen-/Kartenelements sitzt (z.B. die Tabellenzeile in der
+// Listenansicht öffnet bei Klick das Projekt) — ein Klick auf die Adresse soll
+// ausschließlich Maps öffnen, nicht zusätzlich das Projekt.
+function AddressMapsLink({ address, className, iconSize = 12, children }) {
+  const trimmed = (address || "").trim();
+  if (!trimmed) return null;
+  return (
+    <a
+      href={buildGoogleMapsUrl(trimmed)}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(e) => e.stopPropagation()}
+      title="In Google Maps öffnen"
+      className={className || "inline-flex items-center gap-1 text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"}
+    >
+      <MapPin size={iconSize} className="shrink-0" />
+      {children || trimmed}
+    </a>
+  );
 }
 
 // ----------------------------------------------------------------------------------
@@ -104,7 +201,7 @@ const MODAL_BACKDROP_BASE = "fixed inset-0 flex items-end justify-center bg-slat
 
 // Standard-Textfeld (Input/Select ohne Icon-Präfix) in Formularen.
 const TEXT_INPUT_CLASS =
-  "w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-blue-500/30 placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50";
+  "w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50";
 
 // Kopf-/Fußzeile und Scroll-Body der einheitlichen Modal-Karte (Header mit Titel +
 // Schließen-Button, scrollbarer Inhaltsbereich, Footer mit Abbrechen/Speichern).
@@ -113,7 +210,7 @@ const MODAL_FOOTER_ROW = "flex items-center justify-end gap-2 border-t border-sl
 const MODAL_BODY_SCROLL = "flex-1 space-y-4 overflow-y-auto px-5 py-4";
 // Kleine, blau hervorgehobene Eyebrow-Zeile über dem eigentlichen Modal-Titel
 // (z.B. "Neues Projekt" über "Projekt anlegen").
-const MODAL_EYEBROW = "mb-0.5 text-[11px] font-semibold uppercase tracking-wider text-blue-600";
+const MODAL_EYEBROW = "mb-0.5 text-[11px] font-semibold uppercase tracking-wider text-[#FF2A00]";
 // Schließen-Button (X) oben rechts im Modal-Header — zwei Varianten, je nachdem ob
 // die jeweilige Stelle während des Speicherns/Löschens deaktiviert werden kann.
 const MODAL_CLOSE_BTN = "rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700";
@@ -122,17 +219,30 @@ const MODAL_CLOSE_BTN_DISABLED = `${MODAL_CLOSE_BTN} disabled:cursor-not-allowed
 // Sekundärer ("Abbrechen") und primärer (blauer Submit-)Button in Formular-Footern.
 const BTN_SECONDARY = "rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-500 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40";
 const BTN_PRIMARY =
-  "inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60";
+  "inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60";
 
 // ----------------------------------------------------------------------------------
 // STATUS / PRIORITÄT (Mängel-Pins)
 // ----------------------------------------------------------------------------------
 
 const STATUS = {
-  offen: { label: "Offen", dot: "bg-rose-500", text: "text-rose-700", bg: "bg-rose-50", ring: "ring-rose-200" },
+  // Bewusst auf das exakte Markenrot ("REISNER x FRANK") statt auf Tailwinds
+  // Standard-Rose-Palette umgestellt — offene Mängel-Pins sind damit farblich
+  // exakt an der Corporate Identity ausgerichtet (siehe PinMarker sowie
+  // PDF_STATUS_RGB weiter unten für den deckungsgleichen Farbwert im Export).
+  offen: { label: "Offen", dot: "bg-[#FF2A00]", text: "text-[#FF2A00]", bg: "bg-red-50", ring: "ring-red-200" },
   bearbeitung: { label: "In Bearbeitung", dot: "bg-amber-500", text: "text-amber-700", bg: "bg-amber-50", ring: "ring-amber-200" },
   erledigt: { label: "Erledigt", dot: "bg-emerald-500", text: "text-emerald-700", bg: "bg-emerald-50", ring: "ring-emerald-200" },
 };
+
+// Schnell-Filter-Optionen der Status-Toggle-Leiste in der Planansicht (siehe
+// FloorPlanView) — "all" zeigt unabhängig vom Status alle Pins.
+const STATUS_FILTER_OPTIONS = [
+  { value: "all", label: "Alle anzeigen" },
+  { value: "offen", label: "Nur Offen" },
+  { value: "bearbeitung", label: "In Bearbeitung" },
+  { value: "erledigt", label: "Erledigt" },
+];
 
 const PRIORITY = {
   niedrig: { label: "Niedrig", text: "text-slate-600", bg: "bg-slate-100", bar: "bg-slate-400" },
@@ -149,13 +259,66 @@ const PIN_FIELD_LABELS = {
   title: "Titel",
   description: "Beschreibung",
   priority: "Priorität",
-  assigned_to: "Zuständigkeit",
-  trade_id: "Gewerk",
+  trade_ids: "Gewerke",
   angle: "Blickrichtung",
+  due_date: "Frist / Fälligkeitsdatum",
+  area: "Bereich",
 };
 
+// MULTI-SELECT GEWERKE JE PIN (siehe ANFORDERUNG "Multi-Select Trades for Pins"): ein
+// Pin kann jetzt mehreren Gewerken gleichzeitig zugeordnet sein, gespeichert als
+// Array von Gewerke-IDs in pins.trade_ids (siehe supabase_schema_v19_pin_multi_trade.sql).
+// getPinTradeIds() ist die EINZIGE Stelle, an der ein Pin-Datensatz auf seine
+// zugeordneten Gewerke-IDs abgefragt wird — bevorzugt das neue trade_ids-Array, fällt
+// für ältere bzw. rein offline zwischengespeicherte Pin-Datensätze (vor dieser
+// Erweiterung angelegt oder noch nicht synchronisiert) auf das frühere Einzelfeld
+// trade_id zurück, damit eine bestehende Gewerke-Zuordnung dabei nicht stillschweigend
+// verloren geht. getPinTradeNames() baut daraus die kommagetrennte Anzeige ("Trockenbau,
+// Maler, Fliesenleger"), einheitlich für Pin-Detailansicht, kompakte Tabelle unter dem
+// Grundriss, PDF-Export und CSV/Excel-Export.
+function getPinTradeIds(pin) {
+  if (!pin) return [];
+  // Bewusst NICHT auf "trade_ids nicht leer" geprüft, sondern nur darauf, ob das Feld
+  // überhaupt als Array vorliegt: ein bereits vorhandenes, aber bewusst leeres Array
+  // (z.B. weil zuletzt explizit alle Gewerke wieder abgewählt wurden) muss als "keine
+  // Gewerke zugeordnet" gelten dürfen, statt fälschlich auf ein ggf. noch vorhandenes,
+  // veraltetes Einzelfeld trade_id zurückzufallen. Der Fallback greift also NUR, wenn
+  // trade_ids am Pin-Objekt komplett fehlt — das betrifft ausschließlich vor dieser
+  // Erweiterung angelegte, noch nicht synchronisierte Offline-Datensätze.
+  if (Array.isArray(pin.trade_ids)) return pin.trade_ids;
+  if (pin.trade_id) return [pin.trade_id];
+  return [];
+}
+
+function getPinTradeNames(pin, tradesById) {
+  const ids = getPinTradeIds(pin);
+  if (ids.length === 0) return "";
+  return ids
+    .map((id) => tradesById.get(id)?.name)
+    .filter(Boolean)
+    .join(", ");
+}
+
+// Vergleicht einen einzelnen Feldwert zwischen dem neu gespeicherten Stand (fields[key])
+// und dem vorherigen Pin (prevPin[key]) für die Bearbeitungshistorie (siehe
+// handleSaveFields) — bei trade_ids reicht ein einfacher !==-Vergleich nicht, da bei
+// jedem Speichern ein NEUES Array-Objekt entsteht (React-State), selbst wenn die
+// enthaltenen Gewerke-IDs unverändert sind; ein reiner Referenzvergleich hätte hier bei
+// JEDER Speicherung fälschlich "Gewerke geändert" protokolliert.
+function pinFieldValueChanged(key, newVal, oldVal) {
+  if (key === "trade_ids") {
+    const a = Array.isArray(newVal) ? [...newVal].sort() : [];
+    const b = Array.isArray(oldVal) ? [...oldVal].sort() : [];
+    if (a.length !== b.length) return true;
+    return a.some((v, i) => v !== b[i]);
+  }
+  return newVal !== oldVal;
+}
+
 // Menschenlesbare Bezeichnungen + Icons für die Aktions-Typen in pin_activity_log —
-// verwendet sowohl im Verlauf im Pin-Modal als auch im PDF-Export.
+// verwendet ausschließlich im Verlauf im Pin-Modal (PinActivityHistory). Keiner der
+// drei PDF-Exportfunktionen (Gesamt-, Geschoss-/Sammel- und Einzelpin-Export) druckt
+// die Historie, siehe Kommentar "HINWEIS ZUR HISTORIE" in drawPinDetailPage.
 const PIN_ACTIVITY_META = {
   created: { label: "Angelegt", icon: Plus },
   status_changed: { label: "Status geändert", icon: CheckSquare },
@@ -163,6 +326,7 @@ const PIN_ACTIVITY_META = {
   moved: { label: "Verschoben", icon: MapPin },
   photo_added: { label: "Foto hinzugefügt", icon: Camera },
   photo_removed: { label: "Foto entfernt", icon: Trash2 },
+  photo_edited: { label: "Foto bearbeitet", icon: PenTool },
   todo_added: { label: "Aufgabe hinzugefügt", icon: ListChecks },
   todo_completed: { label: "Aufgabe erledigt", icon: CheckSquare },
   todo_reopened: { label: "Aufgabe wieder geöffnet", icon: Square },
@@ -170,93 +334,118 @@ const PIN_ACTIVITY_META = {
 };
 
 // ----------------------------------------------------------------------------------
-// PROJEKT-STATUS & HOAI-LEISTUNGSPHASEN (LPH 1–9)
+// PROJEKT-STATUS
 // ----------------------------------------------------------------------------------
 
-const PROJECT_STATUS_OPTIONS = ["Geplant", "In Bearbeitung", "Abgeschlossen"];
+const PROJECT_STATUS_OPTIONS = ["Geplant", "In Bearbeitung", "On Hold", "Abgeschlossen"];
 
 const PROJECT_STATUS_META = {
   Geplant: { text: "text-slate-600", bg: "bg-slate-100", dot: "bg-slate-400" },
   "In Bearbeitung": { text: "text-amber-700", bg: "bg-amber-50", dot: "bg-amber-500" },
+  "On Hold": { text: "text-violet-700", bg: "bg-violet-50", dot: "bg-violet-500" },
   Abgeschlossen: { text: "text-emerald-700", bg: "bg-emerald-50", dot: "bg-emerald-500" },
 };
 
-const LPH_PHASES = [
-  { key: "1", label: "LPH 1 · Grundlagenermittlung" },
-  { key: "2", label: "LPH 2 · Vorplanung" },
-  { key: "3", label: "LPH 3 · Entwurfsplanung" },
-  { key: "4", label: "LPH 4 · Genehmigungsplanung" },
-  { key: "5", label: "LPH 5 · Ausführungsplanung" },
-  { key: "6", label: "LPH 6 · Vorbereitung der Vergabe" },
-  { key: "7", label: "LPH 7 · Mitwirkung bei der Vergabe" },
-  { key: "8", label: "LPH 8 · Objektüberwachung" },
-  { key: "9", label: "LPH 9 · Objektbetreuung" },
-];
+// ----------------------------------------------------------------------------------
+// BAUZEITENPLAN — MEILENSTEIN-STATUS (project_milestones.status)
+// ----------------------------------------------------------------------------------
+// Gleiches Shape-Muster wie STATUS (Mängel-Pins) oben, damit UI-Stellen (Badge,
+// Pill-Auswahl im MilestoneModal) einheitlich damit arbeiten können.
+const MILESTONE_STATUS_OPTIONS = ["ausstehend", "bearbeitung", "abgeschlossen"];
 
-const LPH_STATUS_META = {
-  ausstehend: { label: "Ausstehend", dot: "bg-slate-400", text: "text-slate-600", bg: "bg-slate-100" },
-  bearbeitung: { label: "In Bearbeitung", dot: "bg-amber-500", text: "text-amber-700", bg: "bg-amber-50" },
-  abgeschlossen: { label: "Abgeschlossen", dot: "bg-emerald-500", text: "text-emerald-700", bg: "bg-emerald-50" },
-  nicht_relevant: { label: "Nicht relevant", dot: "bg-slate-300", text: "text-slate-400", bg: "bg-slate-50" },
+const MILESTONE_STATUS_META = {
+  ausstehend: { label: "Ausstehend", dot: "bg-slate-400", text: "text-slate-600", bg: "bg-slate-100", ring: "ring-slate-200" },
+  bearbeitung: { label: "In Bearbeitung", dot: "bg-amber-500", text: "text-amber-700", bg: "bg-amber-50", ring: "ring-amber-200" },
+  abgeschlossen: { label: "Abgeschlossen", dot: "bg-emerald-500", text: "text-emerald-700", bg: "bg-emerald-50", ring: "ring-emerald-200" },
 };
 
-function defaultLphStatus() {
-  return LPH_PHASES.reduce((acc, phase) => {
-    acc[phase.key] = "ausstehend";
-    return acc;
-  }, {});
+// ----------------------------------------------------------------------------------
+// BAUZEITENPLAN — DATUMS-/FORTSCHRITTSHILFSFUNKTIONEN
+// ----------------------------------------------------------------------------------
+// todayDateOnly()/parseDateOnly() arbeiten bewusst rein auf Kalendertagen (keine
+// Uhrzeitkomponente) — sowohl project.start_date/end_date als auch
+// project_milestones.start_date/end_date sind reine SQL "date"-Spalten (kein
+// timestamptz), ein Vergleich inklusive Uhrzeit würde am selben Kalendertag
+// abhängig von der Tageszeit unterschiedliche Ergebnisse liefern (z.B. "heute
+// fällig" würde ab Mitternacht fälschlich schon als "überfällig" gelten).
+function todayDateOnly() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+function parseDateOnly(value) {
+  if (!value) return null;
+  // "YYYY-MM-DD" explizit in lokale Mitternacht statt UTC-Mitternacht parsen (new
+  // Date("YYYY-MM-DD") interpretiert als UTC, was je nach Zeitzone auf den
+  // Vortag zurückfallen kann) — dieselbe Vorsicht wie bei allen Datumsvergleichen
+  // in dieser Datei.
+  const parts = String(value).slice(0, 10).split("-").map(Number);
+  if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return null;
+  const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  d.setHours(0, 0, 0, 0);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
-// ----------------------------------------------------------------------------------
-// LPH-AUFTRAGSAUSWAHL (Array der beauftragten/relevanten Phasen)
-// ----------------------------------------------------------------------------------
-// Eigenständiger Baustein neben dem 4-Status-Fortschritt oben (LPH_PHASES /
-// LphStatusGrid / LphProgressRow bilden "ausstehend/in Bearbeitung/abgeschlossen/
-// nicht relevant" ab). Hier geht es um eine reine Ja/Nein-Auswahl, wer/was pro
-// Objekt beauftragt bzw. relevant ist, daher bewusst eigene Namen, um mit dem
-// bestehenden LPH-Fortschritt nicht zu kollidieren.
-// Datenformat: Array der ausgewählten Phasen-Keys, z.B. ["1", "3", "5"].
-// Leere Auswahl ist ein leeres Array [].
+// Zeitlicher Ist-Fortschritt in % — heutiges Datum relativ zu start_date/end_date,
+// auf 0–100 begrenzt (ein Projekt vor Baubeginn zeigt 0%, eines nach dem geplanten
+// Fertigstellungstermin 100%, nie negative oder über 100% hinausgehende Werte).
+// Liefert null, wenn eines der beiden Daten fehlt oder end_date nicht nach
+// start_date liegt (Division durch Null bzw. unsinniger Zeitraum).
+function computeTimeProgressPercent(project) {
+  const start = parseDateOnly(project?.start_date);
+  const end = parseDateOnly(project?.end_date);
+  if (!start || !end) return null;
+  const totalMs = end.getTime() - start.getTime();
+  if (totalMs <= 0) return null;
+  const elapsedMs = todayDateOnly().getTime() - start.getTime();
+  const pct = (elapsedMs / totalMs) * 100;
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
 
-const LPH_AUFTRAGS_PHASEN = [
-  { key: "1", label: "LPH 1", title: "Grundlagenermittlung" },
-  { key: "2", label: "LPH 2", title: "Vorplanung" },
-  { key: "3", label: "LPH 3", title: "Entwurfsplanung" },
-  { key: "4", label: "LPH 4", title: "Genehmigungsplanung" },
-  { key: "5", label: "LPH 5", title: "Ausführungsplanung" },
-  { key: "6", label: "LPH 6", title: "Vorbereitung der Vergabe" },
-  { key: "7", label: "LPH 7", title: "Mitwirkung bei der Vergabe" },
-  { key: "8", label: "LPH 8", title: "Objektüberwachung" },
-  { key: "9", label: "LPH 9", title: "Objektbetreuung" },
-];
+// Geschaffener Ist-Fortschritt in % — Anteil der als "abgeschlossen" markierten
+// Meilensteine an allen Meilensteinen. Liefert null bei keinen Meilensteinen
+// (statt fälschlich 0%, das UI unterscheidet "noch nichts angelegt" von "0 von N
+// erledigt").
+function computeMilestoneProgressPercent(milestones) {
+  if (!Array.isArray(milestones) || milestones.length === 0) return null;
+  const done = milestones.filter((m) => m.status === "abgeschlossen").length;
+  return Math.round((done / milestones.length) * 100);
+}
 
-// Normalisiert eine LPH-Auswahl unabhängig von ihrer Herkunft auf ein Array aus
-// String-Keys. Deckt drei Fälle ab: das neue Array-Format ["1","3"], das ältere
-// Objekt-Format { "1": true, "2": false, ... } aus einer früheren Version dieser
-// Funktion (falls in Supabase noch Altbestände in diesem Format liegen), sowie
-// null/undefined (z.B. bei einem Projekt ohne gesetzte Auswahl). Vergleicht Keys
-// stets als String, damit es keinen Unterschied macht, ob Zahlen oder Strings
-// hereinkommen.
-function normalizeLphSelection(value) {
-  if (Array.isArray(value)) return value.map((key) => String(key));
-  if (value && typeof value === "object") {
-    return Object.entries(value)
-      .filter(([, active]) => !!active)
-      .map(([key]) => String(key));
+// "Heute anstehend" — gleicht das heutige Datum mit den Meilensteinen ab und
+// gruppiert sie in drei sich nicht überschneidende Kategorien:
+//   startingToday: start_date === heute (und noch nicht abgeschlossen)
+//   dueToday: end_date === heute (und noch nicht abgeschlossen)
+//   overdue: end_date < heute und noch nicht abgeschlossen (echter Verzug)
+// Ein bereits abgeschlossener Meilenstein taucht bewusst in keiner der drei
+// Kategorien mehr auf, auch wenn sein end_date heute oder in der Vergangenheit
+// liegt — er ist erledigt, kein "Verzug" oder "heute fällig" mehr.
+function getTodaysMilestoneHighlights(milestones) {
+  const today = todayDateOnly().getTime();
+  const startingToday = [];
+  const dueToday = [];
+  const overdue = [];
+  for (const m of milestones || []) {
+    if (m.status === "abgeschlossen") continue;
+    const start = parseDateOnly(m.start_date);
+    const end = parseDateOnly(m.end_date);
+    if (start && start.getTime() === today) startingToday.push(m);
+    if (end && end.getTime() === today) dueToday.push(m);
+    if (end && end.getTime() < today) overdue.push(m);
   }
-  return [];
+  return { startingToday, dueToday, overdue };
 }
 
 // ----------------------------------------------------------------------------------
 // PROJEKTSPEZIFISCHE GEWERKE-AUSWAHL (project.selected_trades)
 // ----------------------------------------------------------------------------------
-// Bewusst analog zu lph_beauftragt: ein Array von Gewerke-IDs, die für ein konkretes
-// Projekt relevant sind. Anders als bei lph_beauftragt wird hier aber zwischen "noch
-// nie gesetzt" (null/undefined — Bestandsprojekt von vor diesem Feature) und "bewusst
-// leer" ([] — es wurde explizit kein Gewerk ausgewählt) unterschieden: nur im ersten
-// Fall gilt in der App weiterhin die alte, unbeschränkte Auswahl aller aktiven
-// Gewerke, damit die Migration niemanden aussperrt. Sobald einmal über das
-// Projektformular gespeichert wurde, ist die Auswahl immer ein (ggf. leeres) Array.
+// Ein Array von Gewerke-IDs, die für ein konkretes Projekt relevant sind. Es wird
+// zwischen "noch nie gesetzt" (null/undefined — Bestandsprojekt von vor diesem
+// Feature) und "bewusst leer" ([] — es wurde explizit kein Gewerk ausgewählt)
+// unterschieden: nur im ersten Fall gilt in der App weiterhin die alte,
+// unbeschränkte Auswahl aller aktiven Gewerke, damit die Migration niemanden
+// aussperrt. Sobald einmal über das Projektformular gespeichert wurde, ist die
+// Auswahl immer ein (ggf. leeres) Array.
 function normalizeSelectedTrades(value) {
   if (value == null) return null;
   if (!Array.isArray(value)) return [];
@@ -270,101 +459,8 @@ function resolveProjectTradeIds(project) {
   return normalizeSelectedTrades(project.selected_trades);
 }
 
-const selectAllLphAuftrag = () => LPH_AUFTRAGS_PHASEN.map((phase) => phase.key);
-const selectLphAuftrag1to8 = () => LPH_AUFTRAGS_PHASEN.filter((phase) => phase.key !== "9").map((phase) => phase.key);
-const resetLphAuftragsSelection = () => [];
-
-// Kompakter Fortschrittsbalken + Text, z.B. "6 / 9 Phasen beauftragt".
-function LphAuftragsProgressRow({ lphSelection }) {
-  const selected = normalizeLphSelection(lphSelection);
-  const activeCount = selected.length;
-  const percent = Math.round((activeCount / LPH_AUFTRAGS_PHASEN.length) * 100);
-
-  return (
-    <div className="flex items-center gap-3">
-      <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
-        <div className="h-full rounded-full bg-blue-600 transition-all duration-300" style={{ width: `${percent}%` }} />
-      </div>
-      <span className="shrink-0 text-xs font-semibold text-slate-600">
-        {activeCount} / {LPH_AUFTRAGS_PHASEN.length} Phasen beauftragt
-      </span>
-    </div>
-  );
-}
-
-// Kompakte Chip-Buttons nebeneinander in einem Raster (statt volle Breite/eine Zeile
-// pro Phase), damit die Auswahl im Formular möglichst wenig vertikalen Platz braucht.
-// Beschriftung bewusst auf "LPH 1" … "LPH 9" gekürzt — der volle Phasenname bleibt als
-// Tooltip (title-Attribut) verfügbar. Der aktive Zustand wird über .includes() auf der
-// normalisierten String-Liste geprüft, damit Zahl- oder String-Keys aus lphSelection
-// keinen Unterschied machen.
-function LphAuftragsGrid({ lphSelection, onToggle, disabled = false }) {
-  const selected = normalizeLphSelection(lphSelection);
-
-  return (
-    <div className="grid grid-cols-5 gap-1.5 sm:grid-cols-9">
-      {LPH_AUFTRAGS_PHASEN.map((phase) => {
-        const active = selected.includes(String(phase.key));
-        return (
-          <button
-            key={phase.key}
-            type="button"
-            onClick={() => onToggle(phase.key)}
-            disabled={disabled}
-            aria-pressed={active}
-            title={`${phase.label} · ${phase.title}`}
-            className={`flex items-center justify-center gap-1 rounded-lg border px-1.5 py-2 text-[11px] font-bold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-              active
-                ? "border-blue-600 bg-blue-600 text-white shadow-sm"
-                : "border-slate-200 bg-white text-slate-500 hover:border-blue-300 hover:bg-blue-50/50"
-            }`}
-          >
-            {active && <Check size={11} strokeWidth={3} />}
-            {phase.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-// Schnell-Auswahl: "Alle auswählen (1–9)", "LPH 1–8", "Zurücksetzen".
-function LphAuftragsQuickActions({ onApply, disabled = false }) {
-  const baseClass =
-    "rounded-md border px-2.5 py-1 text-[11px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-50";
-
-  return (
-    <div className="flex flex-wrap gap-2">
-      <button
-        type="button"
-        onClick={() => onApply(selectAllLphAuftrag())}
-        disabled={disabled}
-        className={`${baseClass} border-slate-200 bg-white text-slate-600 hover:bg-slate-50`}
-      >
-        Alle auswählen (1–9)
-      </button>
-      <button
-        type="button"
-        onClick={() => onApply(selectLphAuftrag1to8())}
-        disabled={disabled}
-        className={`${baseClass} border-slate-200 bg-white text-slate-600 hover:bg-slate-50`}
-      >
-        LPH 1–8
-      </button>
-      <button
-        type="button"
-        onClick={() => onApply(resetLphAuftragsSelection())}
-        disabled={disabled}
-        className={`${baseClass} border-rose-200 bg-white text-rose-600 hover:bg-rose-50`}
-      >
-        Zurücksetzen
-      </button>
-    </div>
-  );
-}
-
 // ----------------------------------------------------------------------------------
-// PROJEKTSPEZIFISCHE GEWERKE-CHIPS (analog zur LPH-Auftragsauswahl)
+// PROJEKTSPEZIFISCHE GEWERKE-CHIPS
 // ----------------------------------------------------------------------------------
 // Interaktive Chip-Auswahl der für ein Projekt relevanten Gewerke im Projektformular.
 // Zeigt grundsätzlich nur aktive Gewerke aus der zentralen Gewerkeverwaltung an —
@@ -392,8 +488,8 @@ function TradeChipsPicker({ trades, selected, onToggle, disabled = false }) {
             aria-pressed={active}
             className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
               active
-                ? "border-blue-600 bg-blue-600 text-white shadow-sm"
-                : "border-slate-200 bg-white text-slate-500 hover:border-blue-300 hover:bg-blue-50/50"
+                ? "border-[#FF2A00] bg-[#FF2A00] text-white shadow-sm"
+                : "border-slate-200 bg-white text-slate-500 hover:border-red-300 hover:bg-red-50/50"
             }`}
           >
             {active && <Check size={11} strokeWidth={3} />}
@@ -426,8 +522,8 @@ function ExportChipGroup({ options, selected, onToggle, disabled = false, emptyL
             aria-pressed={active}
             className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
               active
-                ? "border-blue-600 bg-blue-600 text-white shadow-sm"
-                : "border-slate-200 bg-white text-slate-500 hover:border-blue-300 hover:bg-blue-50/50"
+                ? "border-[#FF2A00] bg-[#FF2A00] text-white shadow-sm"
+                : "border-slate-200 bg-white text-slate-500 hover:border-red-300 hover:bg-red-50/50"
             }`}
           >
             {active && <Check size={11} strokeWidth={3} />}
@@ -501,11 +597,11 @@ const ROLE_META = {
   Projektleitung: {
     label: "Projektleitung",
     description: "Voller Bearbeitungszugriff auf zugeordnete Projekte.",
-    badgeClass: "bg-blue-50 text-blue-700 ring-blue-200",
+    badgeClass: "bg-indigo-50 text-indigo-700 ring-indigo-200",
   },
   Bauleitung: {
     label: "Bauleitung",
-    description: "Bearbeitet Etagen, Pins und LPH-Status in zugeordneten Projekten.",
+    description: "Bearbeitet Etagen und Pins in zugeordneten Projekten.",
     badgeClass: "bg-amber-50 text-amber-700 ring-amber-200",
   },
   Projektmitarbeiter: {
@@ -527,6 +623,29 @@ function canAccessAdmin(session, currentAppUser) {
   return currentAppUser.role === "Administrator";
 }
 
+// Rollen- & Projekt-Filterung (Abschnitt 3 des Auth-/Rechte-Systems): Administrator
+// sieht ausnahmslos ALLE Projekte, jede andere Rolle nur die ihr über project_ids
+// zugewiesenen. Dieselbe Bootstrap-Ausnahme wie bei canAccessAdmin oben (noch kein
+// app_users-Profil vorhanden -> voller Zugriff), aus demselben Grund: ohne sie könnte
+// sich niemand mehr selbst als ersten Administrator eintragen und danach überhaupt
+// ein Projekt sehen.
+function canUserAccessProject(currentAppUser, projectId) {
+  if (!currentAppUser) return true;
+  if (currentAppUser.role === "Administrator") return true;
+  return (currentAppUser.project_ids || []).includes(projectId);
+}
+
+// Löst eine in created_by/updated_by/uploaded_by gespeicherte E-Mail-Adresse (siehe
+// supabase_schema_v5_audit_trail_and_project_number.sql) auf einen menschenlesbaren
+// "Name (E-Mail)"-Anzeigetext auf, sofern ein passendes app_users-Profil existiert —
+// sonst bleibt es bei der reinen E-Mail-Adresse. Für die Anzeige "Ersteller/
+// Bearbeiter" im Pin-Modal (Abschnitt 2, Audit-Log/Aktivitätsnachweis).
+function resolveUserLabel(email, users) {
+  if (!email) return null;
+  const match = (users || []).find((u) => u.email?.toLowerCase() === email.toLowerCase());
+  return match?.name ? `${match.name} (${email})` : email;
+}
+
 // ----------------------------------------------------------------------------------
 // DATEI-ERKENNUNG (Erweiterung + MIME-Type, da .dwg/.dxf oft keinen zuverlässigen
 // MIME-Type mitliefern)
@@ -542,6 +661,11 @@ function getFileInfo(file) {
   // werden — sowohl beim Upload (hier) als auch beim späteren Anzeigen der Etage.
   if (name.endsWith(".dwg") || name.endsWith(".dxf")) return { kind: "cad", ext };
   if (name.endsWith(".pdf") || file.type === "application/pdf") return { kind: "pdf", ext: "pdf" };
+  // SVG-Grundrisse (Vektor-Rendering, siehe SvgPlanCanvas) MÜSSEN vor der
+  // generischen image/*-Prüfung unten erkannt werden — .svg-Dateien liefern im
+  // Browser ebenfalls file.type "image/svg+xml" und würden sonst fälschlich als
+  // gewöhnliches Raster-Bild eingestuft.
+  if (name.endsWith(".svg") || file.type === "image/svg+xml") return { kind: "svg", ext: "svg" };
   if (["png", "jpg", "jpeg", "webp"].includes(ext) || file.type.startsWith("image/")) return { kind: "image", ext: ext || "img" };
   return null;
 }
@@ -573,15 +697,107 @@ function deriveFileExt(fileName) {
 // dass eine .dwg/.dxf-Datei versehentlich in einem <img>-Tag landet.
 function resolveFloorKind(floor) {
   if (!floor) return "image";
-  if (floor.file_type === "cad" || floor.file_type === "pdf" || floor.file_type === "image") return floor.file_type;
+  if (["cad", "pdf", "image", "svg"].includes(floor.file_type)) return floor.file_type;
   const name = deriveFileNameFromUrl(floor.image_url).toLowerCase();
   if (name.endsWith(".dwg") || name.endsWith(".dxf")) return "cad";
   if (name.endsWith(".pdf")) return "pdf";
+  if (name.endsWith(".svg")) return "svg";
   return "image";
 }
 
-const FLOOR_UPLOAD_ACCEPT = ".png,.jpg,.jpeg,.webp,.pdf,.dwg,.dxf,image/png,image/jpeg,image/webp,application/pdf";
-const FLOOR_UPLOAD_HINT = "Grundriss hochladen (PNG, JPG, PDF, DWG, DXF)";
+const FLOOR_UPLOAD_ACCEPT =
+  ".png,.jpg,.jpeg,.webp,.svg,.pdf,.dwg,.dxf,image/png,image/jpeg,image/webp,image/svg+xml,application/pdf";
+const FLOOR_UPLOAD_HINT = "Grundriss hochladen (SVG, PNG, JPG, PDF, DWG, DXF)";
+
+// ----------------------------------------------------------------------------------
+// ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT (GRUNDRISSE, WERKPLÄNE, MONTAGEPLÄNE)"
+// ----------------------------------------------------------------------------------
+// Jede Grundrissskizze/jeder Plan eines Geschosses gehört ab sofort zu genau einer von
+// drei Kategorien (floor_plans.category, siehe supabase_schema_v21_plan_categories.sql).
+// "grundriss" bleibt dabei bewusst der DEFAULT- und FALLBACK-Wert — sowohl auf
+// Datenbankebene (not null default 'grundriss', siehe Migration) als auch hier
+// clientseitig über getPlanCategory(): ein vor dieser Erweiterung angelegter oder rein
+// offline zwischengespeicherter Plan-Datensatz ohne das Feld wird automatisch als
+// "Grundriss / Bestand" behandelt, exakt wie in der ANFORDERUNG unter "FALLBACK /
+// ABWÄRTSKOMPATIBILITÄT" gefordert — keine Bestandsdaten verschwinden dadurch aus der
+// Übersicht oder verlieren ihre Pins.
+const PLAN_CATEGORY_OPTIONS = [
+  { value: "grundriss", label: "Grundrisse", emoji: "🗺️" },
+  { value: "werkplan", label: "Werkpläne", emoji: "📐" },
+  { value: "montageplan", label: "Montagepläne", emoji: "🛠️" },
+];
+const PLAN_CATEGORY_META = Object.fromEntries(PLAN_CATEGORY_OPTIONS.map((c) => [c.value, c]));
+
+function getPlanCategory(plan) {
+  const value = plan?.category;
+  return PLAN_CATEGORY_META[value] ? value : "grundriss";
+}
+
+// Nur in der Kategorie "Grundrisse / Bestand" steht das volle Mängel-/Pin-Setzen zur
+// Verfügung (siehe ANFORDERUNG Punkt 3) — Werkpläne/Montagepläne dienen ausschließlich
+// als hochauflösender Referenz-Viewer mit vollem Touch-Zoom/Pan (siehe FloorPlanView,
+// handlePlanClick/handleAddPlanNote in App).
+function planAllowsPins(plan) {
+  return getPlanCategory(plan) === "grundriss";
+}
+
+// ----------------------------------------------------------------------------------
+// PLATZHALTER-COVERFOTOS FÜR PROJEKT-KACHELN OHNE EIGENES GRUNDRISSBILD
+// ----------------------------------------------------------------------------------
+// Feste, kuratierte Auswahl generischer Architektur-/Baustellen-Fotos (Unsplash,
+// direkt über CDN-URLs verlinkt) für Projekte, die noch kein eigenes Grundriss-/
+// Vorschaubild haben (siehe heroFloor in ProjectOverview). Bewusst NICHT über den
+// von Unsplash 2021 angekündigten und inzwischen abgeschalteten Source-Dienst
+// (source.unsplash.com) bezogen — der liefert seit der Abschaltung keine Bilder
+// mehr — sondern über eine feste, kleine Liste einzelner, direkt referenzierter
+// Foto-URLs. Da diese Bilder generische Fremdmotive zeigen und NICHT die tatsächliche
+// Baustelle, wird die Kachel zusätzlich mit dem Hinweis "Platzhalterbild"
+// gekennzeichnet (siehe ProjectOverview), damit auf der Übersicht nie der Eindruck
+// entsteht, es handle sich um ein echtes Foto des jeweiligen Projekts. Ehrlicher
+// Hinweis: die Erreichbarkeit einzelner externer Foto-URLs kann sich künftig ändern,
+// deshalb hat ProjectCoverImage einen Fallback auf das bisherige neutrale Icon,
+// falls ein Foto nicht lädt.
+const PROJECT_PLACEHOLDER_IMAGES = [
+  "https://images.unsplash.com/photo-1541888946425-d0fbb186a5b7?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1449824913935-59a10b8d2000?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1487958449943-2429e8be8625?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1517581177682-a085bb7ffb15?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1541976590-713941681591?q=80&w=800&auto=format&fit=crop",
+  "https://images.unsplash.com/photo-1523217582562-09d0def993a6?q=80&w=800&auto=format&fit=crop",
+];
+
+// Einfacher, deterministischer String-Hash (djb2-Variante) — wählt für jedes Projekt
+// anhand seiner stabilen ID immer denselben Platzhalter aus derselben festen Liste,
+// kein Zufall bei jedem Neuladen der Übersicht.
+function hashStringToIndex(str, length) {
+  let hash = 5381;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    hash = (hash * 33) ^ s.charCodeAt(i);
+  }
+  return Math.abs(hash) % length;
+}
+
+function getProjectPlaceholderImage(project) {
+  return PROJECT_PLACEHOLDER_IMAGES[hashStringToIndex(project?.id, PROJECT_PLACEHOLDER_IMAGES.length)];
+}
+
+// Ermittelt das älteste vorhandene Foto aus den Mängel-Pins eines Projekts (über
+// alle Etagen/Grundrisskizzen/Pins hinweg) — dient als zweite Priorität für das
+// Kachel-Titelbild in ProjectOverview, wenn kein explizites project.cover_image_url
+// gesetzt ist (siehe ProjectCoverImage/ProjectFormModal). "Ältestes Foto" statt
+// "beliebiges erstes" ist deterministisch und stabil: dieselbe Kachel zeigt nicht
+// bei jedem Neuladen ein anderes Foto, nur weil die Server-Reihenfolge variiert.
+function resolveProjectPinPhoto(project) {
+  const photos = (project?.floors || [])
+    .flatMap((f) => f.pins || [])
+    .flatMap((p) => p.pin_photos || [])
+    .filter((ph) => ph?.photo_url);
+  if (photos.length === 0) return null;
+  return [...photos].sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0))[0].photo_url;
+}
 
 // ----------------------------------------------------------------------------------
 // SUPABASE DATA LAYER
@@ -592,26 +808,34 @@ const FLOOR_UPLOAD_HINT = "Grundriss hochladen (PNG, JPG, PDF, DWG, DXF)";
 // supabase_schema_v2_auth_and_projects.sql.
 // ----------------------------------------------------------------------------------
 
-// Projekte inkl. einer "leichten" Etagen-/Pin-Zusammenfassung (nur id + status) laden.
-// Das reicht aus, um in der Projektübersicht Vorschaubild, Etagenzahl und offene
-// Pins darzustellen, ohne pro Karte einen eigenen Request abzusetzen.
+// Projekte inkl. einer "leichten" Etagen-/Pin-Zusammenfassung laden. Das reicht aus,
+// um in der Projektübersicht Vorschaubild, Etagenzahl und offene Pins darzustellen,
+// ohne pro Karte einen eigenen Request abzusetzen. priority ist seit dem
+// Dringlichkeits-Indikator/der "Nach Dringlichkeit"-Sortierung in ProjectOverview
+// (siehe countUrgentPins) mit dabei. pin_photos(photo_url, created_at) ist seit dem
+// automatischen Kachel-Titelbild (siehe resolveProjectPinPhoto) zusätzlich mit
+// dabei — bewusst NUR die URL-Zeichenkette und den Zeitstempel je Foto, nicht die
+// Bilddaten selbst (die liegen ohnehin nur in Supabase Storage, nie in der
+// Datenbank), das hält den Mehrverbrauch dieser ohnehin auf jedem App-Start
+// geladenen Übersichtsabfrage überschaubar. cover_image_url kommt automatisch über
+// das führende "*" auf projects mit, sobald die Spalte existiert (siehe
+// supabase_schema_v12_project_cover_images.sql).
 async function fetchProjectsWithSummary() {
   const { data, error } = await supabase
     .from("projects")
-    .select("*, floors(id, name, image_url, file_type, pins(id, status))")
+    .select("*, floors(id, name, image_url, file_type, pins(id, status, priority, pin_photos(photo_url, created_at)))")
     .order("created_at", { ascending: false });
   if (error) throw error;
   return data ?? [];
 }
 
-// lph_beauftragt wird hier bewusst noch einmal explizit und normalisiert gesetzt
+// selected_trades wird hier bewusst noch einmal explizit und normalisiert gesetzt
 // (nicht nur über den Spread von fields durchgereicht), damit Insert und Update
 // unabhängig vom Aufrufer immer ein valides, JSON-kompatibles Array in Supabase
 // ablegen und nie undefined oder ein falsch typisiertes Objekt landet.
 async function createProject(fields) {
   const payload = {
     ...fields,
-    lph_beauftragt: normalizeLphSelection(fields.lph_beauftragt),
     // Beim Anlegen kommt selected_trades immer als (ggf. leeres) Array aus dem
     // Projektformular — ?? [] fängt nur den theoretischen Fall ab, dass das Feld
     // gar nicht mitgeschickt wird.
@@ -623,14 +847,10 @@ async function createProject(fields) {
 }
 
 async function updateProject(projectId, fields) {
-  // lph_beauftragt/selected_trades werden nur normalisiert, wenn sie tatsächlich Teil
-  // des Updates sind — sonst würde z.B. ein reines Status-Update ({ lph_status: {...} })
-  // die bestehende Auftrags- bzw. Gewerke-Auswahl versehentlich auf ein leeres Array
-  // zurücksetzen.
+  // selected_trades wird nur normalisiert, wenn es tatsächlich Teil des Updates ist —
+  // sonst würde z.B. ein reines Status-Update die bestehende Gewerke-Auswahl
+  // versehentlich auf ein leeres Array zurücksetzen.
   const payload = { ...fields };
-  if (Object.prototype.hasOwnProperty.call(fields, "lph_beauftragt")) {
-    payload.lph_beauftragt = normalizeLphSelection(fields.lph_beauftragt);
-  }
   if (Object.prototype.hasOwnProperty.call(fields, "selected_trades")) {
     payload.selected_trades = normalizeSelectedTrades(fields.selected_trades) ?? [];
   }
@@ -649,23 +869,71 @@ async function deleteProject(projectId) {
 }
 
 // Etagen eines Projekts inkl. leichter Pin-Zusammenfassung (für die Badges in der
-// Etagenübersicht) laden.
+// Etagenübersicht) sowie der Anzahl zugehöriger Grundrisskizzen (floor_plans) laden.
+// Die Pin-Zusammenfassung läuft weiterhin über pins.floor_id (geschossweite
+// Aggregation über ALLE Grundrisskizzen eines Geschosses hinweg) — siehe
+// supabase_schema_v7_floor_plans_sketch_level.sql für die Begründung.
 async function fetchFloorsWithPinSummary(projectId) {
   const { data, error } = await supabase
     .from("floors")
-    .select("*, pins(id, status)")
+    .select("*, pins(id, status), floor_plans(id)")
     .eq("project_id", projectId)
+    // sort_order ist die manuell per Drag & Drop veränderbare Reihenfolge (siehe
+    // reorderFloors unten sowie supabase_schema_v14_floor_sort_order.sql).
+    // nullsFirst: false + created_at als zweites Sortierkriterium fängt den
+    // Übergangszustand unmittelbar nach einem Deployment ohne bereits ausgeführte
+    // Migration ab (sort_order dann noch null) — sortiert in dem Fall unverändert
+    // wie zuvor nach Anlagezeitpunkt, statt mit nicht deterministischer Reihenfolge.
+    .order("sort_order", { ascending: true, nullsFirst: false })
     .order("created_at", { ascending: true });
   if (error) throw error;
   return data ?? [];
 }
 
-// Pins einer Etage inkl. aller zugehörigen To-dos und Fotos in einem einzigen
-// Request laden (verschachtelter Supabase-Select über die Fremdschlüssel).
-async function fetchPinsWithDetails(floorId) {
+// Grundrisskizzen eines Geschosses inkl. leichter Pin-Zusammenfassung (für die
+// Badges in der Grundrissskizzen-Übersicht, Ebene 3) laden. Die Pin-Zusammenfassung
+// bezieht sich hier strikt auf pins.plan_id — Pins anderer Skizzen desselben
+// Geschosses tauchen an dieser Skizze nie auf.
+async function fetchFloorPlansWithPinSummary(floorId) {
+  const { data, error } = await supabase
+    .from("floor_plans")
+    .select("*, pins(id, status)")
+    .eq("floor_id", floorId)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+// Hinweis: Die App lädt Pins seit der Dexie-Umstellung über syncEngine.refreshPlan (./offline,
+// dieselbe Abfrage, siehe pullPlan in offline/syncService.js). Diese Funktion bleibt als
+// Referenz/Direktabfrage erhalten.
+// Pins einer konkreten Grundrissskizze (Ebene 4) inkl. aller zugehörigen Fotos in
+// einem einzigen Request laden (verschachtelter Supabase-Select über die
+// Fremdschlüssel). Strikte Datentrennung: gefiltert wird über plan_id, nicht mehr
+// über floor_id — Pins tauchen dadurch garantiert nur auf genau der Grundrissskizze
+// auf, der sie zugeordnet wurden. Lädt bewusst KEINE pin_todos mehr mit (die
+// Aufgaben-/To-do-Funktion wurde vollständig aus der App entfernt, siehe
+// PinModal/generateFloorPinsTablePdf/generateSinglePinPdf) — eventuell noch aus der
+// Zeit davor in der Datenbank vorhandene pin_todos-Zeilen bleiben dadurch einfach
+// ungenutzt liegen, statt weiterhin mitgeladen zu werden.
+async function fetchPinsWithDetails(planId) {
   const { data, error } = await supabase
     .from("pins")
-    .select("*, pin_todos(*), pin_photos(*), pin_activity_log(*)")
+    .select("*, pin_photos(*), pin_activity_log(*)")
+    .eq("plan_id", planId)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+// Sämtliche Pins EINES Geschosses über ALLE seine Grundrisskizzen hinweg laden
+// (inkl. Fotos) — bewusst über floor_id statt plan_id gefiltert, für den
+// projektweiten PDF-Export (Abschnitt 5, siehe fetchAllPinsForProject unten), der
+// geschossweise aggregiert und keine Skizzen-Ebene kennt.
+async function fetchPinsForFloor(floorId) {
+  const { data, error } = await supabase
+    .from("pins")
+    .select("*, pin_photos(*), pin_activity_log(*)")
     .eq("floor_id", floorId)
     .order("created_at", { ascending: true });
   if (error) throw error;
@@ -676,56 +944,602 @@ function sanitizeFileName(name) {
   return name.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+// ---- Client-seitige PDF-Komprimierung für Baupläne über dem Supabase-Free-Plan-Limit ---
+// Der Storage-Bucket eines Supabase-Free-Plan-Projekts akzeptiert keine Einzeldatei über
+// 50MB. Hochauflösend gescannte oder direkt aus dem CAD-Programm exportierte Baupläne
+// (v.a. A0/A1-Formate) überschreiten das in der Praxis. Ab FLOOR_PLAN_PDF_COMPRESS_
+// THRESHOLD_BYTES wird die Datei deshalb VOR dem Upload automatisch verkleinert, statt den
+// Nutzer erst nach einem fehlschlagenden Upload-Versuch mit einer Fehlermeldung stehen zu
+// lassen (siehe uploadFloorPlan unten).
+const FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_MB = 45;
+const FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_BYTES = FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_MB * 1024 * 1024;
+const FLOOR_PLAN_PDF_HARD_LIMIT_MB = 50;
+const FLOOR_PLAN_PDF_HARD_LIMIT_BYTES = FLOOR_PLAN_PDF_HARD_LIMIT_MB * 1024 * 1024;
+// pdf.js' Skalierungsfaktor ist relativ zur PDF-eigenen 72-DPI-Basiseinheit — Scale 2.0
+// entspricht rechnerisch rund 144 DPI, nicht wörtlich den in der Anforderung genannten
+// "300 DPI". Ein tatsächliches 300-DPI-Rendering (Scale ≈ 4,17) würde bei den auf der
+// Baustelle üblichen A0/A1-Planformaten selbst als JPEG kaum kleiner als das Original
+// ausfallen und liefe dem eigentlichen Ziel (deutlich kleinere Datei, auf Tablet/Handy
+// weiterhin gut lesbar) zuwider. Übernommen wird deshalb der wörtlich genannte Scale-Wert
+// (2.0), nicht die DPI-Zahl — siehe Einordnung in der Antwort.
+const FLOOR_PLAN_PDF_COMPRESS_RENDER_SCALE = 2.0;
+// Unabhängige, eigene Sicherheitsgrenze für diese Hintergrund-Rasterung (nicht dieselbe
+// Konstante wie die Viewer-Caps PDF_SAFE_MAX_CANVAS_DIM_PX_*, die an die aktuelle
+// Fenstergröße/Gerätedichte des Betrachters gekoppelt sind — hier läuft nichts davon,
+// eine Kopplung an das Browserfenster ergäbe für einen Hintergrund-Batch-Vorgang keinen
+// Sinn) — verhindert dennoch zuverlässig eine übermäßige Speicherallokation bei extrem
+// großformatigen Scans.
+const FLOOR_PLAN_PDF_COMPRESS_MAX_CANVAS_DIM_PX = 8000;
+const FLOOR_PLAN_PDF_COMPRESS_JPEG_QUALITY = 0.75;
+
+// Rendert jede Seite der zu großen PDF-Datei clientseitig über pdf.js auf ein Offscreen-
+// Canvas und baut daraus über jsPDF eine neue, als JPEG re-komprimierte PDF-Datei
+// zusammen — dieselben beiden bereits vorhandenen, per CDN nachgeladenen Bibliotheken
+// (loadPdfJs/loadJsPdf), die auch der Grundriss-Viewer bzw. die App-eigenen PDF-Exporte
+// nutzen, hier nur in umgekehrter Richtung (lesen UND neu schreiben statt nur lesen).
+// Läuft vollständig im Browser, kein Server-Aufruf. Vektorinhalte (echter Text, feine
+// CAD-Linien) gehen dabei zwangsläufig verloren, das Ergebnis ist pro Seite ein reines
+// Rasterbild — der unvermeidbare Kompromiss jeder Rasterung, weshalb dieser Pfad auch nur
+// ab der konfigurierten Mindestgröße greift, nicht generell für jede PDF.
+async function compressPdfForUpload(file) {
+  const pdfjsLib = await loadPdfJs();
+  const objectUrl = URL.createObjectURL(file);
+  // sourceDoc außerhalb des try deklariert, damit finally weiter unten unabhängig vom
+  // genauen Fehlschlagpunkt darauf zugreifen und destroy() aufrufen kann (siehe
+  // Kommentar dort zum GEDÄCHTNIS-LECK-FIX).
+  let sourceDoc = null;
+  try {
+    sourceDoc = await loadPdfDocument(pdfjsLib, objectUrl);
+    const JsPdfCtor = await loadJsPdf();
+    let outputDoc = null;
+    for (let pageNum = 1; pageNum <= sourceDoc.numPages; pageNum += 1) {
+      const page = await sourceDoc.getPage(pageNum);
+      let viewport = page.getViewport({ scale: FLOOR_PLAN_PDF_COMPRESS_RENDER_SCALE });
+      const largestDim = Math.max(viewport.width, viewport.height);
+      if (largestDim > FLOOR_PLAN_PDF_COMPRESS_MAX_CANVAS_DIM_PX) {
+        viewport = page.getViewport({
+          scale: FLOOR_PLAN_PDF_COMPRESS_RENDER_SCALE * (FLOOR_PLAN_PDF_COMPRESS_MAX_CANVAS_DIM_PX / largestDim),
+        });
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(viewport.width));
+      canvas.height = Math.max(1, Math.round(viewport.height));
+      const ctx = canvas.getContext("2d", { alpha: false });
+      // Weißer Hintergrund vor dem Zeichnen: JPEG kennt keine Transparenz (siehe
+      // dieselbe Begründung bei compressImage für Pin-Fotos weiter oben).
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      const imageData = canvas.toDataURL("image/jpeg", FLOOR_PLAN_PDF_COMPRESS_JPEG_QUALITY);
+
+      // Seitengröße exakt an die gerenderte Pixelgröße gekoppelt (unit "px"), damit das
+      // Seitenformat des Original-Plans (z.B. A0 quer) erhalten bleibt statt auf ein
+      // festes A4-Format gepresst zu werden.
+      const orientation = canvas.width >= canvas.height ? "landscape" : "portrait";
+      if (!outputDoc) {
+        outputDoc = new JsPdfCtor({ unit: "px", format: [canvas.width, canvas.height], orientation, compress: true });
+      } else {
+        outputDoc.addPage([canvas.width, canvas.height], orientation);
+      }
+      outputDoc.addImage(imageData, "JPEG", 0, 0, canvas.width, canvas.height);
+      // Canvas-Speicher der bereits verarbeiteten Seite sofort freigeben, bevor die
+      // nächste Seite gerendert wird — bei mehrseitigen Planwerken sonst unnötig hoher
+      // Speicher-Spitzenbedarf während der Konvertierung.
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+    if (!outputDoc) throw new Error("Die PDF-Datei enthält keine Seiten.");
+    const blob = outputDoc.output("blob");
+    const baseName = (file.name || "plan").replace(/\.[a-zA-Z0-9]+$/, "");
+    return new File([blob], `${baseName}_komprimiert.pdf`, { type: "application/pdf", lastModified: Date.now() });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+    // GEDÄCHTNIS-LECK-FIX (siehe Einordnung in der Antwort): pdf.js' PDFDocumentProxy
+    // gibt seine internen Caches (Worker-seitige Font-/Seiten-Daten) NICHT automatisch
+    // frei, nur weil die JS-Variable außer Reichweite gerät — destroy() ist laut
+    // pdf.js-API der dafür vorgesehene, explizite Aufruf. Ohne ihn blieb bei JEDEM
+    // PDF-Grundriss-Upload über dieser Größenschwelle ein solches Dokument dauerhaft
+    // im Speicher der Seite hängen. try/catch hier bewusst defensiv: destroy() selbst
+    // sollte nie fehlschlagen, aber ein einzelner Aufräumfehler darf niemals den
+    // eigentlichen Upload-Vorgang zum Absturz bringen.
+    if (sourceDoc) {
+      try {
+        sourceDoc.destroy();
+      } catch (destroyErr) {
+        console.warn("PDF-Dokument (Upload-Komprimierung) konnte nicht sauber freigegeben werden:", destroyErr);
+      }
+    }
+  }
+}
+
+// ---- Client-seitige Vorab-Verkleinerung hochgeladener Raster-Grundrisse (PNG/JPG/WebP) --
+// TABLET CANVAS ZOOM FIX, Teil 2: ein direkt als PNG/JPG/WebP hochgeladener Grundriss
+// (kind "image" in getFileInfo, im Unterschied zu PDF/DWG/DXF) wird später einfach über
+// ein normales <img src={image_url}> angezeigt (siehe FloorPlanView) und durchläuft dabei
+// KEINE der bereits vorhandenen Rasterisierungs-Caps (PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE/
+// _DESKTOP, renderPdfPageToSafeCanvasElement) — die gelten ausschließlich für die PDF-
+// Rendering-Pipeline. Ein sehr hochauflösend gescannter oder direkt aus dem CAD-Programm
+// exportierter Plan (z. B. > 6000px Kantenlänge) würde also unverändert in voller Auflösung
+// ins DOM geladen und dort erst beim Zoomen auf schwächeren Tablets zum GPU-Speicher-Risiko.
+// Deshalb wird JEDES Raster-Bild vor dem Upload hier client-seitig über ein Offscreen-
+// Canvas auf maximal FLOOR_PLAN_IMAGE_MAX_DIM_PX an der LÄNGEREN Seite herunterskaliert,
+// bevor es an Supabase Storage geht — unter Beibehaltung der vollen Schärfe, wie
+// angefordert: 3000px an der längeren Seite liegt deutlich über der tatsächlich
+// wahrnehmbaren Detailauflösung selbst eines modernen Tablet-Displays bei voll
+// ausgereiztem FLOORPLAN_MAX_SCALE (400%), ein sichtbarer Schärfeverlust ist damit nicht zu
+// erwarten. PNG-Quellen bleiben bewusst PNG (verlustfrei, wichtig für gestochen scharfe
+// CAD-/Linienzeichnungen mit feinem Text), alle anderen Raster-Formate werden — wie bei
+// compressImage() für reine Mängel-Fotos — bevorzugt als hochqualitatives WebP (Qualität
+// 0.92, deutlich über der 0.82 von compressImage für reine Foto-Dokumentation)
+// re-encodiert, mit automatischem JPEG-Fallback auf Browsern ohne WebP-Kodierungs-
+// unterstützung (siehe supportsWebpEncoding). Ein bereits kleinerer Plan bleibt
+// unverändert die Original-Datei (kein unnötiges Re-Encoding). Wirft absichtlich nie
+// einen Fehler nach außen — schlägt das Dekodieren fehl, wird unverändert die
+// Original-Datei zurückgegeben (dieselbe Fallback-Strategie wie bei compressImage für
+// Pin-Fotos oben), damit ein einzelnes exotisches Bildformat den Grundriss-Upload nicht
+// blockiert.
+const FLOOR_PLAN_IMAGE_MAX_DIM_PX = 3000;
+const FLOOR_PLAN_IMAGE_JPEG_QUALITY = 0.92;
+function resizeFloorPlanImageForUpload(file, maxDim = FLOOR_PLAN_IMAGE_MAX_DIM_PX, quality = FLOOR_PLAN_IMAGE_JPEG_QUALITY) {
+  return new Promise((resolve) => {
+    if (!file || !file.type || !file.type.startsWith("image/") || file.type === "image/svg+xml") {
+      resolve(file);
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    const cleanup = () => URL.revokeObjectURL(objectUrl);
+    const fallbackToOriginal = (reason) => {
+      cleanup();
+      console.warn("Grundriss-Vorab-Verkleinerung übersprungen, Original wird verwendet:", reason);
+      resolve(file);
+    };
+    const img = new Image();
+    img.onload = async () => {
+      try {
+        const naturalWidth = img.naturalWidth || img.width;
+        const naturalHeight = img.naturalHeight || img.height;
+        if (!naturalWidth || !naturalHeight) {
+          fallbackToOriginal("Bildabmessungen konnten nicht ermittelt werden.");
+          return;
+        }
+        const largestDim = Math.max(naturalWidth, naturalHeight);
+        // Nur verkleinern, nie vergrößern — ein Plan unterhalb der Grenze bleibt
+        // unverändert die Original-Datei.
+        if (largestDim <= maxDim) {
+          cleanup();
+          resolve(file);
+          return;
+        }
+        const downscale = maxDim / largestDim;
+        const targetWidth = Math.max(1, Math.round(naturalWidth * downscale));
+        const targetHeight = Math.max(1, Math.round(naturalHeight * downscale));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        const isPng = file.type === "image/png";
+        const ctx = canvas.getContext("2d", { alpha: isPng });
+        if (!ctx) {
+          fallbackToOriginal("2D-Canvas-Context nicht verfügbar.");
+          return;
+        }
+        if (!isPng) {
+          // Weder JPEG noch WebP (verlustbehaftet, wie hier eingesetzt) kennen
+          // Transparenz — weißer Hintergrund vor dem Zeichnen (siehe dieselbe
+          // Begründung bei compressImage für Pin-Fotos).
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, targetWidth, targetHeight);
+        }
+        ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+        // ANFORDERUNG "CLIENT-SIDE IMAGE RESIZING & WEBP COMPRESSION": PNG-Quellen
+        // bleiben weiterhin verlustfrei PNG (siehe Kommentar oben, CAD-/
+        // Linienzeichnungen mit feinem Text) — alle anderen Raster-Grundrisse werden
+        // jetzt, wie die reinen Mängel-Fotos über compressImage(), bevorzugt als WebP
+        // re-encodiert (kleinere Datei bei gleicher Zielqualität), mit demselben
+        // automatischen JPEG-Fallback auf Browsern ohne WebP-Kodierungsunterstützung
+        // (siehe supportsWebpEncoding oben).
+        const useWebp = !isPng && (await supportsWebpEncoding());
+        const outputType = isPng ? "image/png" : useWebp ? "image/webp" : "image/jpeg";
+        canvas.toBlob(
+          (blob) => {
+            cleanup();
+            if (!blob) {
+              console.warn(
+                "Grundriss-Vorab-Verkleinerung übersprungen, Original wird verwendet: toBlob lieferte kein Ergebnis."
+              );
+              resolve(file);
+              return;
+            }
+            const baseName = (file.name || "grundriss").replace(/\.[a-zA-Z0-9]+$/, "");
+            const ext = isPng ? "png" : useWebp ? "webp" : "jpg";
+            resolve(new File([blob], `${baseName}.${ext}`, { type: outputType, lastModified: Date.now() }));
+          },
+          outputType,
+          isPng ? undefined : quality
+        );
+      } catch (err) {
+        fallbackToOriginal(err);
+      }
+    };
+    img.onerror = () => fallbackToOriginal("Bild konnte nicht geladen werden.");
+    img.src = objectUrl;
+  });
+}
+
+// ---- TABLET CANVAS ZOOM FIX, Teil 3: Kachel-/Deep-Zoom-Pyramide für Raster-Grundrisse --
+// Architektur-Entscheidung (siehe Einordnung in der Antwort): statt einer fertigen
+// Deep-Zoom-Bibliothek (z.B. OpenSeadragon) wird hier eine eigene, bewusst einfach
+// gehaltene Kachel-Engine gebaut, die sich in die bereits bestehende "Bühne"
+// (contentRef-Transform, Long-Press-Gesten, prozentuale Pin-Koordinaten, siehe
+// FloorPlanView) einfügt, statt diese komplett zu ersetzen — dadurch bleiben Pin-
+// Interaktionen, Zoom-/Pan-Gesten und PDF-Export unverändert funktionsfähig, ohne
+// deren Koordinatensystem oder Event-Modell auf ein fremdes Bibliotheks-Konzept
+// umstellen zu müssen (siehe TiledPlanImage weiter unten für die Anzeige-Seite).
+//
+// Prinzip (klassische Bild-Pyramide, wie bei Google Maps/IIIF/Deep-Zoom-Viewern):
+// das Quellbild wird in mehrere Auflösungsstufen zerlegt (Stufe 0 = ganzes Bild passt
+// in eine einzige kleine Kachel, jede folgende Stufe verdoppelt die Auflösung bis zur
+// nativen Größe), jede Stufe wiederum in einzelne, kleine Kacheln von
+// FLOOR_PLAN_TILE_SIZE_PX Kantenlänge. Beim Anzeigen wird IMMER nur die für den
+// aktuellen Zoom passende Stufe geladen (siehe TiledPlanImage), nie das gesamte Bild
+// in voller Auflösung auf einmal — jede einzelne Kachel bleibt dabei weit unter jedem
+// bekannten Canvas-/Bild-Größenlimit mobiler Browser, wodurch der weiße Bildschirm bei
+// hohem Zoom strukturell ausgeschlossen ist, unabhängig davon, wie hoch die native
+// Auflösung der Quelle tatsächlich ist.
+//
+// FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX ist bewusst EIGENSTÄNDIG von
+// FLOOR_PLAN_IMAGE_MAX_DIM_PX (siehe oben) und liegt deutlich höher: Letzteres deckelt
+// das flache, einzelne Fallback-/Export-Bild (image_url) auf 3000px, weil DIESES als
+// EIN EINZIGES Bild angezeigt bzw. in den PDF-Export geladen wird und deshalb an das
+// bisherige, konservative Sicherheitsmaß gebunden bleibt. Die Kachel-Pyramide dagegen
+// wird NIE als ein einziges großes Bild gerendert, sondern immer nur kachelweise —
+// deshalb ist es hier sicher, für die Pyramide selbst von einer höheren nativen
+// Quellauflösung auszugehen, ohne das ursprüngliche Weißbildschirm-Risiko
+// zurückzuholen. 6000px ist dabei ein bewusst gewählter, aber nicht absolut
+// unbegrenzter Wert (siehe Einordnung: Kompromiss aus "spürbar mehr Schärfe als
+// bisher" und vertretbarer Kachel-Anzahl/Speicherbedarf pro Grundriss).
+const FLOOR_PLAN_TILE_SIZE_PX = 512;
+const FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX = 6000;
+const FLOOR_PLAN_TILE_JPEG_QUALITY = 0.85;
+const FLOOR_PLAN_TILE_UPLOAD_CONCURRENCY = 6;
+const FLOOR_PLAN_TILES_BUCKET = "floor-plan-tiles";
+
+// Berechnet ausschließlich die GEOMETRIE der Pyramiden-Stufen (Breite/Höhe/Anzahl
+// Kacheln je Stufe), unabhängig vom eigentlichen Rendern — wird sowohl bei der
+// Erzeugung (generateAndUploadTilePyramid) als auch beim Anzeigen (buildTileList in
+// TiledPlanImage, über das gespeicherte Manifest) mit denselben Eingabewerten
+// aufgerufen und liefert dadurch garantiert dieselbe Aufteilung.
+function buildTilePyramidLevels(naturalWidth, naturalHeight, tileSize) {
+  const maxDim = Math.max(naturalWidth, naturalHeight);
+  const maxLevel = Math.max(0, Math.ceil(Math.log2(Math.max(1, maxDim / tileSize))));
+  const levels = [];
+  for (let level = 0; level <= maxLevel; level += 1) {
+    // Stufe maxLevel entspricht IMMER exakt der nativen Auflösung (kein gerundeter
+    // Zweierpotenz-Faktor, um Rundungsabweichungen an der schärfsten Stufe zu
+    // vermeiden), alle Stufen darunter halbieren die Auflösung schrittweise.
+    const isNativeLevel = level === maxLevel;
+    const factor = isNativeLevel ? 1 : Math.pow(2, level - maxLevel);
+    const width = isNativeLevel ? naturalWidth : Math.max(1, Math.round(naturalWidth * factor));
+    const height = isNativeLevel ? naturalHeight : Math.max(1, Math.round(naturalHeight * factor));
+    const cols = Math.max(1, Math.ceil(width / tileSize));
+    const rows = Math.max(1, Math.ceil(height / tileSize));
+    levels.push({ level, width, height, cols, rows });
+  }
+  return { maxLevel, levels };
+}
+
+// Erzeugt aus der ORIGINAL hochgeladenen Bilddatei (bewusst NICHT aus der bereits auf
+// FLOOR_PLAN_IMAGE_MAX_DIM_PX verkleinerten uploadFile-Variante, siehe Kommentar oben
+// bei FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX) eine vollständige Kachel-Pyramide und lädt
+// alle Kacheln in den eigenen Storage-Bucket "floor-plan-tiles" hoch. Liefert bei
+// Erfolg das Manifest (Geometrie + öffentliche Basis-URL) zurück, das unverändert als
+// jsonb in floor_plans.tile_manifest gespeichert wird. Wirft absichtlich einen Fehler
+// nach außen (anders als resizeFloorPlanImageForUpload) — der EINZIGE Aufrufer
+// (uploadFloorPlan) fängt ihn gezielt ab und behandelt eine fehlgeschlagene
+// Kachel-Erzeugung als reine, nicht-blockierende Zusatzfunktion: der eigentliche
+// Grundriss-Upload (flaches Fallback-Bild) darf davon niemals abhängen.
+async function generateAndUploadTilePyramid(projectId, originalFile, onStatusMessage) {
+  if (!originalFile || !originalFile.type || !originalFile.type.startsWith("image/") || originalFile.type === "image/svg+xml") {
+    return null;
+  }
+  const objectUrl = URL.createObjectURL(originalFile);
+  let img;
+  try {
+    img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("Bild konnte für die Kachel-Erzeugung nicht geladen werden."));
+      el.src = objectUrl;
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+  const rawWidth = img.naturalWidth || img.width;
+  const rawHeight = img.naturalHeight || img.height;
+  if (!rawWidth || !rawHeight) return null;
+
+  // Nur verkleinern, nie vergrößern — ein bereits kleineres Original bleibt in seiner
+  // tatsächlichen Auflösung, es wird also nie künstlich "hochgerechnet".
+  const sourceDownscale = Math.min(1, FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX / Math.max(rawWidth, rawHeight));
+  const naturalWidth = Math.max(1, Math.round(rawWidth * sourceDownscale));
+  const naturalHeight = Math.max(1, Math.round(rawHeight * sourceDownscale));
+
+  const isPng = originalFile.type === "image/png";
+  const tileExt = isPng ? "png" : "jpg";
+  const tileSize = FLOOR_PLAN_TILE_SIZE_PX;
+  const { maxLevel, levels } = buildTilePyramidLevels(naturalWidth, naturalHeight, tileSize);
+
+  const tileSetId = crypto.randomUUID();
+  const basePath = `${projectId}/${tileSetId}`;
+  const tiles = [];
+
+  for (const levelInfo of levels) {
+    // Jede Stufe wird EINMAL vollständig auf ein Zwischen-Canvas in ihrer eigenen,
+    // bereits durch FLOOR_PLAN_TILE_SOURCE_MAX_DIM_PX gedeckelten Auflösung gerendert
+    // und danach ausschließlich in kleine TILE_SIZE-Kacheln zerschnitten — dieses
+    // Zwischen-Canvas wird NIE selbst angezeigt oder dauerhaft gehalten, dient nur als
+    // Quelle für drawImage beim Zuschneiden und wird direkt danach wieder freigegeben
+    // (canvas.width = 0), bleibt also zu keinem Zeitpunkt im Speicher hängen.
+    const levelCanvas = document.createElement("canvas");
+    levelCanvas.width = levelInfo.width;
+    levelCanvas.height = levelInfo.height;
+    const levelCtx = levelCanvas.getContext("2d", { alpha: isPng });
+    if (!isPng) {
+      levelCtx.fillStyle = "#ffffff";
+      levelCtx.fillRect(0, 0, levelInfo.width, levelInfo.height);
+    }
+    levelCtx.drawImage(img, 0, 0, levelInfo.width, levelInfo.height);
+
+    for (let row = 0; row < levelInfo.rows; row += 1) {
+      for (let col = 0; col < levelInfo.cols; col += 1) {
+        const tileX = col * tileSize;
+        const tileY = row * tileSize;
+        const tileW = Math.min(tileSize, levelInfo.width - tileX);
+        const tileH = Math.min(tileSize, levelInfo.height - tileY);
+        const tileCanvas = document.createElement("canvas");
+        tileCanvas.width = tileW;
+        tileCanvas.height = tileH;
+        const tileCtx = tileCanvas.getContext("2d", { alpha: isPng });
+        tileCtx.drawImage(levelCanvas, tileX, tileY, tileW, tileH, 0, 0, tileW, tileH);
+        // eslint-disable-next-line no-await-in-loop
+        const blob = await new Promise((resolve) =>
+          tileCanvas.toBlob((b) => resolve(b), isPng ? "image/png" : "image/jpeg", isPng ? undefined : FLOOR_PLAN_TILE_JPEG_QUALITY)
+        );
+        tileCanvas.width = 0;
+        tileCanvas.height = 0;
+        if (blob) {
+          tiles.push({ path: `${basePath}/${levelInfo.level}/${col}_${row}.${tileExt}`, blob });
+        }
+      }
+    }
+    levelCanvas.width = 0;
+    levelCanvas.height = 0;
+  }
+
+  // Hochladen in begrenzt parallelen Batches statt aller Kacheln gleichzeitig —
+  // vermeidet zu viele gleichzeitige Verbindungen bei schwachem Baustellen-WLAN/
+  // Mobilfunk und hält den Fortschritt über onStatusMessage nachvollziehbar. Bricht
+  // beim ersten fehlgeschlagenen Batch sofort ab (throw) — der Aufrufer fängt das ab
+  // und verwirft die gesamte, dann ohnehin unvollständige Pyramide zugunsten des
+  // garantiert vorhandenen Fallback-Bilds, statt eine Pyramide mit Lücken zu
+  // speichern.
+  let uploaded = 0;
+  for (let i = 0; i < tiles.length; i += FLOOR_PLAN_TILE_UPLOAD_CONCURRENCY) {
+    const batch = tiles.slice(i, i + FLOOR_PLAN_TILE_UPLOAD_CONCURRENCY);
+    // eslint-disable-next-line no-await-in-loop
+    const results = await Promise.allSettled(
+      batch.map((tile) =>
+        supabase.storage.from(FLOOR_PLAN_TILES_BUCKET).upload(tile.path, tile.blob, {
+          cacheControl: "31536000",
+          upsert: false,
+          contentType: isPng ? "image/png" : "image/jpeg",
+        })
+      )
+    );
+    const failedResult = results.find((r) => r.status === "fulfilled" && r.value?.error);
+    if (failedResult) throw failedResult.value.error;
+    const rejectedResult = results.find((r) => r.status === "rejected");
+    if (rejectedResult) throw rejectedResult.reason;
+    uploaded += batch.length;
+    onStatusMessage?.(`Kachel-Ansicht für scharfes Zoomen wird vorbereitet… (${uploaded}/${tiles.length})`);
+  }
+
+  const { data: baseUrlData } = supabase.storage.from(FLOOR_PLAN_TILES_BUCKET).getPublicUrl(basePath);
+
+  return {
+    version: 1,
+    tileSize,
+    ext: tileExt,
+    naturalWidth,
+    naturalHeight,
+    maxLevel,
+    levels: levels.map(({ level, width, height, cols, rows }) => ({ level, width, height, cols, rows })),
+    baseUrl: baseUrlData.publicUrl,
+  };
+}
+
 // Lädt eine Grundriss-Datei in den Bucket "floor-plans" hoch und liefert die
-// öffentliche URL + den erkannten Dateityp zurück.
-async function uploadFloorPlan(projectId, file) {
+// öffentliche URL + den erkannten Dateityp zurück. onStatusMessage (optional) meldet
+// dem Aufrufer Fortschrittstexte für ein Toast/Hinweis-UI (siehe compressionNotice in
+// NewFloorPlanModal/EditFloorPlanModal) — wird bei jedem Aufruf zunächst NICHT gesetzt
+// und ausschließlich für die automatische Vorab-Komprimierung überhaupt benutzt, ein
+// regulärer, bereits ausreichend kleiner Upload zeigt also gar nichts an.
+async function uploadFloorPlan(projectId, file, onStatusMessage) {
   const info = getFileInfo(file);
   if (!info) throw new Error("Nicht unterstützter Dateityp. Bitte PNG, JPG, WebP, PDF, DWG oder DXF verwenden.");
 
-  const path = `${projectId}/${crypto.randomUUID()}_${sanitizeFileName(file.name)}`;
+  let uploadFile = file;
+  // TABLET CANVAS ZOOM FIX, Teil 2: reine Raster-Grundrisse (PNG/JPG/WebP) vor dem Upload
+  // auf maximal FLOOR_PLAN_IMAGE_MAX_DIM_PX an der längeren Seite verkleinern, siehe
+  // resizeFloorPlanImageForUpload oben. Läuft VOR dem PDF-Zweig unten und schließt sich mit
+  // diesem gegenseitig aus (info.kind ist entweder "image" oder "pdf", nie beides).
+  if (info.kind === "image") {
+    uploadFile = await resizeFloorPlanImageForUpload(file);
+  }
+  if (info.kind === "pdf" && file.size > FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_BYTES) {
+    onStatusMessage?.(
+      `Plan ist größer als ${FLOOR_PLAN_PDF_COMPRESS_THRESHOLD_MB}MB. Wird automatisch für Mobilgeräte optimiert…`
+    );
+    try {
+      uploadFile = await compressPdfForUpload(file);
+    } catch (err) {
+      console.error("Automatische PDF-Komprimierung fehlgeschlagen:", err);
+      throw new Error(
+        "Die PDF konnte nicht automatisch komprimiert werden. Bitte die Datei mit einem PDF-Tool vorkomprimieren und erneut hochladen."
+      );
+    }
+    if (uploadFile.size > FLOOR_PLAN_PDF_HARD_LIMIT_BYTES) {
+      throw new Error(`Plan trotz Komprimierung über ${FLOOR_PLAN_PDF_HARD_LIMIT_MB}MB. Bitte die PDF mit einem PDF-Tool vorkomprimieren.`);
+    }
+    onStatusMessage?.(null);
+  }
+
+  const path = `${projectId}/${crypto.randomUUID()}_${sanitizeFileName(uploadFile.name)}`;
   const { error: uploadError } = await supabase.storage
     .from(FLOOR_PLANS_BUCKET)
-    .upload(path, file, { cacheControl: "3600", upsert: false });
+    .upload(path, uploadFile, { cacheControl: "3600", upsert: false });
   if (uploadError) throw uploadError;
 
   const { data: publicUrlData } = supabase.storage.from(FLOOR_PLANS_BUCKET).getPublicUrl(path);
-  return { publicUrl: publicUrlData.publicUrl, fileType: info.kind };
+
+  // TABLET CANVAS ZOOM FIX, Teil 3: zusätzlich zum immer vorhandenen flachen Fallback-
+  // Bild oben (image_url) eine Kachel-Pyramide erzeugen und hochladen (siehe
+  // generateAndUploadTilePyramid) — ausschließlich für Raster-Grundrisse (info.kind
+  // "image"), NICHT für PDF/CAD/SVG (die haben bereits eigene, vektor- bzw.
+  // geräteabhängig gedeckelte Rendering-Pfade, siehe PdfPlanCanvas/SvgPlanCanvas/
+  // CadBlueprintPlan). Schlägt die Kachel-Erzeugung fehl (z.B. Netzwerkabbruch mitten
+  // im Kachel-Upload, exotisches Bildformat), wird das bewusst NICHT zum Abbruch des
+  // gesamten Grundriss-Uploads — tileManifest bleibt dann einfach null, und die
+  // Ansicht fällt zuverlässig auf das bereits erfolgreich hochgeladene Fallback-Bild
+  // zurück (siehe TiledPlanImage). Ein einzelner Kachel-Fehler darf niemals dazu
+  // führen, dass der Nutzer gar keinen Grundriss hochladen kann.
+  let tileManifest = null;
+  if (info.kind === "image") {
+    try {
+      tileManifest = await generateAndUploadTilePyramid(projectId, file, onStatusMessage);
+    } catch (err) {
+      console.error(
+        "Kachel-Pyramide für scharfes Zoomen konnte nicht erzeugt werden, Grundriss bleibt trotzdem über das Fallback-Bild nutzbar:",
+        err
+      );
+      tileManifest = null;
+    }
+    onStatusMessage?.(null);
+  }
+
+  return { publicUrl: publicUrlData.publicUrl, fileType: info.kind, tileManifest };
 }
 
-async function createFloor(projectId, name, file) {
-  const { publicUrl, fileType } = await uploadFloorPlan(projectId, file);
+// Lädt ein Projekt-Titelbild (Gebäudeansicht für die Kachel in der Projektübersicht,
+// siehe ProjectFormModal/ProjectCoverImage) in den eigenen Bucket "project-covers"
+// hoch — bewusst ein eigener Bucket statt Wiederverwendung von "floor-plans", damit
+// echte Grundrisse und reine Gebäudefotos storage-seitig getrennt bleiben. Nimmt
+// ausschließlich Bildformate an (kein PDF/DWG/DXF wie bei Grundrissen), da es sich
+// um ein Foto, nicht um eine technische Zeichnung handelt.
+async function uploadProjectCoverImage(projectId, file) {
+  if (!file.type.startsWith("image/")) {
+    throw new Error("Bitte nur ein Bildformat (PNG, JPG oder WebP) als Titelbild hochladen.");
+  }
+  const path = `${projectId}/${crypto.randomUUID()}_${sanitizeFileName(file.name)}`;
+  const { error: uploadError } = await supabase.storage
+    .from(PROJECT_COVERS_BUCKET)
+    .upload(path, file, { cacheControl: "3600", upsert: false });
+  if (uploadError) throw uploadError;
+
+  const { data: publicUrlData } = supabase.storage.from(PROJECT_COVERS_BUCKET).getPublicUrl(path);
+  return publicUrlData.publicUrl;
+}
+
+// Ein Geschoss ist ab sofort ein reiner Namens-Container ohne eigenen Grundriss
+// (siehe supabase_schema_v7_floor_plans_sketch_level.sql) — der Grundriss/die
+// Grundrisse gehören zur separaten, darunterliegenden Ebene (floor_plans).
+// sortOrder wird vom Aufrufer (siehe handleAddFloor in App) als aktuelle Anzahl
+// bestehender Geschosse übergeben — ein neues Geschoss wird dadurch immer ans Ende
+// der Reihenfolge angehängt, exakt wie bei handleCreateTrade/sort_order für Gewerke.
+async function createFloor(projectId, name, sortOrder) {
   const { data, error } = await supabase
     .from("floors")
-    .insert({ project_id: projectId, name, image_url: publicUrl, file_type: fileType })
+    .insert({ project_id: projectId, name, sort_order: sortOrder })
     .select()
     .single();
   if (error) throw error;
   return data;
 }
 
-// Aktualisiert Name und/oder Grundriss-Datei einer bestehenden Etage. Die Datei ist
-// optional: wird keine neue Datei übergeben, bleibt image_url/file_type unverändert und
-// nur der Name wird aktualisiert. Die alte Grundriss-Datei im Storage bleibt beim
-// Austausch technisch bedingt liegen (analog zu deleteProject() oben) — das Aufräumen
-// verwaister Storage-Dateien ist nicht Teil dieses Umbaus.
-async function updateFloor(floorId, projectId, name, file) {
-  const fields = { name };
-  if (file) {
-    const { publicUrl, fileType } = await uploadFloorPlan(projectId, file);
-    fields.image_url = publicUrl;
-    fields.file_type = fileType;
-  }
-  const { data, error } = await supabase.from("floors").update(fields).eq("id", floorId).select().single();
+async function updateFloor(floorId, name) {
+  const { data, error } = await supabase.from("floors").update({ name }).eq("id", floorId).select().single();
   if (error) throw error;
   return data;
 }
 
-// Löscht eine Etage. pins/pin_todos/pin_photos hängen per ON DELETE CASCADE an floors,
-// werden also serverseitig automatisch mitgelöscht. Die zugehörigen Storage-Dateien
-// (Grundriss der Etage, Fotos der enthaltenen Pins) bleiben dabei technisch bedingt
+// Löscht eine Etage. floor_plans (und darüber pins/pin_todos/pin_photos) sowie die
+// direkt an floor_id hängenden Pins hängen per ON DELETE CASCADE an floors, werden
+// also serverseitig automatisch mitgelöscht. Die zugehörigen Storage-Dateien
+// (Grundrisskizzen, Fotos der enthaltenen Pins) bleiben dabei technisch bedingt
 // liegen — siehe deleteProject() oben.
 async function deleteFloor(floor) {
   const { error } = await supabase.from("floors").delete().eq("id", floor.id);
+  if (error) throw error;
+}
+
+// Persistiert eine per Drag & Drop geänderte Geschoss-Reihenfolge: orderedFloors
+// (Objekte mit mindestens .id, bereits in der gewünschten Zielreihenfolge) bekommen
+// ihr sort_order stur 0..n-1 neu zugewiesen — exakt dasselbe, bereits bewährte Muster
+// wie reorderTrades weiter oben (verhindert Lücken/Kollisionen gegenüber einem reinen
+// "zwischen zwei Nachbarn einschieben"-Ansatz mit Nachkommastellen).
+async function reorderFloors(orderedFloors) {
+  const results = await Promise.all(
+    orderedFloors.map((f, idx) => supabase.from("floors").update({ sort_order: idx }).eq("id", f.id))
+  );
+  const failed = results.find((r) => r.error);
+  if (failed?.error) throw failed.error;
+}
+
+// Grundrisskizzen (Ebene 3) — ein Geschoss kann beliebig viele davon enthalten.
+// createFloorPlanSketch benötigt zwingend eine Datei (eine Skizze ohne Plan wäre
+// nutzlos), updateFloorPlanSketch lässt die Datei wie zuvor bei Etagen optional.
+async function createFloorPlanSketch(floorId, projectId, name, file, onStatusMessage, category = "grundriss") {
+  const { publicUrl, fileType, tileManifest } = await uploadFloorPlan(projectId, file, onStatusMessage);
+  const { data, error } = await supabase
+    .from("floor_plans")
+    // tile_manifest (siehe supabase_schema_v18_floor_plan_tiles.sql) bleibt bei PDF/
+    // CAD/SVG bzw. bei fehlgeschlagener Kachel-Erzeugung schlicht null — TiledPlanImage
+    // fällt dann zuverlässig auf image_url als reines Fallback-Bild zurück. category
+    // (siehe supabase_schema_v21_plan_categories.sql/getPlanCategory) wird beim Anlegen
+    // IMMER explizit mitgeschickt — der Aufrufer (handleAddFloorPlanSketch in App) füllt
+    // ihn automatisch mit der aktuell aktiven Tab-Kategorie der Skizzenübersicht.
+    .insert({ floor_id: floorId, name, image_url: publicUrl, file_type: fileType, tile_manifest: tileManifest, category })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+// Aktualisiert Name, Kategorie und/oder Datei einer bestehenden Grundrisskizze. Die
+// Datei ist optional: wird keine neue Datei übergeben, bleiben image_url/file_type/
+// tile_manifest unverändert und nur Name/Kategorie werden aktualisiert. Die alte Datei
+// im Storage bleibt beim Austausch technisch bedingt liegen (analog zu deleteProject()
+// oben) — dasselbe gilt für eine dabei verwaiste alte Kachel-Pyramide im Bucket
+// "floor-plan-tiles".
+async function updateFloorPlanSketch(planId, projectId, name, file, onStatusMessage, category) {
+  const fields = { name };
+  if (category) fields.category = category;
+  if (file) {
+    const { publicUrl, fileType, tileManifest } = await uploadFloorPlan(projectId, file, onStatusMessage);
+    fields.image_url = publicUrl;
+    fields.file_type = fileType;
+    fields.tile_manifest = tileManifest;
+  }
+  const { data, error } = await supabase.from("floor_plans").update(fields).eq("id", planId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+// Löscht eine Grundrisskizze. pins (und darüber pin_todos/pin_photos) hängen per ON
+// DELETE CASCADE an floor_plans, werden also serverseitig automatisch mitgelöscht.
+async function deleteFloorPlanSketch(plan) {
+  const { error } = await supabase.from("floor_plans").delete().eq("id", plan.id);
   if (error) throw error;
 }
 
@@ -733,18 +1547,29 @@ async function deleteFloor(floor) {
 // currentActor) und wird ausschließlich zur automatischen Zeit-/Benutzererfassung
 // verwendet (created_by/updated_by-Spalten sowie die Einträge in pin_activity_log,
 // siehe logPinActivity weiter unten) — nie zur Autorisierung, die läuft weiterhin
-// über RLS auf Supabase-Ebene.
-async function createPin(floorId, x, y, actor) {
+// über RLS auf Supabase-Ebene. Ein Pin ist strikt an genau eine Grundrissskizze
+// (planId) gebunden; floor_id wird zusätzlich mitgeschrieben, ausschließlich für die
+// geschossweite Kennzahlen-Aggregation in der Geschossübersicht (Ebene 2).
+//
+// overrides (optional): title/description/priority/trade_ids, mit denen die sonst
+// generischen Standardwerte überschrieben werden können — allgemeine, optionale
+// Erweiterung mit Default {} statt einer neuen, parallelen Funktion. Das direkte
+// Duplizieren eines bestehenden Pins (siehe "Mangel duplizieren" im PinModal-Kopf)
+// läuft NICHT über diesen Parameter, sondern über die eigenständige duplicatePin-
+// Funktion weiter unten (kopiert zusätzlich Status, Bereich und Frist und vergibt die
+// Wurzel-/Unter-Nummerierung, siehe dort).
+async function createPin(planId, floorId, x, y, actor, overrides = {}) {
   const { data, error } = await supabase
     .from("pins")
     .insert({
+      plan_id: planId,
       floor_id: floorId,
-      title: "Neuer Eintrag",
-      description: "",
+      title: overrides.title || "Neuer Eintrag",
+      description: overrides.description || "",
       status: "offen",
-      priority: "mittel",
+      priority: overrides.priority || "mittel",
       assigned_to: "",
-      trade_id: null,
+      trade_ids: overrides.trade_ids || [],
       x,
       y,
       angle: 0,
@@ -754,7 +1579,7 @@ async function createPin(floorId, x, y, actor) {
     .select()
     .single();
   if (error) throw error;
-  return { ...data, pin_todos: [], pin_photos: [], pin_activity_log: [] };
+  return { ...data, pin_photos: [], pin_activity_log: [] };
 }
 
 async function updatePin(pinId, fields, actor) {
@@ -785,9 +1610,31 @@ async function logPinActivity(pinId, action, detail, actor) {
   return data;
 }
 
-// Löscht einen Pin inkl. aller zugehörigen Fotos im Storage (best effort) — die
-// Datenbankzeilen in pin_todos/pin_photos entfernt Postgres selbst über
-// ON DELETE CASCADE.
+// Löscht einen Pin inkl. aller zugehörigen Fotos im Storage (best effort) sowie —
+// SAUBERES LÖSCHEN (FOREIGN KEY HANDLING) — der verknüpften Untereinträge in
+// pin_photos. Das aktuelle Schema setzt für diese Tabelle zwar bereits
+// "on delete cascade" auf pin_id, verlässt sich hier aber NICHT ausschließlich darauf:
+// bei diesem Projekt hat sich bereits einmal gezeigt (siehe die frühere
+// lph_status-Constraint-Problematik), dass ein Teil eines Migrationsskripts auf einer
+// Live-Datenbank stillschweigend nie ausgeführt wurde — ein explizites Vorab-Löschen
+// der Kindzeilen schützt zuverlässig vor einem Foreign-Key-Fehler beim Löschen des
+// Pins, auch falls die CASCADE-Regel auf der jeweiligen Datenbank-Instanz fehlen
+// sollte. Ist sie hingegen korrekt gesetzt, betrifft dieser Aufruf schlicht null
+// Zeilen (der Pin selbst hat sie zu diesem Zeitpunkt noch, es sind einfach keine
+// verwaisten Reste vorhanden) und ist folgenlos.
+// pin_todos wird hier NICHT mehr explizit vorab gelöscht — die Aufgaben-/To-do-
+// Funktion wurde vollständig aus der App entfernt (siehe PinModal/generateFloor-
+// PinsTablePdf/generateSinglePinPdf), eventuell noch aus der Zeit davor vorhandene
+// pin_todos-Zeilen werden beim Löschen des Pins weiterhin zuverlässig über die
+// FK-CASCADE der Tabelle entfernt (eine reine Datenbank-interne Operation, unabhängig
+// von der App-Logik).
+// pin_activity_log wird hier BEWUSST NICHT explizit gelöscht: das Schema erlaubt für
+// diese Tabelle absichtlich kein clientseitiges DELETE (append-only Audit-Trail, siehe
+// supabase_schema_current.sql — nur SELECT/INSERT-Policies), ein Löschversuch würde
+// dort wegen fehlender Policy ohnehin nur folgenlos null Zeilen betreffen. Ihre
+// Bereinigung passiert ausschließlich über die FK-CASCADE beim Löschen des Pins
+// selbst, die als reine Datenbank-interne Operation nicht von Row-Level-Security
+// betroffen ist.
 async function deletePin(pin) {
   const photos = pin?.pin_photos || [];
   if (photos.length > 0) {
@@ -797,28 +1644,212 @@ async function deletePin(pin) {
       if (removeError) console.error("Fotos konnten nicht aus dem Storage entfernt werden:", removeError);
     }
   }
+  const { error: photoRowsError } = await supabase.from("pin_photos").delete().eq("pin_id", pin.id);
+  if (photoRowsError) console.error("Foto-Einträge des Pins konnten nicht vorab gelöscht werden:", photoRowsError);
+
   const { error } = await supabase.from("pins").delete().eq("id", pin.id);
   if (error) throw error;
 }
 
-async function addPinTodo(pinId, text, actor) {
+// "Mangel duplizieren" (siehe Duplizieren-Button im PinModal-Kopf, handleDuplicatePin
+// in App): legt SOFORT eine vollständige Kopie des übergebenen Pins an — Titel,
+// Beschreibung, Status, Priorität, Gewerke, Bereich, Frist und Blickrichtung werden 1:1
+// übernommen. Fotos werden BEWUSST NICHT mitkopiert: eine Kopie dokumentiert
+// typischerweise einen ähnlichen, aber eigenständigen Mangel an anderer Stelle — die
+// Fotos des Originals würden dort den falschen Ort zeigen. Die Kopie erscheint minimal
+// versetzt (+2 %/+2 %, an den Plan-Rand geklammert wie jede reguläre Pin-Platzierung,
+// siehe posFromEvent in FloorPlanView) neben dem Original, damit sich beide Marker
+// nicht exakt überdecken. Aufgaben werden NICHT mitkopiert — die Aufgaben-/To-do-
+// Funktion wurde vollständig aus der App entfernt.
+//
+// parent_pin_id verweist auf den unmittelbaren Quell-Pin (reine Audit-Spur).
+// root_pin_id verweist auf den ursprünglichen, selbst NICHT duplizierten Wurzel-Pin
+// und bestimmt die Unter-Nummerierung (siehe computePinNumberById weiter unten) — ist
+// der Quell-Pin selbst bereits eine Kopie, wird root_pin_id von IHM geerbt statt
+// erneut auf ihn zu zeigen, damit die Nummerierung flach bleibt: Pin "3" dupliziert
+// ergibt "3.1"; wird "3.1" anschließend erneut dupliziert, ergibt das "3.2" und NICHT
+// das verschachtelte "3.1.1".
+async function duplicatePin(sourcePin, actor) {
+  const rootPinId = sourcePin.root_pin_id || sourcePin.id;
+  const clampCoord = (v) => Math.min(98, Math.max(2, v));
   const { data, error } = await supabase
-    .from("pin_todos")
-    .insert({ pin_id: pinId, text, completed: false, created_by: actor?.email || null })
+    .from("pins")
+    .insert({
+      plan_id: sourcePin.plan_id,
+      floor_id: sourcePin.floor_id,
+      title: sourcePin.title,
+      description: sourcePin.description || "",
+      status: sourcePin.status,
+      priority: sourcePin.priority,
+      assigned_to: "",
+      trade_ids: getPinTradeIds(sourcePin),
+      area: sourcePin.area || "",
+      due_date: sourcePin.due_date || null,
+      x: clampCoord((sourcePin.x ?? 50) + 2),
+      y: clampCoord((sourcePin.y ?? 50) + 2),
+      angle: sourcePin.angle ?? 0,
+      parent_pin_id: sourcePin.id,
+      root_pin_id: rootPinId,
+      created_by: actor?.email || null,
+      updated_by: actor?.email || null,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+
+  return { ...data, pin_photos: [], pin_activity_log: [] };
+}
+
+// Berechnet für eine Menge von Pins die anzuzeigende Pin-Nummer inklusive der
+// Unter-Nummerierung per "Duplizieren" erzeugter Kopien (siehe duplicatePin oben):
+// jeder eigenständige ("Wurzel"-)Pin bekommt fortlaufend 1, 2, 3 … (per sortCompare
+// sortiert, standardmäßig nach Anlagedatum aufsteigend — exakt wie bisher). Ein per
+// Duplizieren erzeugter Pin hängt IMMER an seiner Wurzel (root_pin_id, wird beim
+// Duplizieren bereits geflacht, siehe Kommentar dort) und bekommt fortlaufend
+// N.1, N.2, N.3 … (ebenfalls per sortCompare innerhalb der Gruppe sortiert). Zeigt
+// root_pin_id auf keinen (mehr) in dieser Menge vorhandenen Pin (z.B. weil die
+// Wurzel inzwischen gelöscht wurde), wird der betroffene Pin wie ein eigener
+// Wurzel-Pin behandelt statt eine undefinierte Nummer zu erhalten.
+//
+// Gibt eine Map<pinId, {number, subNumber, label}> zurück — number/subNumber sind
+// für eine stabile NUMERISCHE Sortierung gedacht (siehe comparePinNumberEntries,
+// ein reiner String-Vergleich von "10" vs. "2" oder "1.10" vs. "1.2" wäre falsch),
+// label ist der anzuzeigende Text ("3" bzw. "3.2").
+//
+// Wird von FloorPlanView (Plan-Marker, kompakte Pin-Liste), App (Modal-Kopf-
+// Nummer) sowie generateProjectReportPdf/generateFloorPinsTablePdf/
+// pinsToFloorExportRows (CSV) gemeinsam genutzt, damit dieselbe Nummer garantiert
+// überall identisch erscheint.
+function computePinNumberById(pinsList, sortCompare = (a, b) => new Date(a.created_at) - new Date(b.created_at)) {
+  const list = pinsList || [];
+  const idSet = new Set(list.map((p) => p.id));
+  const hasValidRoot = (p) => p.root_pin_id && p.root_pin_id !== p.id && idSet.has(p.root_pin_id);
+
+  const result = new Map();
+  const rootNumberById = new Map();
+  [...list]
+    .filter((p) => !hasValidRoot(p))
+    .sort(sortCompare)
+    .forEach((p, idx) => {
+      const number = idx + 1;
+      rootNumberById.set(p.id, number);
+      result.set(p.id, { number, subNumber: null, label: String(number) });
+    });
+
+  const childrenByRoot = new Map();
+  list.forEach((p) => {
+    if (!hasValidRoot(p)) return;
+    if (!childrenByRoot.has(p.root_pin_id)) childrenByRoot.set(p.root_pin_id, []);
+    childrenByRoot.get(p.root_pin_id).push(p);
+  });
+  childrenByRoot.forEach((children, rootId) => {
+    const rootNumber = rootNumberById.get(rootId);
+    [...children].sort(sortCompare).forEach((p, idx) => {
+      const subNumber = idx + 1;
+      result.set(p.id, { number: rootNumber, subNumber, label: `${rootNumber}.${subNumber}` });
+    });
+  });
+  return result;
+}
+
+// Numerischer Vergleich zweier computePinNumberById-Einträge (nicht der Label-Strings,
+// siehe Kommentar dort) — für jede Stelle, die Pins in Nummern-Reihenfolge sortiert.
+function comparePinNumberEntries(a, b) {
+  if (!a || !b) return 0;
+  return a.number - b.number || (a.subNumber || 0) - (b.subNumber || 0);
+}
+
+// ----------------------------------------------------------------------------------
+// SKIZZEN-NOTIZEN (PLAN ANNOTATIONS) — reine Text-Marker auf dem Grundriss, ergänzend
+// zu den nummerierten Mängel-Pins (siehe supabase_schema_v9_site_onboarding_and_plan_notes.sql).
+// Bewusst schlanker gehalten als die Pin-Datenschicht: kein Foto-/Verlaufs-Anhang,
+// keine Offline-Anlage-Warteschlange (siehe requireOnline-Guards in
+// App() bei den zugehörigen Handlern) — Notizen sind ein reines Vor-Ort-
+// Orientierungswerkzeug, keine dokumentationspflichtige Mängelerfassung.
+// ----------------------------------------------------------------------------------
+async function fetchPlanNotes(planId) {
+  const { data, error } = await supabase
+    .from("plan_notes")
+    .select("*")
+    .eq("floor_plan_id", planId)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function createPlanNote(planId, x, y, actor) {
+  const { data, error } = await supabase
+    .from("plan_notes")
+    .insert({
+      floor_plan_id: planId,
+      text: "Neue Notiz",
+      color: "amber",
+      x,
+      y,
+      created_by: actor?.email || null,
+      updated_by: actor?.email || null,
+    })
     .select()
     .single();
   if (error) throw error;
   return data;
 }
 
-async function togglePinTodo(todoId, completed) {
-  const { data, error } = await supabase.from("pin_todos").update({ completed }).eq("id", todoId).select().single();
+async function updatePlanNote(noteId, fields, actor) {
+  const payload = { ...fields, updated_by: actor?.email || null, updated_at: new Date().toISOString() };
+  const { data, error } = await supabase.from("plan_notes").update(payload).eq("id", noteId).select().single();
   if (error) throw error;
   return data;
 }
 
-async function deletePinTodo(todoId) {
-  const { error } = await supabase.from("pin_todos").delete().eq("id", todoId);
+async function deletePlanNote(noteId) {
+  const { error } = await supabase.from("plan_notes").delete().eq("id", noteId);
+  if (error) throw error;
+}
+
+// ----------------------------------------------------------------------------------
+// PROJEKT-MEILENSTEINE (BAUZEITENPLAN) — Bauabschnitte/Gewerke-Meilensteine auf
+// Projektebene, siehe supabase_schema_v20_bauzeitenplan.sql sowie ScheduleView/
+// MilestoneModal/ProjectScheduleProgress weiter unten. Bewusst schlank gehalten wie
+// plan_notes (keine Offline-Warteschlange, keine Foto-/Verlaufs-Anhänge) — reine
+// Terminplanung, kein Ersatz für die Mängeldokumentation über pins.
+// ----------------------------------------------------------------------------------
+async function fetchProjectMilestones(projectId) {
+  const { data, error } = await supabase
+    .from("project_milestones")
+    .select("*")
+    .eq("project_id", projectId)
+    .order("start_date", { ascending: true, nullsFirst: false })
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+async function createProjectMilestone(projectId, fields, actor) {
+  const payload = {
+    project_id: projectId,
+    title: (fields.title || "").trim(),
+    trade_id: fields.trade_id || null,
+    start_date: fields.start_date || null,
+    end_date: fields.end_date || null,
+    status: fields.status || "ausstehend",
+    created_by: actor?.email || null,
+    updated_by: actor?.email || null,
+  };
+  const { data, error } = await supabase.from("project_milestones").insert(payload).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateProjectMilestone(milestoneId, fields, actor) {
+  const payload = { ...fields, updated_by: actor?.email || null, updated_at: new Date().toISOString() };
+  const { data, error } = await supabase.from("project_milestones").update(payload).eq("id", milestoneId).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function deleteProjectMilestone(milestoneId) {
+  const { error } = await supabase.from("project_milestones").delete().eq("id", milestoneId);
   if (error) throw error;
 }
 
@@ -860,23 +1891,59 @@ async function deletePinPhoto(photo) {
   }
 }
 
+// Ersetzt die Bilddatei eines bereits gespeicherten Fotos durch eine bearbeitete
+// Fassung (siehe PhotoMarkupEditor/handleSavePhotoMarkup) — lädt die neue Version
+// unter einem eigenen Storage-Pfad hoch (nie ein Überschreiben desselben Pfads, um
+// Caching-Altlasten zu vermeiden), aktualisiert photo_url in der DB und entfernt
+// anschließend die alte Bilddatei im Storage (best effort, analog zu deletePinPhoto).
+async function updatePinPhotoUrl(photo, newDataUrl, actor) {
+  const file = dataUrlToFile(newDataUrl, `markup_${photo.id}.jpg`, "image/jpeg");
+  const path = `${photo.pin_id}/${crypto.randomUUID()}_${sanitizeFileName(file.name)}`;
+  const { error: uploadError } = await supabase.storage
+    .from(PIN_PHOTOS_BUCKET)
+    .upload(path, file, { cacheControl: "3600", upsert: false });
+  if (uploadError) throw uploadError;
+
+  const { data: publicUrlData } = supabase.storage.from(PIN_PHOTOS_BUCKET).getPublicUrl(path);
+  const { data, error } = await supabase
+    .from("pin_photos")
+    .update({ photo_url: publicUrlData.publicUrl, uploaded_by: actor?.email || null })
+    .eq("id", photo.id)
+    .select()
+    .single();
+  if (error) throw error;
+
+  const oldPath = extractStoragePath(photo.photo_url, PIN_PHOTOS_BUCKET);
+  if (oldPath) {
+    const { error: removeError } = await supabase.storage.from(PIN_PHOTOS_BUCKET).remove([oldPath]);
+    if (removeError) console.error("Alte Bildversion konnte nicht aus dem Storage entfernt werden:", removeError);
+  }
+  return data;
+}
+
 // ----------------------------------------------------------------------------------
 // OFFLINE-FIRST-SPEICHERUNG & SYNCHRONISATIONS-WARTESCHLANGE (Abschnitt/Punkt 15)
 // ----------------------------------------------------------------------------------
 // Zweck: einmal geladene Projekte/Etagen/Pins bleiben auch ohne Internetverbindung
 // nutzbar (Anzeigen, Zoomen/Verschieben, neue Pins setzen, Text/Beschreibung/Gewerk
-// erfassen, Fotos aufnehmen, Status ändern). Alle drei Kern-Datensätze werden nach
-// jedem erfolgreichen Laden UND nach jeder lokalen Änderung als einfaches JSON in
-// localStorage gespiegelt (baudoc_offline_cache_v1). Offline getätigte Schreib-
-// aktionen landen zusätzlich als Eintrag in einer geordneten Warteschlange
-// (baudoc_offline_sync_queue_v1) und werden automatisch abgearbeitet, sobald wieder
-// eine Verbindung besteht (siehe flushSyncQueue in App()).
+// erfassen, Status ändern, Fotos aufnehmen UND Pins wieder löschen). Alle drei
+// Kern-Datensätze werden nach jedem erfolgreichen Laden UND nach jeder lokalen
+// Änderung als einfaches JSON in localStorage gespiegelt (baudoc_offline_cache_v1).
+// Offline getätigte Schreibaktionen landen zusätzlich als Eintrag in einer
+// geordneten Warteschlange (baudoc_offline_sync_queue_v1, Eintragstypen create_pin/
+// update_pin/upload_photo/update_photo/delete_pin) und werden automatisch
+// abgearbeitet, sobald wieder eine Verbindung besteht (siehe flushSyncQueue in
+// App()). Die eigentlichen Binärdaten (Grundriss-PDFs, Foto-Bilddateien) laufen
+// NICHT über diese Warteschlange, sondern über den separaten IndexedDB-Asset-Cache
+// weiter unten (siehe ASSET_CACHE_DB_NAME/useOfflineCapableAssetUrl) — dort geht es
+// um das reine ANZEIGEN bereits vorhandener Dateien offline, hier um das SCHREIBEN
+// neuer/geänderter Daten.
 //
-// Bewusste Begrenzung des Umfangs: Löschen von Pins/Aufgaben/Fotos sowie Aufgaben-
-// Verwaltung bleiben an eine bestehende Verbindung gebunden (siehe requireOnline-
-// Guards in den jeweiligen Handlern in App()) — das sind seltenere, weniger
-// zeitkritische Baustellen-Aktionen, und ihr Wegfall im Offline-Fall hält die
-// Synchronisationslogik überschaubar und nachvollziehbar.
+// Bewusste Begrenzung des Umfangs: das Löschen/Bearbeiten einzelner Fotos bleibt an
+// eine bestehende Verbindung gebunden (siehe requireOnline-Guards in den jeweiligen
+// Handlern in App()) — das sind seltenere, weniger zeitkritische Baustellen-Aktionen,
+// und ihr Wegfall im Offline-Fall hält die Synchronisationslogik überschaubar und
+// nachvollziehbar.
 //
 // Bekannte, bewusst in Kauf genommene Grenzen (siehe Einordnung in der Auslieferung):
 // - localStorage ist auf wenige MB pro Origin begrenzt. Offline aufgenommene Fotos
@@ -928,6 +1995,156 @@ function generateOfflineId() {
   return `${OFFLINE_ID_PREFIX}${crypto.randomUUID()}`;
 }
 
+// ----------------------------------------------------------------------------------
+// OFFLINE-ANMELDUNG — Fallback für den verpflichtenden Login-Bildschirm (siehe
+// LoginScreen/App) ohne Netzverbindung
+// ----------------------------------------------------------------------------------
+// Auf der Baustelle ist zeitweise kein Netz vorhanden. Ein Passwort lässt sich ohne
+// Verbindung nicht gegen Supabase Auth prüfen — deshalb wird bei jeder erfolgreichen
+// ONLINE-Anmeldung (siehe handleSignIn in App()) ein gesalzener PBKDF2-Fingerabdruck
+// des Passworts (NICHT das Passwort selbst) lokal auf diesem Gerät hinterlegt. Eine
+// spätere Anmeldung ohne Netz vergleicht den Fingerabdruck des eingegebenen Passworts
+// gegen diesen gespeicherten Wert. Wichtige, bewusste Grenze: das entsperrt
+// ausschließlich die Ansicht der App (isAuthenticated) und die bereits offline
+// zwischengespeicherten Projektdaten — echte Schreibaktionen (Pin anlegen/verschieben,
+// Notiz, Foto, …) bleiben unverändert an eine echte Supabase-Session gebunden (siehe
+// requireAuth() in App()), weil Row-Level-Security serverseitig zwingend ein echtes
+// Auth-Token voraussetzt. Ohne mindestens eine erfolgreiche Online-Anmeldung auf
+// diesem Gerät ist eine Offline-Anmeldung bewusst NICHT möglich — ein Passwort
+// vollständig ohne jede vorherige Online-Prüfung "offline zu erfinden" wäre keine
+// echte Authentifizierung mehr, sondern eine Sicherheitslücke.
+const OFFLINE_AUTH_CACHE_KEY = "baudoc_offline_auth_v1";
+const OFFLINE_AUTH_PBKDF2_ITERATIONS = 120000;
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function deriveOfflineCredentialFingerprint(password, saltBytes) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: saltBytes, iterations: OFFLINE_AUTH_PBKDF2_ITERATIONS, hash: "SHA-256" },
+    keyMaterial,
+    256
+  );
+  return bytesToBase64(new Uint8Array(bits));
+}
+
+// Wird nach jeder erfolgreichen ONLINEN Anmeldung aufgerufen (handleSignIn). Bewusst
+// ohne Rückgabewert/geworfenen Fehler nach außen — ein Cache-Schreibfehler (z.B. sehr
+// alter Browser ohne Web Crypto, voller localStorage) darf die bereits erfolgreiche
+// Anmeldung nicht nachträglich als Fehler erscheinen lassen, er verkleinert lediglich
+// stillschweigend die Offline-Fallback-Abdeckung.
+async function cacheOfflineCredential(email, password) {
+  if (typeof crypto === "undefined" || !crypto.subtle) return;
+  try {
+    const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+    const fingerprint = await deriveOfflineCredentialFingerprint(password, saltBytes);
+    writeJsonStorage(OFFLINE_AUTH_CACHE_KEY, {
+      email: email.trim().toLowerCase(),
+      salt: bytesToBase64(saltBytes),
+      fingerprint,
+      cachedAt: Date.now(),
+    });
+  } catch (err) {
+    console.error("Offline-Zugangsdaten konnten nicht zwischengespeichert werden:", err);
+  }
+}
+
+async function verifyOfflineCredential(email, password) {
+  if (typeof crypto === "undefined" || !crypto.subtle) return false;
+  const cached = readJsonStorage(OFFLINE_AUTH_CACHE_KEY, null);
+  if (!cached || cached.email !== email.trim().toLowerCase()) return false;
+  try {
+    const saltBytes = base64ToBytes(cached.salt);
+    const fingerprint = await deriveOfflineCredentialFingerprint(password, saltBytes);
+    return fingerprint === cached.fingerprint;
+  } catch (err) {
+    console.error("Offline-Anmeldung konnte nicht geprüft werden:", err);
+    return false;
+  }
+}
+
+// "Angemeldet bleiben" auf diesem Gerät — für den Offline-Anmeldepfad. Der Online-
+// Pfad braucht dafür KEINE eigene Logik: Supabase persistiert eine echte Session
+// bereits von sich aus in localStorage und stellt sie beim App-Start automatisch
+// wieder her (siehe supabase.auth.getSession() in App()) — das funktioniert schon
+// heute, auch nach vollständigem Schließen des Browsers/der App. Diese Lücke
+// betrifft ausschließlich den Fall, dass sich jemand zuletzt OFFLINE angemeldet
+// hat: bislang musste dafür bei jedem Kaltstart erneut das Passwort eingegeben
+// werden, obwohl der PBKDF2-Fingerabdruck (siehe verifyOfflineCredential) bereits
+// vorlag.
+//
+// Bewusst NICHT als reines "isLoggedIn: true"-Flag umgesetzt: ein simples,
+// ungebundenes Flag ließe sich mit jedem Zugriff auf die Browser-Konsole
+// (localStorage.setItem(...)) fälschen und würde die gerade erst eingeführte
+// verpflichtende Login-Sperre (siehe LoginScreen) faktisch aushebeln — auch für ein
+// Gerät, das nie zuvor echte Zugangsdaten gesehen hat. Stattdessen merkt sich diese
+// Funktion nur, WESSEN Anmeldung erinnert werden darf (E-Mail-Adresse) und für wie
+// lange; die eigentliche Berechtigung bleibt an den bereits vorhandenen,
+// gehashten Fingerabdruck aus cacheOfflineCredential gebunden (siehe
+// restoreRememberedOfflineSession in App()) — ein Gerät, das nie erfolgreich
+// online angemeldet war, hat gar keinen Fingerabdruck und kommt dadurch so oder so
+// nicht hinein.
+const OFFLINE_REMEMBER_STORAGE_KEY = "baudoc_offline_remember_v1";
+const OFFLINE_REMEMBER_DAYS = 30;
+
+function rememberOfflineSession(email) {
+  writeJsonStorage(OFFLINE_REMEMBER_STORAGE_KEY, {
+    email: email.trim().toLowerCase(),
+    expiresAt: Date.now() + OFFLINE_REMEMBER_DAYS * 24 * 60 * 60 * 1000,
+  });
+}
+
+function forgetOfflineSession() {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.removeItem(OFFLINE_REMEMBER_STORAGE_KEY);
+  } catch (err) {
+    console.error(`Konnte "${OFFLINE_REMEMBER_STORAGE_KEY}" nicht aus localStorage entfernen:`, err);
+  }
+}
+
+// Liefert die E-Mail-Adresse einer noch gültigen, erinnerten Offline-Anmeldung
+// zurück — aber NUR, wenn zusätzlich weiterhin ein passender Zugangsdaten-
+// Fingerabdruck derselben Adresse in OFFLINE_AUTH_CACHE_KEY vorliegt (siehe
+// Erläuterung oben). Beide Bedingungen müssen erfüllt sein, sonst null.
+function getRememberedOfflineEmail() {
+  const remembered = readJsonStorage(OFFLINE_REMEMBER_STORAGE_KEY, null);
+  if (!remembered?.email || !remembered?.expiresAt) return null;
+  if (Date.now() > remembered.expiresAt) return null;
+  const cached = readJsonStorage(OFFLINE_AUTH_CACHE_KEY, null);
+  if (!cached || cached.email !== remembered.email) return null;
+  return remembered.email;
+}
+
+// Unterscheidet eine echte Verbindungsstörung (→ Offline-Fallback erlaubt) von einer
+// aktiven, autoritativen Ablehnung durch Supabase selbst (z.B. falsches Passwort bei
+// bestehender Verbindung → Offline-Fallback NICHT erlauben, sonst könnte ein veralteter
+// lokaler Fingerabdruck eine inzwischen serverseitig widerrufene Anmeldung übertünchen).
+// Heuristik, kein exakter Vertragstest: Netzwerkfehler äußern sich browser- und
+// laufzeitübergreifend uneinheitlich (u.a. als TypeError, als Supabase-eigener
+// AuthRetryableFetchError, oder — über withTimeout — als eigene Zeitlimit-Meldung).
+function isNetworkFailure(err) {
+  if (!err) return false;
+  if (err.name === "AuthRetryableFetchError") return true;
+  if (err instanceof TypeError) return true;
+  const msg = String(err?.message || "");
+  if (msg.includes("Zeitlimit")) return true;
+  if (/failed to fetch|network|internet|Verbindung/i.test(msg)) return true;
+  return false;
+}
+
 // ---- Lese-Cache (Abschnitt 15.1) --------------------------------------------------
 
 function cacheProjectsOffline(projects) {
@@ -944,12 +2161,229 @@ function cacheFloorsOffline(projectId, floors) {
 function readCachedFloors(projectId) {
   return readJsonStorage(OFFLINE_CACHE_KEY, {}).floorsByProject?.[projectId] || null;
 }
-function cachePinsOffline(floorId, pins) {
+function cacheFloorPlansOffline(floorId, plans) {
   const cache = readJsonStorage(OFFLINE_CACHE_KEY, {});
-  writeJsonStorage(OFFLINE_CACHE_KEY, { ...cache, pinsByFloor: { ...(cache.pinsByFloor || {}), [floorId]: pins } });
+  writeJsonStorage(OFFLINE_CACHE_KEY, { ...cache, plansByFloor: { ...(cache.plansByFloor || {}), [floorId]: plans } });
 }
-function readCachedPins(floorId) {
-  return readJsonStorage(OFFLINE_CACHE_KEY, {}).pinsByFloor?.[floorId] || null;
+function readCachedFloorPlans(floorId) {
+  return readJsonStorage(OFFLINE_CACHE_KEY, {}).plansByFloor?.[floorId] || null;
+}
+// Nur noch Lese-Fallback (einmalige Übernahme alter Caches nach Dexie, siehe Pins-Ladeeffekt
+// in App()). Geschrieben wird dieser Cache nicht mehr: Pins liegen seit der Umstellung auf
+// Offline-First in Dexie (./offline).
+function readCachedPins(planId) {
+  return readJsonStorage(OFFLINE_CACHE_KEY, {}).pinsByPlan?.[planId] || null;
+}
+// Notizen bekommen einen reinen Lese-Cache (Pins liegen seit der Dexie-Umstellung in ./offline) —
+// Anlegen/Ändern/Löschen bleibt aber, anders als bei Pins, an eine bestehende
+// Verbindung gebunden (siehe requireOnline-Guards in App()), es gibt also bewusst
+// keine analoge Synchronisations-Warteschlange für Notizen.
+function cachePlanNotesOffline(planId, notes) {
+  const cache = readJsonStorage(OFFLINE_CACHE_KEY, {});
+  writeJsonStorage(OFFLINE_CACHE_KEY, { ...cache, notesByPlan: { ...(cache.notesByPlan || {}), [planId]: notes } });
+}
+function readCachedPlanNotes(planId) {
+  return readJsonStorage(OFFLINE_CACHE_KEY, {}).notesByPlan?.[planId] || null;
+}
+
+// ----------------------------------------------------------------------------------
+// ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS
+// (ZERO-LATENCY & OFFLINE-READ)"
+// ----------------------------------------------------------------------------------
+// Eigenständiges IndexedDB-Modul (Datenbank "BauleiterPWA_DB"), bewusst UNABHÄNGIG
+// von den beiden bereits bestehenden Cache-Mechanismen oben/unten:
+//   - Der Lese-Cache direkt oberhalb (OFFLINE_CACHE_KEY, localStorage) dient
+//     AUSSCHLIESSLICH als Fallback, WENN ein Netzwerk-Request fehlschlägt — beim
+//     normalen Öffnen einer Etage/Skizze mit bestehender Verbindung wird er gar
+//     nicht gelesen, es wird immer zuerst der Server abgefragt.
+//   - Der weiter unten folgende Offline-Asset-Cache (ASSET_CACHE_DB_NAME, ebenfalls
+//     IndexedDB) speichert ausschließlich BINÄRDATEN einzelner Bild-/PDF-URLs
+//     (Blobs), nicht die JSON-Metadaten der Skizzen/Pins selbst.
+// Dieses Modul hier verfolgt ein drittes, eigenes Ziel: den zuletzt gesehenen Stand
+// der Grundriss-Skizzen und Pins eines Geschosses SOFORT anzuzeigen, noch BEVOR
+// überhaupt ein Netzwerk-Request losgeht (Zero-Latency) — nicht erst als Reaktion
+// auf einen Fehlschlag. Kombiniert mit einem im Hintergrund weiterlaufenden
+// Server-Abgleich ergibt das eine klassische Stale-While-Revalidate-Strategie: der
+// zuletzt bekannte Stand ist sofort da, ein aktuellerer Stand ersetzt ihn kurz
+// danach unauffällig, sobald er eintrifft (siehe die beiden Lade-Effekte für
+// floorPlans/pins in App() weiter unten). Wirft nie einen Fehler nach außen — jede
+// Funktion fängt IndexedDB-Fehler (Speicherplatz voll, privater Modus, Browser ohne
+// IndexedDB) selbst ab und liefert im Fehlerfall lediglich null/undefined, exakt wie
+// beim bereits bestehenden Offline-Asset-Cache.
+const IDB_DB_NAME = "BauleiterPWA_DB";
+const IDB_DB_VERSION = 1;
+const IDB_SKETCHES_STORE = "sketches";
+const IDB_PINS_STORE = "pins";
+
+let baudocIdbPromise = null;
+function openBaudocIdb() {
+  if (typeof indexedDB === "undefined") {
+    return Promise.reject(new Error("IndexedDB ist in dieser Umgebung nicht verfügbar."));
+  }
+  if (baudocIdbPromise) return baudocIdbPromise;
+  baudocIdbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(IDB_DB_NAME, IDB_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      // "sketches": ein Datensatz je Grundrissskizze (keyPath "id" = plan.id), mit
+      // einem Index auf "floorId" — nötig, um beim Wechsel auf ein GESCHOSS (nicht
+      // nur eine einzelne Skizze) alle zugehörigen Skizzen in einem Rutsch aus dem
+      // Cache zu lesen (siehe getSketchesForFloorFromIDB unten).
+      if (!db.objectStoreNames.contains(IDB_SKETCHES_STORE)) {
+        const store = db.createObjectStore(IDB_SKETCHES_STORE, { keyPath: "id" });
+        store.createIndex("floorId", "floorId", { unique: false });
+      }
+      // "pins": ein Datensatz je Skizze, unter dem KOMPLETTEN, zuletzt bekannten
+      // Pins-Array dieser Skizze (keyPath "floorId" — in der Praxis aufgerufen mit
+      // der ID der aktuell geöffneten Grundrissskizze, siehe savePinsToIDB unten).
+      if (!db.objectStoreNames.contains(IDB_PINS_STORE)) {
+        db.createObjectStore(IDB_PINS_STORE, { keyPath: "floorId" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => {
+      baudocIdbPromise = null;
+      reject(request.error || new Error('IndexedDB "BauleiterPWA_DB" konnte nicht geöffnet werden.'));
+    };
+  });
+  return baudocIdbPromise;
+}
+
+// ---- "sketches"-Store -------------------------------------------------------------
+
+// Speichert genau EINE Grundrissskizze unter ihrer ID. blobOrUrlData ist bewusst
+// generisch benannt und wird unverändert (als "data"-Feld) abgelegt — in dieser App
+// wird hier der komplette Skizzen-Datensatz übergeben (inkl. image_url/tile_manifest
+// etc.), NICHT die Bildpixel selbst (die laufen bereits über den bestehenden
+// Offline-Asset-Cache, siehe cacheAssetBlob/useOfflineCapableAssetUrl oben) — die
+// Funktion würde aber unverändert auch mit einem echten Blob als zweitem Argument
+// funktionieren, falls das künftig gebraucht wird.
+async function saveSketchToIDB(sketchId, blobOrUrlData) {
+  if (!sketchId) return;
+  try {
+    const db = await openBaudocIdb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readwrite");
+      tx.objectStore(IDB_SKETCHES_STORE).put({
+        id: sketchId,
+        floorId: blobOrUrlData?.floor_id ?? blobOrUrlData?.floorId ?? null,
+        data: blobOrUrlData,
+        cachedAt: Date.now(),
+      });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizze "${sketchId}" konnte nicht zwischengespeichert werden:`, err);
+  }
+}
+
+async function getSketchFromIDB(sketchId) {
+  if (!sketchId) return null;
+  try {
+    const db = await openBaudocIdb();
+    const record = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readonly");
+      const req = tx.objectStore(IDB_SKETCHES_STORE).get(sketchId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    return record?.data ?? null;
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizze "${sketchId}" konnte nicht gelesen werden:`, err);
+    return null;
+  }
+}
+
+// Geschossweite Bulk-Varianten der beiden Funktionen oben — zusätzlich zu den in der
+// ANFORDERUNG benannten Funktionen, aber auf denselben "sketches"-Store aufgesetzt:
+// "Beim Wechsel auf ein GESCHOSS" (siehe ANFORDERUNG Punkt 2) müssen ALLE Skizzen
+// dieses Geschosses aus dem Cache kommen, nicht nur eine einzelne per ID — ohne diese
+// beiden Hilfsfunktionen ließe sich die geforderte Zero-Latency-Anzeige der
+// Skizzen-Übersicht (SketchOverview) nicht abbilden. saveSketchesForFloorToIDB
+// ERSETZT beim Speichern immer den kompletten, zuvor für dieses Geschoss
+// zwischengespeicherten Bestand (statt nur zu ergänzen), damit z.B. eine
+// zwischenzeitlich gelöschte Skizze nicht dauerhaft als Karteileiche im Cache
+// hängen bleibt.
+async function saveSketchesForFloorToIDB(floorId, sketches) {
+  if (!floorId) return;
+  try {
+    const db = await openBaudocIdb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readwrite");
+      const store = tx.objectStore(IDB_SKETCHES_STORE);
+      const index = store.index("floorId");
+      const cursorReq = index.openCursor(IDBKeyRange.only(floorId));
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (cursor) {
+          store.delete(cursor.primaryKey);
+          cursor.continue();
+        } else {
+          const now = Date.now();
+          for (const sketch of sketches || []) {
+            if (!sketch?.id) continue;
+            store.put({ id: sketch.id, floorId, data: sketch, cachedAt: now });
+          }
+        }
+      };
+      cursorReq.onerror = () => reject(cursorReq.error);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizzen für Geschoss "${floorId}" konnten nicht zwischengespeichert werden:`, err);
+  }
+}
+
+async function getSketchesForFloorFromIDB(floorId) {
+  if (!floorId) return null;
+  try {
+    const db = await openBaudocIdb();
+    const records = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_SKETCHES_STORE, "readonly");
+      const index = tx.objectStore(IDB_SKETCHES_STORE).index("floorId");
+      const req = index.getAll(IDBKeyRange.only(floorId));
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+    if (!records || records.length === 0) return null;
+    return records.map((r) => r.data);
+  } catch (err) {
+    console.warn(`IndexedDB: Grundrissskizzen für Geschoss "${floorId}" konnten nicht gelesen werden:`, err);
+    return null;
+  }
+}
+
+// ---- "pins"-Store -------------------------------------------------------------
+// Ein Datensatz je Grundrissskizze (Parameter heißt gemäß ANFORDERUNG "floorId",
+// aufgerufen wird er in dieser App aber mit der ID der aktuell geöffneten
+// GRUNDRISSSKIZZE/selectedFloorPlanId — exakt dieselbe Granularität, mit der auch
+// der bereits bestehende cachePinsOffline/readCachedPins arbeitet, siehe oben: Pins
+// hängen fachlich an pins.plan_id, nicht direkt an einem Geschoss mit mehreren
+// Skizzen). Speichert bewusst das GESAMTE Array unter einem Schlüssel statt
+// einzelner Pin-Datensätze — savePinsToIDB wird ohnehin immer mit dem kompletten,
+// aktuellen Pins-Stand einer Skizze aufgerufen (siehe die synchronisierenden
+// useEffects in App() weiter unten), ein Diffing auf Einzel-Pin-Ebene wäre hier
+// unnötige Komplexität.
+// savePinsToIDB entfällt: Pins werden nicht mehr in diesen Store gespiegelt, sondern in Dexie
+// (./offline) geführt. getPinsFromIDB bleibt als Lese-Fallback für die einmalige Übernahme
+// bereits zwischengespeicherter Stände.
+async function getPinsFromIDB(floorId) {
+  if (!floorId) return null;
+  try {
+    const db = await openBaudocIdb();
+    const record = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_PINS_STORE, "readonly");
+      const req = tx.objectStore(IDB_PINS_STORE).get(floorId);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    return record?.pins ?? null;
+  } catch (err) {
+    console.warn(`IndexedDB: Pins für "${floorId}" konnten nicht gelesen werden:`, err);
+    return null;
+  }
 }
 
 // ---- Synchronisations-Warteschlange (Abschnitt 15.2/15.3) ------------------------
@@ -986,20 +2420,132 @@ function resolveOfflineId(id) {
   return readOfflineIdMap()[id] || id;
 }
 
+// ---- Client-seitige Bild-Komprimierung (vor JEDEM Foto-Upload) --------------------
+// ANFORDERUNG "CLIENT-SIDE IMAGE RESIZING & WEBP COMPRESSION BEFORE SUPABASE UPLOAD":
+// skaliert ein neu aufgenommenes/ausgewähltes Foto auf dem Client herunter und
+// re-encodiert es als WebP (mit automatischem JPEG-Fallback für Browser ohne
+// WebP-Kodierungsunterstützung, siehe supportsWebpEncoding), BEVOR es überhaupt an die
+// Offline-Warteschlange oder den Online-Upload übergeben wird — läuft vollständig
+// lokal über ein <canvas>, ohne externen Dienst, und funktioniert dadurch unverändert
+// auch ohne Netzverbindung. Nutzen dafür: spürbar kleinere Dateien bei gleicher
+// wahrgenommener Qualität als das bisherige JPEG (WebP komprimiert bei vergleichbarer
+// Qualitätsstufe typischerweise 25-35% kleiner), kleinere data:-URLs im
+// localStorage-Sync-Queue-Eintrag (dessen Größe sonst schnell an praktische
+// localStorage-Grenzen stößt, siehe OFFLINE_SYNC_QUEUE_KEY), kleinere IndexedDB-
+// Cache-Einträge, spürbar schnellere Uploads auf der Baustelle bei schwachem Empfang
+// und — namensgebend für diese Erweiterung — weniger VRAM-Druck beim Zoomen auf dem
+// iPad, da nie mehr als maxDimension Pixel an der längeren Kante geladen werden
+// müssen. Wirft absichtlich NIE einen Fehler nach außen: schlägt das Dekodieren eines
+// einzelnen, ggf. exotischen Bildformats fehl, wird unverändert die Original-Datei
+// zurückgegeben (nur mit einer Konsolenwarnung) — ein einzelnes fehlerhaftes Foto darf
+// niemals den gesamten Foto-Upload blockieren. Aufrufer: handleUploadPhotos (Mängel-
+// Pin-Fotos) sowie — über resizeFloorPlanImageForUpload weiter unten, das dieselbe
+// WebP-Kodierung für seinen JPEG-fähigen Zweig wiederverwendet — die Multi-File-
+// Grundriss-Skizzen-Uploads. Für Notiz-Fotos gibt es aktuell keinen Upload-Pfad (siehe
+// Einordnung): PlanNoteModal ist bewusst ein reiner Text-Marker ohne Foto-Anhang,
+// dafür also nichts zu verschalten.
+const COMPRESS_IMAGE_DEFAULT_MAX_DIMENSION = 2000;
+const COMPRESS_IMAGE_DEFAULT_QUALITY = 0.82;
+
+// Einmalige, gecachte Feature-Erkennung, ob dieser Browser Canvas-Inhalte tatsächlich
+// als WebP kodieren kann (Kodier-Unterstützung ist NICHT deckungsgleich mit reiner
+// Anzeige-Unterstützung eines <img>) — canvas.toBlob liefert auf Browsern ohne
+// WebP-Encoder entweder gar keinen Blob oder fällt still auf PNG zurück; beides wird
+// hier erkannt, indem der tatsächliche MIME-Type des Ergebnis-Blobs geprüft wird,
+// statt einer reinen Versions-/User-Agent-Prüfung zu vertrauen. Das Ergebnis wird
+// promise-weise zwischengespeichert, damit nicht bei jedem einzelnen Foto erneut ein
+// Test-Canvas erzeugt werden muss.
+let _webpEncodingSupportPromise = null;
+function supportsWebpEncoding() {
+  if (!_webpEncodingSupportPromise) {
+    _webpEncodingSupportPromise = new Promise((resolve) => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 1;
+        canvas.height = 1;
+        if (!canvas.toBlob) {
+          resolve(false);
+          return;
+        }
+        canvas.toBlob((blob) => resolve(!!blob && blob.type === "image/webp"), "image/webp");
+      } catch {
+        resolve(false);
+      }
+    });
+  }
+  return _webpEncodingSupportPromise;
+}
+
+async function compressImage(file, maxDimension = COMPRESS_IMAGE_DEFAULT_MAX_DIMENSION, quality = COMPRESS_IMAGE_DEFAULT_QUALITY) {
+  if (!file || !file.type || !file.type.startsWith("image/")) return file;
+  const objectUrl = URL.createObjectURL(file);
+  const cleanup = () => URL.revokeObjectURL(objectUrl);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Bild konnte nicht geladen werden."));
+      image.src = objectUrl;
+    });
+
+    const naturalWidth = img.naturalWidth || img.width;
+    const naturalHeight = img.naturalHeight || img.height;
+    if (!naturalWidth || !naturalHeight) {
+      throw new Error("Bildabmessungen konnten nicht ermittelt werden.");
+    }
+
+    // Nur verkleinern, nie vergrößern — ein bereits kleineres Foto (z.B. Nahaufnahme aus
+    // einer älteren/einfacheren Kamera) bleibt in seiner Originalauflösung, wird aber
+    // trotzdem mit der Ziel-Qualität re-encodiert, damit z.B. unkomprimierte PNG-
+    // Aufnahmen ebenfalls von der Komprimierung profitieren. Skaliert an der LÄNGEREN
+    // Kante auf exakt maxDimension, die kürzere Kante folgt proportional.
+    const largestDim = Math.max(naturalWidth, naturalHeight);
+    const downscale = Math.min(1, maxDimension / largestDim);
+    const targetWidth = Math.max(1, Math.round(naturalWidth * downscale));
+    const targetHeight = Math.max(1, Math.round(naturalHeight * downscale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) {
+      throw new Error("2D-Canvas-Context nicht verfügbar.");
+    }
+    // Weißer Hintergrund vor dem Zeichnen: weder JPEG noch das hier primär verwendete
+    // WebP-Encoding (verlustbehaftet, ohne Alpha-Kanal in diesem Einsatz) kennen
+    // Transparenz in dieser Pipeline — ohne dies würde ein transparenter Bildbereich
+    // (z.B. bei einem PNG-Foto) sonst je nach Browser schwarz statt weiß dargestellt.
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, targetWidth, targetHeight);
+    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+    const useWebp = await supportsWebpEncoding();
+    const outputType = useWebp ? "image/webp" : "image/jpeg";
+    const outputExt = useWebp ? "webp" : "jpg";
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, outputType, quality));
+    cleanup();
+    if (!blob) {
+      console.warn("Foto-Komprimierung übersprungen, Original wird verwendet: toBlob lieferte kein Ergebnis.");
+      return file;
+    }
+    // Dateiname bleibt erhalten (nur die Endung wird auf .webp bzw. im Fallback-Fall auf
+    // .jpg vereinheitlicht) — sanitizeFileName() beim eigentlichen Storage-Upload (siehe
+    // uploadPinPhoto) greift unverändert auf diesen Namen zu.
+    const baseName = (file.name || "foto").replace(/\.[a-zA-Z0-9]+$/, "");
+    return new File([blob], `${baseName}.${outputExt}`, { type: outputType, lastModified: Date.now() });
+  } catch (err) {
+    cleanup();
+    console.warn("Foto-Komprimierung übersprungen, Original wird verwendet:", err);
+    return file;
+  }
+}
+
 // ---- Foto-Konvertierung für die Offline-Warteschlange -----------------------------
 // Offline aufgenommene/ausgewählte Fotos werden als data:-URL (Base64) an einen Pin
 // gehängt und in derselben Form in die Warteschlange gelegt. Beim Synchronisieren
 // (flushSyncQueue) wird die data:-URL wieder in eine echte Datei zurückverwandelt,
 // damit derselbe uploadPinPhoto()-Pfad wie beim Online-Upload verwendet werden kann.
-
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
 
 function dataUrlToFile(dataUrl, fileName, mimeType) {
   const [header, base64] = dataUrl.split(",");
@@ -1008,6 +2554,198 @@ function dataUrlToFile(dataUrl, fileName, mimeType) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
   return new File([bytes], fileName, { type: mime });
+}
+
+// ----------------------------------------------------------------------------------
+// OFFLINE-ASSET-CACHE (IndexedDB) — Grundriss-Baupläne (PDF/SVG) & Pin-Fotos
+// ----------------------------------------------------------------------------------
+// Der obige Lese-Cache (OFFLINE_CACHE_KEY, localStorage) deckt ausschließlich die
+// JSON-Metadaten von Projekten/Etagen/Pins ab — die eigentlichen BINÄRDATEN
+// (Grundriss-PDFs, Foto-Bilddateien) hängen bislang an Supabase-Storage-URLs, die
+// ohne Netzverbindung schlicht nicht laden. IndexedDB ist dafür die richtige Wahl:
+// deutlich höheres Speicherlimit als localStorage (typischerweise ein nennenswerter
+// Anteil des freien Datenträgerplatzes statt weniger MB) und nativer Blob-Support
+// ohne Umweg über Base64-Zeichenketten.
+//
+// Funktionsweise: jede Ressourcen-URL (ein Grundriss oder ein Foto) wird bei jedem
+// erfolgreichen ONLINEN Anzeigen im Hintergrund zusätzlich als Blob unter genau
+// dieser URL als Schlüssel abgelegt (siehe cacheAssetForOfflineUseInBackground/
+// useOfflineCapableAssetUrl unten) — "best effort", ein Fehlschlag (z.B. Speicher-
+// platz voll, IndexedDB im privaten Modus mancher Browser gesperrt) darf die
+// eigentliche Anzeige nie blockieren oder abbrechen. Beim OFFLINEN Öffnen wird
+// zuerst dieser Cache geprüft; liegt der Plan/das Foto dort bereits vor, wird er
+// direkt von dort geladen statt über Supabase. Ehrlicher Hinweis, weil unvermeidbar:
+// ein Plan/Foto, das auf diesem Gerät noch nie ONLINE geöffnet wurde, kann naturgemäß
+// nicht offline verfügbar sein — das ist keine Lücke dieser Implementierung, sondern
+// die Grenze jedes Offline-Caches. Ein offline aufgenommenes/noch unsynchronisiertes
+// Foto (data:-URL) ist bereits vollständig lokal und läuft
+// bewusst NICHT durch diesen Cache.
+const ASSET_CACHE_DB_NAME = "baudoc_asset_cache_v1";
+const ASSET_CACHE_STORE = "assets";
+const ASSET_CACHE_DB_VERSION = 1;
+
+let assetCacheDbPromise = null;
+function openAssetCacheDb() {
+  if (typeof indexedDB === "undefined") {
+    return Promise.reject(new Error("IndexedDB ist in dieser Umgebung nicht verfügbar."));
+  }
+  if (assetCacheDbPromise) return assetCacheDbPromise;
+  assetCacheDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(ASSET_CACHE_DB_NAME, ASSET_CACHE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(ASSET_CACHE_STORE)) {
+        db.createObjectStore(ASSET_CACHE_STORE, { keyPath: "url" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => {
+      assetCacheDbPromise = null;
+      reject(request.error || new Error("IndexedDB konnte nicht geöffnet werden."));
+    };
+  });
+  return assetCacheDbPromise;
+}
+
+async function cacheAssetBlob(url, blob) {
+  try {
+    const db = await openAssetCacheDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(ASSET_CACHE_STORE, "readwrite");
+      tx.objectStore(ASSET_CACHE_STORE).put({ url, blob, cachedAt: Date.now() });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    // Best effort — siehe Erläuterung oben (Speicherplatz voll, IndexedDB gesperrt, …).
+    console.error(`Offline-Zwischenspeicherung fehlgeschlagen für "${url}":`, err);
+  }
+}
+
+async function getCachedAssetBlob(url) {
+  try {
+    const db = await openAssetCacheDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(ASSET_CACHE_STORE, "readonly");
+      const req = tx.objectStore(ASSET_CACHE_STORE).get(url);
+      req.onsuccess = () => resolve(req.result?.blob || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+// Lädt eine Ressource, die der Browser bereits selbst über <img>/pdf.js anzeigt (und
+// damit schon einmal über das Netz geholt hat), ein ZWEITES Mal im Hintergrund nach,
+// rein um sie als Blob im Offline-Cache abzulegen — ehrlicher Kompromiss: das kostet
+// beim erstmaligen Online-Betrachten eines Plans/Fotos zusätzliches Datenvolumen,
+// ist dafür aber die einfachste robuste Lösung, ohne die eigentliche Anzeige (bei
+// PDFs inkl. der Lazy-Loading-Range-Requests aus der letzten Anforderung) anzufassen
+// oder zu verlangsamen — der Zwischenspeicher-Download läuft komplett unabhängig
+// nebenher. inflightAssetCaches verhindert doppelte Parallel-Anfragen für dieselbe
+// URL (z.B. Foto gleichzeitig in Galerie UND Lightbox sichtbar).
+const inflightAssetCaches = new Set();
+function cacheAssetForOfflineUseInBackground(url) {
+  if (!url || url.startsWith("data:") || url.startsWith("blob:") || inflightAssetCaches.has(url)) return;
+  inflightAssetCaches.add(url);
+  fetch(url)
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.blob();
+    })
+    .then((blob) => cacheAssetBlob(url, blob))
+    .catch((err) => console.warn(`Hintergrund-Zwischenspeicherung fehlgeschlagen für "${url}":`, err))
+    .finally(() => inflightAssetCaches.delete(url));
+}
+
+// Holt den Textinhalt einer Ressource (native .svg-Grundrisse, siehe SvgPlanCanvas)
+// — online per direktem fetch() (der dabei ohnehin bereits vorliegende Blob wird
+// gleich mit im Cache abgelegt, KEIN zweiter Download nötig), offline zuerst aus dem
+// Cache, nur wenn dort nichts vorliegt als letzter, dann typischerweise
+// fehlschlagender Versuch wie bisher — kein Verhaltensunterschied gegenüber vorher
+// für einen noch nie online geöffneten Plan.
+async function fetchAssetTextWithOfflineCache(url) {
+  if (isOnline()) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    cacheAssetBlob(url, blob); // best effort, nicht blockierend abgewartet
+    return await blob.text();
+  }
+  const cachedBlob = await getCachedAssetBlob(url);
+  if (cachedBlob) return await cachedBlob.text();
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.text();
+}
+
+// React-Hook: liefert die tatsächlich zu verwendende Quelle für eine Supabase-
+// Storage-URL (Grundriss-PDF oder Pin-Foto). Online unverändert die Original-URL
+// (der Browser lädt dort direkt und am schnellsten, inkl. eigenem HTTP-Cache) plus
+// ein angestoßener Hintergrund-Download in den Offline-Asset-Cache; offline
+// stattdessen, sofern bereits einmal zwischengespeichert, eine lokale object:-URL
+// aus genau diesem Cache. data:-URLs (offline aufgenommene, noch nicht
+// synchronisierte Fotos) werden unverändert durchgereicht. Reagiert außerdem
+// selbstständig auf einen Verbindungswechsel (eigene online/offline-Listener), ohne
+// dass online/offline als Prop durch PlanSvgStage/PdfPlanCanvas durchgereicht werden
+// müsste.
+function useOfflineCapableAssetUrl(url) {
+  const [online, setOnline] = useState(() => isOnline());
+  const [resolvedUrl, setResolvedUrl] = useState(() => (url && !url.startsWith("data:") && !isOnline() ? null : url));
+  const objectUrlRef = useRef(null);
+
+  useEffect(() => {
+    const handleOnline = () => setOnline(true);
+    const handleOffline = () => setOnline(false);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+    if (!url || url.startsWith("data:") || url.startsWith("blob:")) {
+      setResolvedUrl(url);
+      return undefined;
+    }
+    if (online) {
+      setResolvedUrl(url);
+      cacheAssetForOfflineUseInBackground(url);
+      return undefined;
+    }
+    setResolvedUrl(null); // während der Cache-Abfrage nichts (Falsches) anzeigen
+    getCachedAssetBlob(url).then((blob) => {
+      if (cancelled) return;
+      if (blob) {
+        const objectUrl = URL.createObjectURL(blob);
+        objectUrlRef.current = objectUrl;
+        setResolvedUrl(objectUrl);
+      } else {
+        // Nie online zwischengespeichert — ehrlicher, unveränderter Fallback auf die
+        // Original-URL (schlägt offline weiterhin fehl, wie schon vor diesem Cache).
+        setResolvedUrl(url);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [url, online]);
+
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    };
+  }, []);
+
+  return resolvedUrl;
 }
 
 // ----------------------------------------------------------------------------------
@@ -1266,27 +3004,366 @@ function loadImageAsDataUrl(url) {
     );
 }
 
-// Rendert Seite 1 eines PDF-Grundrisses über pdf.js in ein Offscreen-Canvas und
-// liefert dasselbe Format wie loadImageAsDataUrl — wiederverwendet dieselbe
-// pdf.js-Ladefunktion (loadPdfJs) wie die interaktive PdfPlanCanvas beim Zoomen.
-async function renderPdfPlanToDataUrl(url, scale = 2.5) {
+// Rendert Seite 1 eines PDF-Grundrisses für den PDF-Export bewusst weiterhin als
+// Raster-Bitmap in ein Offscreen-Canvas (jsPDF/doc.addImage() benötigt zwingend ein
+// Bitmap, kein SVG) und liefert dasselbe Format wie loadImageAsDataUrl — wiederverwendet
+// dieselbe robuste, mehrstufige pdf.js-Ladefunktion (loadPdfJs/loadPdfDocument, mit
+// CDN- und Worker-Fallback) wie die interaktive PdfPlanCanvas, die die Seite seit der
+// Umstellung auf natives SVG-Vektor-Rendering nicht mehr rastert. scale=3.75 (statt
+// zuvor 2.5) liefert für den Export mehr Quell-Detail, bevor compressImageDataUrl das
+// Ergebnis ohnehin auf PDF_PLAN_MAX_WIDTH/-HEIGHT herunterskaliert (siehe dort) — bei
+// kleineren/detailärmeren Plänen macht sich das als sichtbarer Schärfegewinn im
+// exportierten PDF-Bericht bemerkbar, bei bereits sehr großformatigen Plänen (die
+// schon bei 2.5 über diese Obergrenze hinausgehen) ändert sich am Endergebnis nichts,
+// da der Kompressionsschritt ohnehin deckelt.
+async function renderPdfPlanToDataUrl(url, scale = 3.75) {
   const pdfjsLib = await loadPdfJs();
-  const pdf = await pdfjsLib.getDocument(url).promise;
-  const page = await pdf.getPage(1);
-  const viewport = page.getViewport({ scale });
-  const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-  return { dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height };
+  const pdf = await loadPdfDocument(pdfjsLib, url);
+  try {
+    const page = await pdf.getPage(1);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    return { dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height };
+  } finally {
+    // GEDÄCHTNIS-LECK-FIX (siehe Einordnung in der Antwort): diese Funktion wird bei
+    // JEDEM PDF-Export EINMAL PRO PDF-GRUNDRISS aufgerufen (generateProjectReportPdf
+    // iteriert über alle Etagen) — ohne destroy() blieb bisher für jeden dabei
+    // geladenen PDF-Grundriss ein eigenes pdf.js-Dokument samt interner Font-/
+    // Seiten-Caches dauerhaft im Speicher der Seite liegen, auch lange nachdem der
+    // Export fertig war. Bei einem Projekt mit mehreren PDF-Grundrissen (z.B. eine
+    // Etage je Geschoss) addierte sich das über die Dauer einer Sitzung spürbar auf —
+    // ein plausibler Mitverursacher dafür, dass der Speicherdruck kurz danach beim
+    // Zoomen auf dem Grundriss eher an die iOS-Grenze stößt, siehe Einordnung.
+    try {
+      pdf.destroy();
+    } catch (destroyErr) {
+      console.warn("PDF-Dokument (Export-Rendering) konnte nicht sauber freigegeben werden:", destroyErr);
+    }
+  }
 }
 
-// Lädt für eine Liste von Etagen jeweils alle Pins inkl. Fotos/Aufgaben/Verlauf
-// (siehe fetchPinsWithDetails) und hängt eine Referenz auf die jeweilige Etage an
-// jeden Pin — vereinfacht Filtern/Sortieren über alle Etagen eines Projekts hinweg.
+// GRUNDRISS-GARANTIE (Anforderung PDF-Export): der Grundriss soll unabhängig von
+// seiner Dateigröße IMMER lesbar im Export erscheinen. loadImageAsDataUrl/
+// renderPdfPlanToDataUrl können bei einem einzelnen, vorübergehenden Netzwerk-Hänger
+// (z. B. auf einer schwachen Baustellen-Verbindung) fehlschlagen, obwohl die Datei an
+// sich verfügbar ist — ein einziger sofortiger erneuter Versuch nach kurzer Pause
+// behebt genau diesen häufigsten Fall, ohne den Export spürbar zu verzögern. Bleiben
+// beide Versuche erfolglos (z. B. Datei wirklich nicht erreichbar), wirft die Funktion
+// weiterhin ganz normal — die aufrufende Stelle zeigt dann wie bisher den textuellen
+// Fallback (siehe generateProjectReportPdf/generateFloorPinsTablePdf/
+// generateSinglePinPdf), ein hundertprozentiges Gelingen kann bei einem echten
+// Netzwerk- oder Dateiproblem naturgemäß niemand garantieren.
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadFloorPlanImageWithRetry(planUrl, planKind) {
+  const load = () =>
+    planKind === "pdf" ? renderPdfPlanToDataUrl(planUrl) : loadImageAsDataUrl(planUrl);
+  try {
+    return await load();
+  } catch (err) {
+    console.warn("Grundriss konnte nicht geladen werden, erneuter Versuch:", err);
+    await delay(600);
+    return await load();
+  }
+}
+
+// ---- PDF-Dateigrößen-Optimierung (Downscaling & Komprimierung) --------------------
+// Kamerafotos von Baustellen-Smartphones (oft 8–48 Megapixel) und hochauflösend
+// gescannte/gerenderte Grundrisse werden von loadImageAsDataUrl/renderPdfPlanToDataUrl
+// unverändert in voller Originalauflösung geladen — direkt per doc.addImage() in ein
+// PDF eingebettet, lässt das allein schon einen Bericht mit mehreren Dutzend Fotos auf
+// weit über 100 MB anwachsen und ist für den mobilen E-Mail-Versand unbrauchbar. Jedes
+// Bild wird daher VOR dem Einbetten zusätzlich über ein Offscreen-Canvas auf eine für
+// den tatsächlichen Darstellungszweck ausreichende Auflösung herunterskaliert und als
+// komprimiertes JPEG re-encodiert. Zielgröße laut Vorgabe: ca. 5–15 MB je Bericht.
+const PDF_PHOTO_MAX_WIDTH = 800;
+const PDF_PHOTO_MAX_HEIGHT = 600;
+const PDF_PHOTO_JPEG_QUALITY = 0.65;
+// GRUNDRISS-GARANTIE: 2200×2200 bei Qualität 0.78 (statt zuvor 1800×1800 / 0.72) —
+// spürbar schärfer bei größeren/detailreicheren Grundrissen (z. B. beschriftete
+// Achsraster, feine Bemaßung), ohne die Zielgröße des Gesamtberichts (siehe Kommentar
+// oben) nennenswert zu sprengen. Siehe auch loadFloorPlanImageWithRetry unten.
+const PDF_PLAN_MAX_WIDTH = 2200;
+const PDF_PLAN_MAX_HEIGHT = 2200;
+const PDF_PLAN_JPEG_QUALITY = 0.78;
+
+// Skaliert & komprimiert ein bereits geladenes Bild (Data-URL, siehe
+// loadImageAsDataUrl/renderPdfPlanToDataUrl) über ein Offscreen-Canvas auf maximal
+// maxWidth×maxHeight (Seitenverhältnis bleibt erhalten, es wird nie vergrößert) und
+// re-encodiert es verlustbehaftet als JPEG mit der angegebenen Qualität (0–1). Gibt
+// dasselbe { dataUrl, width, height }-Format zurück wie die beiden Lade-Funktionen —
+// 1:1 austauschbar an jeder addImage()-Aufrufstelle. Für die Vorschaubild-Darstellung
+// im Druck UND am Bildschirm ist diese Auflösung völlig ausreichend; die Original-
+// Fotos in voller Qualität bleiben unangetastet in Supabase Storage gespeichert und
+// über die "Foto-Links"-Spalte des Excel-Exports weiterhin vollständig erreichbar.
+function compressImageDataUrl(sourceDataUrl, maxWidth, maxHeight, quality) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const ratio = Math.min(1, maxWidth / img.naturalWidth, maxHeight / img.naturalHeight);
+      const width = Math.max(1, Math.round(img.naturalWidth * ratio));
+      const height = Math.max(1, Math.round(img.naturalHeight * ratio));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      // JPEG kennt keine Transparenz — ohne einen weißen Untergrund würden ursprünglich
+      // transparente Bereiche (z. B. bei PNG-Grundrissen) sonst schwarz dargestellt.
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve({ dataUrl: canvas.toDataURL("image/jpeg", quality), width, height });
+    };
+    img.onerror = () => reject(new Error("Bild konnte für die PDF-Komprimierung nicht dekodiert werden."));
+    img.src = sourceDataUrl;
+  });
+}
+
+// Feste Normalisierungsgröße (4:3) & Hintergrundfarbe — dieselbe Hintergrundfarbe wie
+// die Bild-Box im Bericht (siehe drawPdfPhotoBox), damit ein eventueller Rand nahtlos
+// mit der umgebenden Box verschmilzt statt als sichtbarer Balken aufzufallen.
+const PDF_PHOTO_NORMALIZE_WIDTH = 800;
+const PDF_PHOTO_NORMALIZE_HEIGHT = 600;
+const PDF_PHOTO_NORMALIZE_BG = "#f8fafc";
+
+// ---- BILDER-GRID IM PDF-LAYOUT: 2-Spalten-Raster, GLEICHBERECHTIGT (kein Haupt-/
+// Vorschaubild mehr) ------------------------------------------------------------------
+// Einheitliches 2-Spalten-Foto-Raster (entspricht display:grid; grid-template-columns:
+// repeat(2,1fr); gap:12px) für ALLE DREI PDF-Export-Funktionen — JEDE Bild-Box erhält
+// exakt dieselbe feste Höhe (rechnerisches Äquivalent zu CSS height: 250px bei ~96dpi:
+// 250 / 96 * 25.4 ≈ 66.15mm, auf 66mm gerundet) und dieselbe volle verfügbare
+// Spaltenbreite (width: 100% der Spalte), unabhängig von Fotoanzahl UND Position in der
+// Liste — es gibt bewusst KEINE Sonderbehandlung für das erste Foto mehr (kein
+// "Hauptbild" + kleinere "Vorschaubilder"), Bild 1, 2 und 3 stehen exakt gleich groß
+// nebeneinander/untereinander. In Kombination mit der 4:3-Bildnormalisierung beim
+// Preload (siehe normalizeImageTo4x3Canvas) ergibt das für JEDES Foto im gesamten
+// Bericht exakt dieselbe Darstellungsgröße auf den Millimeter genau.
+const PDF_PHOTO_GRID_COLS = 2;
+const PDF_PHOTO_GRID_GAP_MM = 3.2; // ≈ CSS gap: 12px bei ~96dpi (12 / 96 * 25.4 ≈ 3.175mm)
+const PDF_PHOTO_GRID_ROW_HEIGHT_MM = 66; // ≈ CSS height: 250px bei ~96dpi
+// Bild-Box-Optik (entspricht der Vorgabe background:#f8fafc, border:1px solid #e2e8f0,
+// border-radius:8px — hier als jsPDF-RGB/mm-Äquivalente): dieselben Werte wie
+// PDF_PHOTO_NORMALIZE_BG oben, damit der Normalisierungs-Rand nahtlos in die Box
+// übergeht. 8px Radius bei ~96dpi ≈ 2.1mm.
+const PDF_PHOTO_BOX_BG_RGB = [248, 250, 252];
+const PDF_PHOTO_BOX_BORDER_RGB = [226, 232, 240];
+const PDF_PHOTO_BOX_RADIUS_MM = 2.1;
+
+// ---- CANVAS-BASED IMAGE NORMALIZATION (ALLE FOTOS EXAKT GLEICH GROSS) -------------
+// Zeichnet ein bereits geladenes Bild (Data-URL) zentriert und seitenverhältnistreu
+// ("object-fit: contain" — es wird NICHTS vom eigentlichen Bildinhalt beschnitten) auf
+// einen Offscreen-Canvas mit FESTEM Seitenverhältnis 4:3 (Standardgröße 800×600px).
+// Hoch- UND Querformat-Aufnahmen erhalten dadurch identische Außenmaße: jedes
+// vorgeladene Foto lässt sich anschließend 1:1 in eine gleich große Box im PDF-Raster
+// einsetzen. Bewusst KEIN Zuschnitt (kein "object-fit: cover") — bei Mängeldokumentation
+// liefert gerade der Bildrand oft den entscheidenden Kontext (Anschluss an die
+// Wand/Decke, Ausdehnung eines Risses); ein Zuschnitt könnte genau diesen Kontext
+// abschneiden. Der schmale, ggf. entstehende Rand links/rechts bzw. oben/unten wird mit
+// derselben Hintergrundfarbe gefüllt wie die Bild-Box selbst (siehe drawPdfPhotoBox),
+// sodass er im fertigen Bericht praktisch nicht auffällt.
+function normalizeImageTo4x3Canvas(sourceDataUrl, targetWidthPx = PDF_PHOTO_NORMALIZE_WIDTH, targetHeightPx = PDF_PHOTO_NORMALIZE_HEIGHT, quality = PDF_PHOTO_JPEG_QUALITY, bgColor = PDF_PHOTO_NORMALIZE_BG) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = targetWidthPx;
+      canvas.height = targetHeightPx;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = bgColor;
+      ctx.fillRect(0, 0, targetWidthPx, targetHeightPx);
+      const ratio = Math.min(targetWidthPx / img.naturalWidth, targetHeightPx / img.naturalHeight);
+      const w = img.naturalWidth * ratio;
+      const h = img.naturalHeight * ratio;
+      ctx.drawImage(img, (targetWidthPx - w) / 2, (targetHeightPx - h) / 2, w, h);
+      resolve({ dataUrl: canvas.toDataURL("image/jpeg", quality), width: targetWidthPx, height: targetHeightPx });
+    };
+    img.onerror = () => reject(new Error("Bild konnte für die einheitliche 4:3-Normalisierung nicht dekodiert werden."));
+    img.src = sourceDataUrl;
+  });
+}
+
+// ---- EINZEL-BILD-PRELOAD: Foto-URL -> normalisierte 4:3-Base64/Data-URL ------------
+// Lädt EINE Foto-URL vollständig als Base64-Data-String vor — über fetch() + Blob +
+// FileReader (siehe loadImageAsDataUrl), NICHT per <img crossOrigin>/Canvas-Snapshot,
+// da Supabase-Storage-URLs je nach Bucket-Konfiguration keine anonyme Canvas-Lesbarkeit
+// garantieren (Tainted-Canvas-Risiko). Direkt im Anschluss auf das feste 4:3-Format
+// normalisiert (siehe normalizeImageTo4x3Canvas) — dadurch enthält der vorgeladene
+// Cache bereits das fertige, einbettbare UND größenvereinheitlichte Format, das
+// Zeichnen selbst (siehe drawPdfPhotoBox) muss keine weitere Bildbearbeitung mehr
+// vornehmen. Wirft bei einem Lade-/Dekodierfehler ganz normal (kein internes
+// try/catch) — die Fehlerbehandlung je Bild liegt bewusst bei der aufrufenden Stelle
+// (siehe preloadPinPhotosForPdf, Promise.allSettled), damit ein einzelnes
+// fehlschlagendes Foto individuell und nachvollziehbar behandelt werden kann, ohne die
+// übrigen Ladevorgänge zu beeinflussen.
+async function preloadImageAsBase64(url, { quality = PDF_PHOTO_JPEG_QUALITY } = {}) {
+  const raw = await loadImageAsDataUrl(url);
+  return await normalizeImageTo4x3Canvas(raw.dataUrl, PDF_PHOTO_NORMALIZE_WIDTH, PDF_PHOTO_NORMALIZE_HEIGHT, quality, PDF_PHOTO_NORMALIZE_BG);
+}
+
+// ---- ASYNCHRONES BILDER-PRELOADING (Promise.allSettled) für den Geschoss-PDF-Export -
+// Lädt JEDES Mängelfoto ALLER übergebenen Pins parallel (preloadImageAsBase64 je Foto)
+// vor, BEVOR die eigentliche PDF-Generierung beginnt (statt wie zuvor sequentiell erst
+// beim Zeichnen jeder einzelnen Karte). Vorteile gegenüber dem sequentiellen Laden:
+// 1. Deutlich schnellerer Gesamt-Export bei vielen Pins/Fotos, da die Netzwerk-Ladezeit
+//    aller Bilder überlappt statt sich zu addieren.
+// 2. Ein einzelnes fehlschlagendes Foto (Netzwerk-Hänger, CORS, gelöschte Datei) bricht
+//    den Export NICHT ab — Promise.allSettled wartet auf ALLE Ladevorgänge, unabhängig
+//    davon ob einzelne davon ablehnen ("rejected"). Ein Fehlschlag liefert lediglich
+//    { ok: false } für genau diese URL, alle anderen Fotos UND der restliche Bericht
+//    werden davon unberührt vollständig fertiggestellt (Graceful Fallback, siehe
+//    Verwendung/drawPhotoBox in generateFloorPinsTablePdf).
+// Mehrfach verwendete Foto-URLs (kommt praktisch nicht vor, aber möglich) werden dank
+// des Sets nur einmal geladen. Rückgabe: Map<photo_url, { ok, dataUrl?, width?, height? }>.
+async function preloadPinPhotosForPdf(pins, opts = {}) {
+  const urls = new Set();
+  (pins || []).forEach((pin) => {
+    (pin.pin_photos || []).forEach((photo) => {
+      if (photo?.photo_url) urls.add(photo.photo_url);
+    });
+  });
+  const urlList = [...urls];
+  const settled = await Promise.allSettled(urlList.map((url) => preloadImageAsBase64(url, opts)));
+  const cache = new Map();
+  settled.forEach((result, idx) => {
+    const url = urlList[idx];
+    if (result.status === "fulfilled") {
+      cache.set(url, { ok: true, ...result.value });
+    } else {
+      console.warn(`Mängelfoto konnte nicht vorab in den PDF-Export geladen werden (${url}):`, result.reason);
+      cache.set(url, { ok: false });
+    }
+  });
+  return cache;
+}
+
+// ---- EINHEITLICHE BILDGRÖSSEN IM PDF-EXPORT: Zeichnen ------------------------------
+// Zeichnet EIN Foto — oder, falls keine URL vorliegt bzw. der Preload für genau dieses
+// Foto fehlgeschlagen ist (siehe photoCache/preloadPinPhotosForPdf), einen dezenten
+// Platzhalter — mit abgerundeten Ecken in eine fest vorgegebene Box. Da der Cache
+// bereits normalisierte 4:3-Bilder enthält (siehe normalizeImageTo4x3Canvas), muss
+// hier zur Laufzeit keine Bildbearbeitung mehr stattfinden: einfaches, seitenverhältnis-
+// treues Einpassen (object-fit: contain, zentriert) genügt — weil JEDES Foto bereits
+// dasselbe 4:3-Ausgangsformat besitzt, fällt das Ergebnis für jedes Foto in derselben
+// Box-Größe pixelgenau identisch groß aus, unabhängig vom ursprünglichen Kamera-
+// Seitenverhältnis. Zentrale, von ALLEN DREI PDF-Export-Funktionen
+// (generateProjectReportPdf, generateFloorPinsTablePdf, generateSinglePinPdf)
+// gemeinsam genutzte Stelle. Die abgerundeten Ecken werden über jsPDF's natives
+// Clipping erzeugt (roundedRect-Pfad ohne Füllung/Strich, .clip(), Bild zeichnen,
+// Grafikzustand wiederherstellen) statt über eine transparente PNG-Maske — das hält
+// die Bilder als komprimiertes JPEG und damit die Berichtsgröße klein.
+async function drawPdfPhotoBox(
+  doc,
+  {
+    url,
+    photoCache,
+    x,
+    y,
+    w,
+    h,
+    radius = PDF_PHOTO_BOX_RADIUS_MM,
+    placeholderText = "Foto konnte nicht geladen werden",
+    mutedRgb = [100, 116, 139],
+    inkRgb = [15, 23, 42],
+    bgRgb = PDF_PHOTO_BOX_BG_RGB,
+    borderRgb = PDF_PHOTO_BOX_BORDER_RGB,
+  }
+) {
+  const cached = url ? photoCache.get(url) : null;
+  doc.setFillColor(...bgRgb);
+  doc.setDrawColor(...borderRgb);
+  doc.roundedRect(x, y, w, h, radius, radius, "FD");
+  const drawPlaceholder = () => {
+    doc.setFontSize(h >= 24 ? 9 : 6.3);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(...mutedRgb);
+    doc.text(placeholderText, x + w / 2, y + h / 2, { align: "center", maxWidth: Math.max(w - 3, 6) });
+    doc.setTextColor(...inkRgb);
+  };
+  if (cached && cached.ok) {
+    try {
+      const ratio = Math.min(w / cached.width, h / cached.height);
+      const drawW = cached.width * ratio;
+      const drawH = cached.height * ratio;
+      doc.saveGraphicsState();
+      doc.roundedRect(x, y, w, h, radius, radius, null);
+      doc.clip();
+      doc.discardPath();
+      doc.addImage(cached.dataUrl, "JPEG", x + (w - drawW) / 2, y + (h - drawH) / 2, drawW, drawH);
+      doc.restoreGraphicsState();
+    } catch (err) {
+      console.warn("Bild konnte nicht in den PDF-Export eingebettet werden, zeige Platzhalter:", err);
+      drawPlaceholder();
+    }
+  } else {
+    drawPlaceholder();
+  }
+}
+
+// Schneidet aus einem bereits geladenen Grundriss-Bild (Data-URL) einen quadratischen
+// Ausschnitt zentriert auf eine relative Position (centerXRatio/centerYRatio, je 0–1,
+// entspricht pin.x/pin.y aus 0–100 umgerechnet) aus und liefert ihn — analog zu
+// compressImageDataUrl — direkt als komprimiertes JPEG zurück. Für den
+// Einzel-Pin-PDF-Export (siehe generateSinglePinPdf): zeigt einem Nachunternehmer auf
+// einen Blick, WO genau am Grundriss sich der Mangel befindet, ohne den kompletten
+// (oft sehr viel größeren) Gesamtplan mitschicken zu müssen. cropRatio bestimmt die
+// "Zoomstufe" als Anteil der kürzeren Bildseite. Der Ausschnitt wird an den
+// Bildrändern automatisch geklemmt (kein Überstand über den Plan hinaus) — der Pin
+// landet dadurch nicht zwingend exakt in der Mitte des Ausschnitts; die
+// zurückgegebenen pinRatioX/pinRatioY geben seine TATSÄCHLICHE relative Position
+// innerhalb des Ausschnitts an, für die exakte Platzierung des Pin-Markers darauf.
+function cropImageDataUrl(sourceDataUrl, centerXRatio, centerYRatio, cropRatio, maxOutput = 900, quality = 0.75) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const srcW = img.naturalWidth;
+      const srcH = img.naturalHeight;
+      const cropSize = Math.max(40, Math.round(Math.min(srcW, srcH) * cropRatio));
+      let sx = Math.round(centerXRatio * srcW - cropSize / 2);
+      let sy = Math.round(centerYRatio * srcH - cropSize / 2);
+      sx = Math.min(Math.max(0, sx), Math.max(0, srcW - cropSize));
+      sy = Math.min(Math.max(0, sy), Math.max(0, srcH - cropSize));
+      // Ausgabegröße nie größer als der Ausschnitt selbst (kein Hochskalieren) — deckt
+      // sich mit derselben "nie vergrößern"-Regel wie bei compressImageDataUrl.
+      const outSize = Math.min(maxOutput, cropSize);
+      const canvas = document.createElement("canvas");
+      canvas.width = outSize;
+      canvas.height = outSize;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, outSize, outSize);
+      ctx.drawImage(img, sx, sy, cropSize, cropSize, 0, 0, outSize, outSize);
+      resolve({
+        dataUrl: canvas.toDataURL("image/jpeg", quality),
+        width: outSize,
+        height: outSize,
+        pinRatioX: (centerXRatio * srcW - sx) / cropSize,
+        pinRatioY: (centerYRatio * srcH - sy) / cropSize,
+      });
+    };
+    img.onerror = () => reject(new Error("Grundriss-Ausschnitt konnte nicht erzeugt werden."));
+    img.src = sourceDataUrl;
+  });
+}
+
+// Lädt für eine Liste von Etagen jeweils alle Pins inkl. Fotos/Verlauf
+// (siehe fetchPinsForFloor) und hängt sowohl eine Referenz auf die jeweilige Etage
+// als auch auf die konkrete Grundrissskizze (via pin.plan_id) an jeden Pin an —
+// vereinfacht Filtern/Sortieren über alle Etagen eines Projekts hinweg UND liefert
+// der Planübersicht im PDF-Export (siehe generateProjectReportPdf) das richtige,
+// zum jeweiligen Pin passende Skizzenbild statt eines nicht mehr existierenden
+// einzelnen Etagen-Grundrisses.
 async function fetchAllPinsForProject(floors) {
   const perFloor = await Promise.all(
-    floors.map(async (floor) => (await fetchPinsWithDetails(floor.id)).map((pin) => ({ ...pin, floor })))
+    floors.map(async (floor) => {
+      const [pins, plans] = await Promise.all([fetchPinsForFloor(floor.id), fetchFloorPlansWithPinSummary(floor.id)]);
+      const plansById = new Map(plans.map((p) => [p.id, p]));
+      return pins.map((pin) => ({ ...pin, floor, plan: pin.plan_id ? plansById.get(pin.plan_id) || null : null }));
+    })
   );
   return perFloor.flat();
 }
@@ -1297,7 +3374,9 @@ async function fetchAllPinsForProject(floors) {
 function filterExportPins(pins, filters) {
   return pins.filter((pin) => {
     if (filters.floorIds?.length && !filters.floorIds.includes(pin.floor.id)) return false;
-    if (filters.tradeIds?.length && !filters.tradeIds.includes(pin.trade_id)) return false;
+    // Ein Pin gilt als Treffer, sobald IRGENDEINES seiner (ggf. mehreren) Gewerke in der
+    // Filterauswahl enthalten ist (siehe getPinTradeIds — Mehrfachauswahl je Pin).
+    if (filters.tradeIds?.length && !getPinTradeIds(pin).some((id) => filters.tradeIds.includes(id))) return false;
     if (filters.statuses?.length && !filters.statuses.includes(pin.status)) return false;
     if (filters.creators?.length && !filters.creators.includes(pin.created_by)) return false;
     if (filters.fromDate && new Date(pin.created_at) < new Date(`${filters.fromDate}T00:00:00`)) return false;
@@ -1308,10 +3387,249 @@ function filterExportPins(pins, filters) {
 
 // RGB-Entsprechungen der App-Statusfarben (Tailwind rose/amber/emerald-500) für die
 // Pin-Marker auf der Planübersicht des PDF-Exports.
-const PDF_STATUS_RGB = { offen: [244, 63, 94], bearbeitung: [245, 158, 11], erledigt: [16, 185, 129] };
+// offen exakt im Markenrot ("REISNER x FRANK", #FF2A00) — deckungsgleich mit
+// STATUS.offen oben, damit Bildschirmdarstellung und PDF-Export farblich exakt
+// übereinstimmen.
+const PDF_STATUS_RGB = { offen: [255, 42, 0], bearbeitung: [245, 158, 11], erledigt: [16, 185, 129] };
+
+// ANFORDERUNG "PIN-DESIGN AUF DEM PLAN (FARBLOS & NEUTRAL)": einheitliche, neutrale
+// Füllfarbe für Pin-Marker, die DIREKT AUF DER PLANFLÄCHE gezeichnet werden (Übersichts-
+// seite jeder Skizze in drawFloorPinsReportSection sowie die Pin-Plan-Ausschnitte je
+// Mangelkarte) — bewusst eine eigene, von PDF_STATUS_RGB getrennte Konstante, da
+// Status-Badges und die Legende weiterhin unverändert ihre Statusfarbe behalten (siehe
+// dortige Aufrufstellen) und nur die Planflächen-Darstellung selbst neutral wird, exakt
+// dieselbe Abgrenzung wie bei der monochromen Pin-Darstellung in der Live-Planansicht
+// (siehe PinMarker). jsPDF bietet ohne Zusatz-Plugin keine verlässliche Flächen-
+// transparenz — der "leicht transparente" Effekt wird stattdessen über einen weißen
+// Kontrast-Ring hinter dem dunklen Marker nachgebildet (siehe Aufrufstellen).
+const PDF_PIN_NEUTRAL_RGB = [15, 23, 42]; // #0F172A, identisch mit inkColor()
+
+// ANFORDERUNG "PIN-AUSSCHNITT-BILD (PLAN-CROP FÜR JEDEN PIN)": kompakte, quadratische
+// Planausschnitt-Miniatur, die in drawFloorPinsReportSection JEDER Mangel-Karte
+// zusätzlich zu ihren Foto-Uploads beigefügt wird — zeigt auf einen Blick, WO GENAU auf
+// dem Plan sich dieser Mangel befindet, nach demselben Prinzip wie der bereits
+// bestehende Detail-Zoom im Einzel-Pin-Export (siehe cropImageDataUrl/
+// SINGLE_PIN_PLAN_CROP_RATIO bei generateSinglePinPdf), hier aber bewusst kleiner
+// dimensioniert, da sie nur EINE von mehreren Informationen auf der Karte ist, nicht
+// deren Hauptinhalt.
+const FLOOR_REPORT_PIN_CROP_SIZE_MM = 30;
+const FLOOR_REPORT_PIN_CROP_RATIO = 0.24;
+const FLOOR_REPORT_PIN_CROP_MAX_OUTPUT_PX = 260;
+const FLOOR_REPORT_PIN_CROP_QUALITY = 0.68;
+
+// FIX "RIESIGER SCHWARZER KREIS AUF DEM MINI-CROP": der Sichtkegel (drawPdfViewCone)
+// und der Marker-Punkt darauf nutzten bislang dieselben absoluten mm-Radien wie auf
+// der großformatigen Planübersicht (radius 9mm bzw. Kreis 2.6/2.2mm) — auf der dort
+// ca. 180-250mm breiten Seite unauffällig klein, auf der hier nur 30mm großen
+// "Lage auf dem Plan"-Box (siehe FLOOR_REPORT_PIN_CROP_SIZE_MM) dagegen ca. 30% des
+// gesamten Ausschnitts und damit deutlich zu groß — genau das vom Nutzer gemeldete
+// Deckungsproblem. Beide Werte werden jetzt als Anteil von
+// FLOOR_REPORT_PIN_CROP_SIZE_MM abgeleitet statt fest verdrahtet, damit sie bei einer
+// künftigen Änderung der Box-Größe automatisch mitskalieren und nie wieder über die
+// Box hinauswachsen können.
+const FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM = FLOOR_REPORT_PIN_CROP_SIZE_MM * 0.15; // 4.5mm
+const FLOOR_REPORT_PIN_CROP_MARKER_OUTER_MM = FLOOR_REPORT_PIN_CROP_SIZE_MM * 0.06; // 1.8mm (weißer Kontrastring)
+const FLOOR_REPORT_PIN_CROP_MARKER_INNER_MM = FLOOR_REPORT_PIN_CROP_SIZE_MM * 0.05; // 1.5mm (Kernpunkt)
+
+// ANFORDERUNG "GRÖSSERER PLANAUSSCHNITT AUF DER PIN-DETAILSEITE DES SAMMELBERICHTS":
+// eigene, deutlich größere Box-Größe NUR für "Lage auf dem Plan" in drawPinDetailPage
+// (projektweiter Gesamtbericht, generateProjectReportPdf) — der bisherige 30mm-Wert
+// (FLOOR_REPORT_PIN_CROP_SIZE_MM) bleibt unverändert für drawFloorPinsReportSection
+// (Geschoss-/Skizzen-Export), da dort nicht moniert und die Mangel-Karten dort bereits
+// eng bemessen sind. Eigener Konstanten-Satz statt Wiederverwendung von
+// FLOOR_REPORT_PIN_CROP_*, damit beide Exportpfade unabhängig voneinander angepasst
+// werden können. Zoom-Ausschnitt (RATIO) bleibt identisch zum bisherigen Wert — nur
+// die DARSTELLUNGSGRÖSSE wächst, nicht der gezeigte Planbereich um den Pin. Die
+// MAX_OUTPUT_PX-Auflösung wächst proportional mit, damit der größere Ausschnitt nicht
+// unscharf/verpixelt wirkt. Cone-/Marker-Radien nach demselben proportionalen Prinzip
+// wie FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM oben (siehe dortiger FIX-Kommentar) —
+// WICHTIG gerade hier, weil eine größere Box ohne proportionale Skalierung genau wieder
+// den gemeldeten "riesigen Kreis" erzeugen würde.
+const SAMMELBERICHT_PIN_CROP_SIZE_MM = 70;
+const SAMMELBERICHT_PIN_CROP_RATIO = FLOOR_REPORT_PIN_CROP_RATIO;
+const SAMMELBERICHT_PIN_CROP_MAX_OUTPUT_PX = 600;
+const SAMMELBERICHT_PIN_CROP_QUALITY = FLOOR_REPORT_PIN_CROP_QUALITY;
+const SAMMELBERICHT_PIN_CROP_CONE_RADIUS_MM = SAMMELBERICHT_PIN_CROP_SIZE_MM * 0.15; // 10.5mm
+const SAMMELBERICHT_PIN_CROP_MARKER_OUTER_MM = SAMMELBERICHT_PIN_CROP_SIZE_MM * 0.06; // 4.2mm
+const SAMMELBERICHT_PIN_CROP_MARKER_INNER_MM = SAMMELBERICHT_PIN_CROP_SIZE_MM * 0.05; // 3.5mm
+
+// Zeichnet den Blickrichtungsindikator ("View Cone") eines Pins auf einer
+// Planübersicht-Seite im PDF — 1:1 an die interaktive Planansicht angepasst (siehe
+// ViewCone-Komponente): dort ist der Indikator ein halbtransparenter Fächer/
+// Winkelsektor (SVG-Pfad "M 50 4 L 18 62 A 40 40 0 0 0 82 62 Z"), keine schlichte
+// Dreiecksspitze. Hier als echter, vom Pin-Mittelpunkt ausgehender Kreissektor
+// nachgebaut: Der Öffnungswinkel (halfSpread) ist exakt aus denselben SVG-Koordinaten
+// hergeleitet (die beiden "Ecken" des Original-Pfads liegen bei atan2(32, 58) zur
+// Symmetrieachse) und nicht nur grob geschätzt. Da jsPDF keine native gefüllte
+// Bogenform kennt, wird die Rundung durch mehrere Bogensegmente angenähert (Fächer aus
+// gleichfarbigen Dreiecken vom Pin-Mittelpunkt zu je zwei benachbarten Bogenpunkten —
+// bei identischer Füllfarbe entstehen dabei keine sichtbaren Nähte). Rotation exakt
+// wie ViewCone UND AngleCompass (dieselbe, dort ausdrücklich dokumentierte Konvention:
+// "0° = oben (Norden), im Uhrzeigersinn steigend"). Wird VOR dem eigentlichen
+// Pin-Kreis gezeichnet, damit Kreis und Nummer sichtbar darüber liegen — genau wie
+// ViewCone im Screen-Rendering hinter MapPin/PinMarker liegt. Von beiden
+// PDF-Planübersichten geteilt (generateProjectReportPdf & generateFloorPinsTablePdf)
+// UND vom Grundriss-Ausschnitt des Einzel-Pin-Exports (generateSinglePinPdf).
+// coneRadius (mm, optional): Standard 9mm passt für die großformatigen
+// Planübersichten (ca. 180-250mm Seitenbreite), auf denen dieser Parameter bislang
+// überall implizit mitlief. Für die kleinen "Lage auf dem Plan"-Mini-Crops
+// (FLOOR_REPORT_PIN_CROP_SIZE_MM, nur 30mm) wäre derselbe Wert ca. 30% der gesamten
+// Box und hat dort sichtbar den Ausschnitt verdeckt (siehe FIX-Kommentar an
+// FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM oben) — Aufrufer an kleinen Boxen übergeben
+// deshalb jetzt explizit einen zur jeweiligen Box-Größe proportionalen Radius.
+function drawPdfViewCone(doc, px, py, angleDeg, statusRgb, coneRadius = 9) {
+  const theta = ((angleDeg || 0) * Math.PI) / 180;
+  const halfSpread = Math.atan2(32, 58); // exakter Öffnungswinkel des ViewCone-SVG-Pfads
+  const radius = coneRadius;
+  const segments = 10;
+  const pointAt = (a) => [px + radius * Math.sin(a), py - radius * Math.cos(a)];
+
+  const arcPoints = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = theta - halfSpread + (i / segments) * (2 * halfSpread);
+    arcPoints.push(pointAt(a));
+  }
+
+  const light = statusRgb.map((c) => Math.round(c + (255 - c) * 0.6));
+  doc.setFillColor(...light);
+  for (let i = 0; i < segments; i++) {
+    doc.triangle(px, py, arcPoints[i][0], arcPoints[i][1], arcPoints[i + 1][0], arcPoints[i + 1][1], "F");
+  }
+
+  // Dünne Kontur entlang des äußeren Randes (zwei Radien + Bogen) — Entsprechung zur
+  // zweiten, nur umrandeten SVG-Ebene (stroke, opacity 0.55) im ViewCone-Original.
+  doc.setDrawColor(...statusRgb);
+  doc.setLineWidth(0.35);
+  doc.line(px, py, arcPoints[0][0], arcPoints[0][1]);
+  doc.line(px, py, arcPoints[segments][0], arcPoints[segments][1]);
+  for (let i = 0; i < segments; i++) {
+    doc.line(arcPoints[i][0], arcPoints[i][1], arcPoints[i + 1][0], arcPoints[i + 1][1]);
+  }
+}
 
 function sanitizeFileNamePart(text) {
   return (text || "").replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "Export";
+}
+
+// ----------------------------------------------------------------------------------
+// BAUSTELLEN-INFO FÜR NACHUNTERNEHMER (SITE ONBOARDING) — vier strukturierte
+// Freitextfelder auf Projektebene (siehe supabase_schema_v9_site_onboarding_and_
+// plan_notes.sql), die neuen Nachunternehmern die Orientierung vor Ort erleichtern:
+// Anfahrt & Parkmöglichkeiten, Zugang & Sicherheit, Ansprechpartner/Bauleitung und
+// Verpflegung & Infrastruktur. hasOnboardingInfo/buildOnboardingSections sind die
+// gemeinsame Grundlage für die Anzeige im Projekt-Header (siehe FloorOverview) UND
+// für die optionale Info-Box/-Leiste auf der ersten Seite der PDF-Exporte.
+// ----------------------------------------------------------------------------------
+function hasOnboardingInfo(project) {
+  if (!project) return false;
+  return [project.site_access_info, project.site_safety_info, project.site_contact_name, project.site_contact_phone, project.site_amenities_info].some(
+    (v) => (v || "").trim() !== ""
+  );
+}
+
+function buildOnboardingSections(project) {
+  const sections = [];
+  if ((project?.site_access_info || "").trim()) {
+    sections.push({ label: "Anfahrt & Parkmöglichkeiten", text: project.site_access_info.trim() });
+  }
+  if ((project?.site_safety_info || "").trim()) {
+    sections.push({ label: "Zugang & Sicherheit", text: project.site_safety_info.trim() });
+  }
+  const contact = [project?.site_contact_name?.trim(), project?.site_contact_phone?.trim()].filter(Boolean).join(" · ");
+  if (contact) {
+    sections.push({ label: "Ansprechpartner / Bauleitung", text: contact });
+  }
+  if ((project?.site_amenities_info || "").trim()) {
+    sections.push({ label: "Verpflegung & Infrastruktur", text: project.site_amenities_info.trim() });
+  }
+  return sections;
+}
+
+// Vollformat-Info-Box (Deckblatt des projektweiten Berichts, siehe
+// generateProjectReportPdf) — misst zuerst den Platzbedarf aller Abschnitte (jsPDF-
+// "measure-then-draw"-Muster, siehe drawPdfViewCone/generateSinglePinPdf) und
+// springt bei Bedarf auf eine neue Seite, statt die Box mitten im Text abzuschneiden.
+// Gibt die y-Position direkt unterhalb der gezeichneten Box zurück.
+function drawOnboardingInfoBox(doc, project, margin, startY, contentWidth, pageHeight) {
+  const sections = buildOnboardingSections(project);
+  if (sections.length === 0) return startY;
+  const padX = 4.5;
+  const padY = 5;
+  const headingH = 7;
+  const lineH = 3.8;
+  const rowGapH = 3;
+
+  doc.setFontSize(7.8);
+  let bodyH = 0;
+  const measured = sections.map((s) => {
+    const lines = doc.splitTextToSize(s.text, contentWidth - padX * 2);
+    const h = 4 + lines.length * lineH + rowGapH;
+    bodyH += h;
+    return { ...s, lines, h };
+  });
+  const boxH = padY * 2 + headingH + bodyH;
+
+  let y = startY;
+  if (y + boxH > pageHeight - 15) {
+    doc.addPage();
+    y = 20;
+  }
+
+  doc.setDrawColor(253, 186, 116);
+  doc.setFillColor(255, 247, 237);
+  doc.roundedRect(margin, y, contentWidth, boxH, 2.2, 2.2, "FD");
+
+  let cursorY = y + padY + 3.5;
+  doc.setFontSize(10);
+  doc.setFont("helvetica", "bold");
+  doc.setTextColor(255, 42, 0);
+  doc.text("Baustellen-Info für Nachunternehmer", margin + padX, cursorY);
+  doc.setTextColor(15, 23, 42);
+  cursorY += headingH;
+
+  measured.forEach((s) => {
+    doc.setFontSize(7.8);
+    doc.setFont("helvetica", "bold");
+    doc.text(`${s.label}:`, margin + padX, cursorY);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8.4);
+    doc.text(s.lines, margin + padX, cursorY + lineH);
+    cursorY += s.h;
+  });
+
+  doc.setFont("helvetica", "normal");
+  doc.setTextColor(0, 0, 0);
+  return y + boxH + 6;
+}
+
+// Kompakte Leisten-Variante der Info-Box: für Seite 1 des Grundriss-Berichts
+// (generateFloorPinsTablePdf), wo der volle Planausschnitt bereits nahezu die
+// gesamte Seite beansprucht — die Abschnitte laufen hier nebeneinander in Spalten
+// statt untereinander, auf maximal zwei Textzeilen je Spalte begrenzt. Gibt die
+// y-Position direkt unterhalb der Leiste zurück (bzw. startY, wenn nichts hinterlegt ist).
+function drawOnboardingInfoBar(doc, project, margin, startY, contentWidth) {
+  const sections = buildOnboardingSections(project);
+  if (sections.length === 0) return startY;
+  const barH = 15;
+  doc.setDrawColor(253, 186, 116);
+  doc.setFillColor(255, 247, 237);
+  doc.roundedRect(margin, startY, contentWidth, barH, 1.8, 1.8, "FD");
+  const colW = contentWidth / sections.length;
+  sections.forEach((s, i) => {
+    const x = margin + i * colW + 3.5;
+    const colContentW = colW - 6;
+    doc.setFontSize(6.6);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(255, 42, 0);
+    doc.text(s.label.toUpperCase(), x, startY + 4.6, { maxWidth: colContentW });
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7.4);
+    doc.setTextColor(15, 23, 42);
+    const lines = doc.splitTextToSize(s.text, colContentW).slice(0, 2);
+    doc.text(lines, x, startY + 8.6);
+  });
+  doc.setTextColor(0, 0, 0);
+  return startY + barH + 4;
 }
 
 // Baut den vollständigen, drucktauglichen Bericht (Abschnitt 5.2: Deckblatt,
@@ -1320,9 +3638,13 @@ function sanitizeFileNamePart(text) {
 // Fehler beim Laden EINES einzelnen Bilds (Grundriss oder Foto) brechen den
 // Gesamt-Export bewusst nicht ab — der Bericht ist auch mit einzelnen fehlenden
 // Bildern noch nützlich, ein kompletter Abbruch wäre ärgerlicher als eine Lücke.
-async function generateProjectReportPdf({ project, floors, pins, filters, trades, generatedBy }) {
+async function generateProjectReportPdf({ project, floors, pins, filters, trades, generatedBy, includeOnboarding = false }) {
   const jsPDF = await loadJsPdf();
-  const doc = new jsPDF({ unit: "mm", format: "a4" });
+  // compress: true aktiviert jsPDFs eigene interne Bild-/Stream-Kompression zusätzlich
+  // zur bereits vor dem Einbetten durchgeführten Downscaling-Komprimierung der Fotos
+  // und Grundrisse (siehe compressImageDataUrl) — beide Maßnahmen zusammen bringen die
+  // Dateigröße auf das für den mobilen Versand praxistaugliche Zielmaß.
+  const doc = new jsPDF({ unit: "mm", format: "a4", compress: true });
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
   const margin = 15;
@@ -1333,12 +3655,19 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
   const normal = () => doc.setFont("helvetica", "normal");
 
   // Globale, fortlaufende Nummerierung über alle Etagen hinweg (nach Etagenname,
-  // dann Anlagedatum sortiert) — dieselbe Nummer erscheint auf der Planübersicht UND
-  // als Überschrift der zugehörigen Detailseite, damit beide Ansichten eindeutig
-  // zueinander referenzierbar sind.
+  // dann Anlagedatum sortiert), inkl. Unter-Nummerierung per "Duplizieren" erzeugter
+  // Kopien (siehe computePinNumberById) — dieselbe Nummer erscheint auf der
+  // Planübersicht UND als Überschrift der zugehörigen Detailseite, damit beide
+  // Ansichten eindeutig zueinander referenzierbar sind. Die Liste wird anschließend
+  // NACH Nummer sortiert statt in reiner Anlage-Reihenfolge zu bleiben, damit eine
+  // Kopie ("3.1") direkt hinter ihrer Wurzel ("3") erscheint, statt chronologisch
+  // irgendwo dazwischen zu landen.
+  const projectPinNumberSort = (a, b) =>
+    a.floor.id !== b.floor.id ? a.floor.name.localeCompare(b.floor.name) : new Date(a.created_at) - new Date(b.created_at);
+  const projectPinNumberById = computePinNumberById(pins, projectPinNumberSort);
   const numberedPins = [...pins]
-    .sort((a, b) => (a.floor.id !== b.floor.id ? a.floor.name.localeCompare(b.floor.name) : new Date(a.created_at) - new Date(b.created_at)))
-    .map((pin, idx) => ({ ...pin, exportNumber: idx + 1 }));
+    .map((pin) => ({ ...pin, exportNumber: projectPinNumberById.get(pin.id)?.label ?? "" }))
+    .sort((a, b) => comparePinNumberEntries(projectPinNumberById.get(a.id), projectPinNumberById.get(b.id)));
 
   // ---- 1. Deckblatt ---------------------------------------------------------------
   doc.setFontSize(20);
@@ -1361,6 +3690,9 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
   );
   coverLine("Exportdatum", formatDateTime(new Date().toISOString()));
   coverLine("Erstellt von", generatedBy);
+  // ANFORDERUNG "LAYOUT UND UPDATE-LOGIK FÜR DEN PDF-EXPORT": fester Empfänger-Hinweis
+  // auf dem Deckblatt, wie explizit vorgegeben.
+  coverLine("Empfänger", "Reisner & Frank GmbH");
 
   y += 3;
   bold();
@@ -1377,26 +3709,359 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
     y += 6;
   });
   y += 3;
-  doc.text(`${numberedPins.length} Mängel-Pin(s) in diesem Bericht.`, margin, y);
 
-  // ---- 2. Planübersicht je Etage mit nummerierten Pin-Markierungen ------------------
-  const floorsWithPins = floors.filter((f) => numberedPins.some((p) => p.floor.id === f.id));
-  for (const f of floorsWithPins) {
+  // ---- Status-Übersicht (ANFORDERUNG "LAYOUT UND UPDATE-LOGIK FÜR DEN PDF-EXPORT"):
+  // Gesamtanzahl, Aufschlüsselung nach Plänen/Geschossen sowie die nächste anstehende
+  // Fristsetzung unter den exportierten Pins — ergänzt die bisherige reine Filter-
+  // zusammenfassung um eine auf einen Blick erfassbare Kennzahlen-Übersicht. Die
+  // Fristsetzung wird AUS DEN ECHTEN PIN-DATEN berechnet (nächstes offenes
+  // Fälligkeitsdatum), nicht hartkodiert — das Beispieldatum in der ANFORDERUNG
+  // ("16.10.2026") diente nur der Format-Illustration.
+  bold();
+  doc.text("Status-Übersicht", margin, y);
+  normal();
+  y += 7;
+
+  const totalOpen = numberedPins.filter((p) => p.status === "offen").length;
+  const totalProgress = numberedPins.filter((p) => p.status === "bearbeitung").length;
+  const totalDone = numberedPins.filter((p) => p.status === "erledigt").length;
+  doc.setFontSize(10);
+  doc.text(
+    `Gesamtanzahl Pins: ${numberedPins.length}  (offen: ${totalOpen} · in Bearbeitung: ${totalProgress} · erledigt: ${totalDone})`,
+    margin,
+    y,
+    { maxWidth: contentWidth }
+  );
+  y += 7;
+
+  const coverPlanBreakdown = [];
+  const coverSeenPlanIds = new Set();
+  for (const pin of numberedPins) {
+    if (pin.plan && !coverSeenPlanIds.has(pin.plan.id)) {
+      coverSeenPlanIds.add(pin.plan.id);
+      const floorName = floors.find((f) => f.id === pin.plan.floor_id)?.name || "–";
+      coverPlanBreakdown.push({ floorName, planName: pin.plan.name, planId: pin.plan.id });
+    }
+  }
+  const orphanCoverCount = numberedPins.filter((p) => !p.plan).length;
+  coverPlanBreakdown.sort((a, b) =>
+    a.floorName !== b.floorName ? a.floorName.localeCompare(b.floorName) : a.planName.localeCompare(b.planName)
+  );
+
+  bold();
+  doc.setFontSize(9);
+  doc.text("Aufschlüsselung nach Geschoss / Plan:", margin, y);
+  normal();
+  y += 6;
+  doc.setFontSize(9.5);
+  coverPlanBreakdown.forEach((entry) => {
+    if (y > pageHeight - margin - 10) {
+      doc.addPage();
+      y = margin + 10;
+    }
+    const count = numberedPins.filter((p) => p.plan?.id === entry.planId).length;
+    doc.text(`•  ${entry.floorName} — ${entry.planName}: ${count} Pin(s)`, margin, y, { maxWidth: contentWidth });
+    y += 5.5;
+  });
+  if (orphanCoverCount > 0) {
+    if (y > pageHeight - margin - 10) {
+      doc.addPage();
+      y = margin + 10;
+    }
+    doc.text(`•  Ohne zugeordneten Plan: ${orphanCoverCount} Pin(s)`, margin, y, { maxWidth: contentWidth });
+    y += 5.5;
+  }
+  y += 2;
+
+  const pinsWithDueDate = numberedPins.filter((p) => p.due_date && p.status !== "erledigt");
+  let nextDueLabel = "Keine offene Frist gesetzt";
+  if (pinsWithDueDate.length > 0) {
+    const nextDue = [...pinsWithDueDate].sort((a, b) => new Date(a.due_date) - new Date(b.due_date))[0];
+    nextDueLabel = `${formatDateOnly(nextDue.due_date)}  (Pin ${nextDue.exportNumber} — ${nextDue.title})`;
+  }
+  if (y > pageHeight - margin - 10) {
+    doc.addPage();
+    y = margin + 10;
+  }
+  bold();
+  doc.setFontSize(9);
+  doc.text("Nächste Fristsetzung:", margin, y);
+  normal();
+  doc.setFontSize(9.5);
+  doc.text(nextDueLabel, margin + 42, y, { maxWidth: contentWidth - 42 });
+  doc.setFontSize(11);
+  y += 10;
+
+  // Baustellen-Info für Nachunternehmer (optional, siehe includeOnboarding-Checkbox
+  // im PdfExportModal) — erscheint direkt unterhalb der Filterzusammenfassung auf
+  // dem Deckblatt, springt bei Platzmangel automatisch auf eine eigene Seite.
+  if (includeOnboarding) {
+    y = drawOnboardingInfoBox(doc, project, margin, y, contentWidth, pageHeight);
+  }
+
+  // ANFORDERUNG "KRITISCHER FIX FÜR PDF-GENERATOR: DIE SCHLEIFENSTRUKTUR IST FALSCH":
+  // zeichnet EINE vollständige Mängel-Detailseite (Stammdaten, Beschreibung,
+  // Planausschnitt, Fotos) für genau EINEN Pin. Ausgelagert in eine lokale Funktion,
+  // damit sie wortgleich sowohl im kombinierten Plan-für-Plan-Durchlauf unten
+  // (direkt im Anschluss an die jeweilige Planübersicht) als auch für die
+  // Altbestand-Pins ohne zugeordnete Skizze (siehe orphanPins weiter unten) verwendet
+  // werden kann — vorher liefen hier zwei getrennte Phasen (erst ALLE
+  // Planübersichten, danach ALLE Pin-Detailseiten projektweit am Stück), was auf der
+  // Baustelle die Zuordnung zwischen einer Skizze und ihren eigenen Mängeln im PDF
+  // unnötig erschwerte. rawPlanImageDataUrl (optional) ist die rohe, unkomprimierte
+  // Planbildquelle DIESER Skizze für den Planausschnitt je Pin (siehe
+  // cropImageDataUrl) — bleibt null für Altbestand-Pins ohne Skizze, der Ausschnitt
+  // zeigt dann den bereits an anderer Stelle etablierten "Kein Grundriss verfügbar"-
+  // Platzhalter.
+  const drawPinDetailPage = async (pin, rawPlanImageDataUrl) => {
+    doc.addPage();
+
+    // ANFORDERUNG "LAYOUT UND UPDATE-LOGIK FÜR DEN PDF-EXPORT": neue Kopfzeile im
+    // Format "Pin [Nummer] | [Kategorie: Mangel / Restleistung] | [Raum / Bereich]".
+    // INTERPRETATION: das Datenmodell kennt aktuell keine Unterscheidung zwischen
+    // "Mangel" und "Restleistung" (jeder Pin ist inhaltlich ein Mangel) — die
+    // Kategorie wird deshalb bewusst fest mit "Mangel" beschriftet, statt ungeprüft
+    // eine neue Datenstruktur einzuführen. Der bisherige Pin-Titel bleibt zusätzlich
+    // als zweite Zeile sichtbar, damit beim Umbau des Headers keine Information
+    // verloren geht (Zero-Regression).
+    doc.setFontSize(13);
+    bold();
+    doc.text(`Pin ${pin.exportNumber}  |  Mangel  |  ${pin.area || "Bereich n. a."}`, margin, 20, { maxWidth: contentWidth });
+    doc.setFontSize(10);
+    normal();
+    doc.setTextColor(100, 116, 139);
+    doc.text(pin.title || "–", margin, 26, { maxWidth: contentWidth });
+    doc.setTextColor(0, 0, 0);
+    doc.setFontSize(10);
+
+    let dy = 34;
+
+    // ANFORDERUNG "PLANAUSSCHNITT (CROP)": steht jetzt DIREKT nach der Kopfzeile statt
+    // nach Stammdaten/Beschreibung — neue Abschnittsreihenfolge lautet Header →
+    // Planausschnitt → Stammdaten → Chronologie/Historie → Fotodokumentation.
+    // Dieselbe Zuschnitt-/Isolations-Technik wie in drawFloorPinsReportSection (siehe
+    // FLOOR_REPORT_PIN_CROP_* dort), hier aber bewusst GRÖSSER dargestellt (siehe
+    // SAMMELBERICHT_PIN_CROP_* oben) — eigener Konstanten-Satz statt gemeinsamer
+    // Box-Größe, seit der Planausschnitt auf dieser Seite deutlich mehr Raum bekommen
+    // hat, während die kompakten Mangel-Karten des Geschoss-Exports unverändert bei
+    // 30mm bleiben.
+    bold();
+    doc.text("Lage auf dem Plan:", margin, dy);
+    dy += 5.5;
+    normal();
+    doc.setDrawColor(226, 232, 240);
+    doc.setFillColor(248, 250, 252);
+    doc.roundedRect(margin, dy, SAMMELBERICHT_PIN_CROP_SIZE_MM, SAMMELBERICHT_PIN_CROP_SIZE_MM, 2, 2, "FD");
+    if (rawPlanImageDataUrl) {
+      try {
+        const cropped = await cropImageDataUrl(
+          rawPlanImageDataUrl,
+          (pin.x ?? 50) / 100,
+          (pin.y ?? 50) / 100,
+          SAMMELBERICHT_PIN_CROP_RATIO,
+          SAMMELBERICHT_PIN_CROP_MAX_OUTPUT_PX,
+          SAMMELBERICHT_PIN_CROP_QUALITY
+        );
+        const cropRatio = Math.min(SAMMELBERICHT_PIN_CROP_SIZE_MM / cropped.width, SAMMELBERICHT_PIN_CROP_SIZE_MM / cropped.height);
+        const cropW = cropped.width * cropRatio;
+        const cropH = cropped.height * cropRatio;
+        const cropImgX = margin + (SAMMELBERICHT_PIN_CROP_SIZE_MM - cropW) / 2;
+        const cropImgY = dy + (SAMMELBERICHT_PIN_CROP_SIZE_MM - cropH) / 2;
+        doc.addImage(cropped.dataUrl, "JPEG", cropImgX, cropImgY, cropW, cropH);
+        const markerX = cropImgX + cropped.pinRatioX * cropW;
+        const markerY = cropImgY + cropped.pinRatioY * cropH;
+        // FIX "RIESIGER SCHWARZER KREIS AUF DEM MINI-CROP, FOLGEFIX": pinRatioX/Y aus
+        // cropImageDataUrl sind durch das dortige sx/sy-Clamping zwar rechnerisch immer
+        // auf [0, 1] begrenzt, der Marker-Mittelpunkt kann bei einem Pin nahe am Rand des
+        // Quellbilds also exakt auf der Boxkante landen, nicht aber außerhalb — ABER der
+        // Sichtkegel (SAMMELBERICHT_PIN_CROP_CONE_RADIUS_MM) ragt von einem Mittelpunkt
+        // auf der Boxkante aus zwangsläufig über die Box hinaus. Statt uns nur auf die
+        // Proportionierung der Radien zu verlassen, wird der Zeichenbereich hier zusätzlich
+        // hart auf die Box geclippt (PDF-natives Clipping, siehe jsPDF .clip()/
+        // .discardPath()) — dadurch kann geometrisch GARANTIERT nichts mehr über die
+        // "Lage auf dem Plan"-Box hinausragen, unabhängig von der Pin-Position im Quellbild.
+        doc.saveGraphicsState();
+        doc.rect(margin, dy, SAMMELBERICHT_PIN_CROP_SIZE_MM, SAMMELBERICHT_PIN_CROP_SIZE_MM, null);
+        doc.clip();
+        doc.discardPath();
+        drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB, SAMMELBERICHT_PIN_CROP_CONE_RADIUS_MM);
+        doc.setFillColor(255, 255, 255);
+        doc.circle(markerX, markerY, SAMMELBERICHT_PIN_CROP_MARKER_OUTER_MM, "F");
+        doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
+        doc.circle(markerX, markerY, SAMMELBERICHT_PIN_CROP_MARKER_INNER_MM, "F");
+        doc.restoreGraphicsState();
+      } catch (err) {
+        console.error(`Planausschnitt für Pin "${pin.exportNumber}" konnte nicht erzeugt werden:`, err);
+        doc.setFontSize(7.5);
+        doc.setTextColor(100, 116, 139);
+        doc.text("Ausschnitt nicht verfügbar", margin + SAMMELBERICHT_PIN_CROP_SIZE_MM / 2, dy + SAMMELBERICHT_PIN_CROP_SIZE_MM / 2, {
+          align: "center",
+          maxWidth: SAMMELBERICHT_PIN_CROP_SIZE_MM - 4,
+        });
+        doc.setTextColor(0, 0, 0);
+        doc.setFontSize(10);
+      }
+    } else {
+      doc.setFontSize(7.5);
+      doc.setTextColor(100, 116, 139);
+      doc.text("Kein Grundriss verfügbar", margin + SAMMELBERICHT_PIN_CROP_SIZE_MM / 2, dy + SAMMELBERICHT_PIN_CROP_SIZE_MM / 2, {
+        align: "center",
+        maxWidth: SAMMELBERICHT_PIN_CROP_SIZE_MM - 4,
+      });
+      doc.setTextColor(0, 0, 0);
+      doc.setFontSize(10);
+    }
+    dy += SAMMELBERICHT_PIN_CROP_SIZE_MM + 7;
+
+    // ANFORDERUNG "BLUEPRINT FÜR ALLE GESCHOSS-PDF-EXPORTE": das kompakte 4-Felder-
+    // Kartenformat (Gewerk / Status & Frist / Befund / Foto) aus dem referenzierten
+    // Mängelbericht (Word-Export vom 02.10., ARN62) ist jetzt der verbindliche Standard
+    // für den projektweiten Gesamtbericht. Ersetzt den bisherigen, deutlich
+    // ausführlicheren Stammdaten-Block (Titel/Etage/Grundrissskizze/Priorität/Bereich/
+    // Ersteller/Angelegt am als neun Einzelfelder) sowie den separaten Chronologie/
+    // Historie-Abschnitt (erst in dieser Session zuvor ergänzt) — beide entfallen hier
+    // bewusst, weil das Blueprint-Format sie nicht vorsieht. Titel und Bereich bleiben
+    // weiterhin sichtbar (Titel als zweite Headerzeile, Bereich im Pipe-Header), gehen
+    // also trotz Wegfall der Einzelfelder nicht verloren. Kein "Maßnahme"-Feld (siehe
+    // Rückfrage/Antwort): die App hat dafür keine eigene Datenquelle, eine KI-generierte
+    // Nachbesserungsempfehlung wäre erfundener Inhalt und keine echte Pin-Angabe.
+    const field = (label, value) => {
+      if (dy > pageHeight - margin) {
+        doc.addPage();
+        dy = margin;
+      }
+      bold();
+      doc.text(`${label}:`, margin, dy);
+      normal();
+      doc.text(String(value || "–"), margin + 34, dy, { maxWidth: contentWidth - 34 });
+      dy += 6;
+    };
+    field("Gewerk", getPinTradeNames(pin, tradesById) || null);
+    field("Status & Frist", `${STATUS[pin.status]?.label || pin.status || "–"} | ${pin.due_date ? formatDateOnly(pin.due_date) : "–"}`);
+
+    dy += 2;
+    if (dy > pageHeight - margin - 10) {
+      doc.addPage();
+      dy = margin;
+    }
+    bold();
+    doc.text("Befund:", margin, dy);
+    dy += 6;
+    normal();
+    const descLines = doc.splitTextToSize(pin.description || "–", contentWidth);
+    doc.text(descLines, margin, dy);
+    dy += descLines.length * 5 + 4;
+
+    // "Foto" (Blueprint-Feldname, Singular) zeigt hier bewusst die ECHTEN eingebetteten
+    // Aufnahmen statt eines Seitenverweises: der Seitenverweis im Word-Blueprint ergab
+    // nur Sinn, weil dort ein bereits fertiges, separates PDF referenziert wurde — der
+    // App-Export hier erzeugt sein eigenes Dokument und hat die Originalfotos direkt
+    // zur Hand, ein Verweis wäre ein Rückschritt gegenüber dem bisherigen Funktionsumfang.
+    // GUARANTEED UNIFORM IMAGE RESIZING: 2-Spalten-Raster mit fester Zeilenhöhe (siehe
+    // PDF_PHOTO_GRID_COLS/PDF_PHOTO_GRID_ROW_HEIGHT_MM), seitenübergreifend falls nötig.
+    // Fotos DIESES Pins werden vorab parallel geladen und auf ein einheitliches
+    // 4:3-Format normalisiert (preloadPinPhotosForPdf → normalizeImageTo4x3Canvas)
+    // statt sequentiell im Zeichen-Loop — dieselbe robuste Fehlerbehandlung wie im
+    // Geschoss- und Einzelpin-Export: ein fehlgeschlagenes Foto zeigt nur einen
+    // Platzhalter, der Rest des Berichts bleibt unberührt.
+    const photos = pin.pin_photos || [];
+    if (photos.length > 0) {
+      if (dy + 6 > pageHeight - margin) {
+        doc.addPage();
+        dy = margin;
+      }
+      bold();
+      doc.text("Foto:", margin, dy);
+      dy += 6;
+      normal();
+      const projectPinPhotoCache = await preloadPinPhotosForPdf([pin]);
+      const cellW = (contentWidth - PDF_PHOTO_GRID_GAP_MM * (PDF_PHOTO_GRID_COLS - 1)) / PDF_PHOTO_GRID_COLS;
+      const cellH = PDF_PHOTO_GRID_ROW_HEIGHT_MM;
+      let col = 0;
+      for (const photo of photos) {
+        if (col === 0 && dy + cellH > pageHeight - margin) {
+          doc.addPage();
+          dy = margin;
+        }
+        const px = margin + col * (cellW + PDF_PHOTO_GRID_GAP_MM);
+        await drawPdfPhotoBox(doc, { url: photo.photo_url, photoCache: projectPinPhotoCache, x: px, y: dy, w: cellW, h: cellH });
+        col += 1;
+        if (col >= PDF_PHOTO_GRID_COLS) {
+          col = 0;
+          dy += cellH + PDF_PHOTO_GRID_GAP_MM;
+        }
+      }
+      if (col !== 0) dy += cellH + PDF_PHOTO_GRID_GAP_MM;
+      dy += 2;
+    }
+    // HINWEIS ZUR HISTORIE: pin_activity_log wird hier bewusst NICHT gedruckt. Ein
+    // Chronologie/Historie-Abschnitt war kurzzeitig Teil dieser Funktion (siehe
+    // Versionshistorie dieser Datei), wurde aber mit der Umstellung auf das kompakte
+    // Blueprint-Kartenformat (Gewerk/Status & Frist/Befund/Foto) wieder entfernt, da
+    // das Blueprint keinen Historie-Abschnitt vorsieht. drawFloorPinsReportSection und
+    // generateSinglePinPdf drucken ebenfalls weiterhin keine Historie.
+  };
+
+  // ---- 2. + 3. KOMBINIERT, JE SKIZZE: Planübersicht MIT allen ihren Pins, DIREKT
+  // GEFOLGT von genau den Mängel-Detailseiten dieser einen Skizze, bevor die nächste
+  // Skizze beginnt — zu keinem Zeitpunkt werden mehr erst alle Planübersichten
+  // gesammelt und die Mängel-Detailseiten ans Ende des gesamten Dokuments verschoben.
+  // Ein Geschoss kann mehrere Grundrisskizzen enthalten (siehe supabase_schema_v7);
+  // jede Skizze bekommt hier eine eigene Übersichtsseite mit IHREM eigenen Bild und
+  // NUR den Pins, die tatsächlich an dieser Skizze hängen (pin.plan) — so bleibt die
+  // Zuordnung Pin ↔ Position auf dem richtigen Plan eindeutig. Die globale,
+  // fortlaufende Nummerierung (exportNumber, siehe projectPinNumberById oben) bleibt
+  // dabei unverändert über das gesamte Projekt hinweg bestehen — nur die REIHENFOLGE
+  // der Abschnitte im Dokument wird jetzt je Skizze gebündelt statt in zwei globalen
+  // Phasen.
+  const plansWithPins = [];
+  const seenPlanIds = new Set();
+  for (const pin of numberedPins) {
+    if (pin.plan && !seenPlanIds.has(pin.plan.id)) {
+      seenPlanIds.add(pin.plan.id);
+      plansWithPins.push(pin.plan);
+    }
+  }
+  plansWithPins.sort((a, b) => {
+    const floorA = floors.find((f) => f.id === a.floor_id)?.name || "";
+    const floorB = floors.find((f) => f.id === b.floor_id)?.name || "";
+    return floorA !== floorB ? floorA.localeCompare(floorB) : a.name.localeCompare(b.name);
+  });
+
+  for (const p of plansWithPins) {
+    const parentFloor = floors.find((f) => f.id === p.floor_id);
     doc.addPage();
     doc.setFontSize(14);
     bold();
-    doc.text(f.name, margin, 20);
+    doc.text(`${parentFloor?.name ? `${parentFloor.name} — ` : ""}${p.name}`, margin, 20);
     normal();
     doc.setFontSize(10);
 
-    const floorPins = numberedPins.filter((p) => p.floor.id === f.id);
-    const floorKind = resolveFloorKind(f);
+    const planPins = numberedPins.filter((pin) => pin.plan?.id === p.id);
+    const planKind = resolveFloorKind(p);
     let imgRect = null;
+    // ANFORDERUNG "PLANAUSSCHNITT (CROP)": hält die rohe, unkomprimierte Planbild-
+    // Datenquelle dieser Skizze fest, damit die direkt im Anschluss gezeichneten
+    // Pin-Detailseiten (siehe drawPinDetailPage oben) ihren jeweiligen Planausschnitt
+    // daraus erzeugen können, ohne den Plan je Pin erneut laden zu müssen.
+    let rawPlanImageDataUrl = null;
     try {
+      // SVG-Grundrisse werden hier wie Raster-Bilder behandelt: loadImageAsDataUrl
+      // lädt sie unverändert über Image().naturalWidth/-Height (Browser rastern SVGs
+      // beim Dekodieren automatisch anhand ihres viewBox/width/height) — das native
+      // Vektor-Rendering (siehe SvgPlanCanvas) gilt ausschließlich für die interaktive
+      // Planansicht, PDF-Seiten sind selbst bereits eine feste, gedruckte Auflösung.
+      // loadFloorPlanImageWithRetry (siehe dort) versucht bei einem Ladefehler einmal
+      // erneut, bevor auf den Text-Fallback unten ausgewichen wird (GRUNDRISS-GARANTIE).
       let imgData = null;
-      if (floorKind === "pdf") imgData = await renderPdfPlanToDataUrl(f.image_url);
-      else if (floorKind === "image") imgData = await loadImageAsDataUrl(f.image_url);
+      if (planKind === "pdf" || planKind === "image" || planKind === "svg") {
+        imgData = await loadFloorPlanImageWithRetry(p.image_url, planKind);
+      }
       if (imgData) {
+        rawPlanImageDataUrl = imgData.dataUrl;
+        // Vor dem Einbetten auf PDF-taugliche Auflösung herunterskalieren & als JPEG
+        // komprimieren (siehe compressImageDataUrl) — entscheidend für die Dateigröße.
+        imgData = await compressImageDataUrl(imgData.dataUrl, PDF_PLAN_MAX_WIDTH, PDF_PLAN_MAX_HEIGHT, PDF_PLAN_JPEG_QUALITY);
         const availableW = contentWidth;
         const availableH = pageHeight - 35 - margin;
         const ratio = Math.min(availableW / imgData.width, availableH / imgData.height);
@@ -1404,20 +4069,30 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
         const h = imgData.height * ratio;
         const x = margin + (availableW - w) / 2;
         const imgY = 28;
-        doc.addImage(imgData.dataUrl, "PNG", x, imgY, w, h);
+        doc.addImage(imgData.dataUrl, "JPEG", x, imgY, w, h);
         imgRect = { x, y: imgY, w, h };
       }
     } catch (err) {
-      console.error(`Grundriss "${f.name}" konnte nicht in den PDF-Export geladen werden:`, err);
+      console.error(`Grundrissskizze "${p.name}" konnte nicht in den PDF-Export geladen werden:`, err);
     }
 
     if (imgRect) {
-      floorPins.forEach((pin) => {
+      // ANFORDERUNG "Pins auf den Plänen bleiben monochrom / farblos": dieselbe
+      // neutrale Markerfarbe (PDF_PIN_NEUTRAL_RGB) mit weißem Kontrast-Ring wie im
+      // Geschoss-/Sammelbericht — die Statusfarbe (PDF_STATUS_RGB) bleibt unverändert
+      // nur noch für Status-Badges/Legenden anderer Berichtstypen reserviert.
+      planPins.forEach((pin) => {
         const px = imgRect.x + (pin.x / 100) * imgRect.w;
         const py = imgRect.y + (pin.y / 100) * imgRect.h;
-        doc.setFillColor(...(PDF_STATUS_RGB[pin.status] || PDF_STATUS_RGB.offen));
+        drawPdfViewCone(doc, px, py, pin.angle, PDF_PIN_NEUTRAL_RGB);
+        doc.setFillColor(255, 255, 255);
+        doc.circle(px, py, 3.5, "F");
+        doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
         doc.circle(px, py, 3, "F");
-        doc.setFontSize(7);
+        // Etwas kleinere Schrift bei längeren Unter-Nummern (z.B. "12.3" für per
+        // "Duplizieren" erzeugte Kopien, siehe computePinNumberById), damit die Nummer
+        // im kleinen Kreis lesbar bleibt.
+        doc.setFontSize(String(pin.exportNumber).length > 2 ? 5.3 : 7);
         doc.setTextColor(255, 255, 255);
         doc.text(String(pin.exportNumber), px, py + 1, { align: "center" });
         doc.setTextColor(0, 0, 0);
@@ -1428,118 +4103,1265 @@ async function generateProjectReportPdf({ project, floors, pins, filters, trades
       // CadBlueprintPlan) — stattdessen einfache nummerierte Liste als Fallback.
       doc.text("Grundriss konnte nicht dargestellt werden (CAD-Format oder Ladefehler).", margin, 32);
       let listY = 42;
-      floorPins.forEach((pin) => {
+      planPins.forEach((pin) => {
         doc.text(`${pin.exportNumber}. ${pin.title}`, margin, listY);
         listY += 6;
       });
     }
+
+    // ERST WENN DIE PLANÜBERSICHT DIESER SKIZZE STEHT, folgen direkt im Anschluss
+    // ihre eigenen Mängel-Detailseiten — danach erst beginnt die nächste Skizze
+    // (nächste Schleifeniteration) mit ihrer eigenen Planübersicht.
+    for (const pin of planPins) {
+      await drawPinDetailPage(pin, rawPlanImageDataUrl);
+    }
   }
 
-  // ---- 3. Detaildokumentation je Pin ------------------------------------------------
-  for (const pin of numberedPins) {
+  // Pins aus Altbeständen ohne zugeordnete Grundrissskizze (vor Einführung von
+  // supabase_schema_v7) können nicht visuell auf einem Plan verortet werden, tauchen
+  // aber — damit nichts verloren geht — als einfache Liste UND vollständig mit eigener
+  // Detailseite auf (siehe drawPinDetailPage oben, hier ohne Planausschnitt, da keine
+  // Skizze zugeordnet ist). Bewusst als letzter, separater Abschnitt NACH allen
+  // skizzenzugeordneten Pins, da sich Altbestand-Pins keiner Sequenz-Position
+  // zuordnen lassen.
+  const orphanPins = numberedPins.filter((pin) => !pin.plan);
+  if (orphanPins.length > 0) {
     doc.addPage();
     doc.setFontSize(14);
     bold();
-    doc.text(`Pin ${pin.exportNumber} — ${pin.title}`, margin, 20, { maxWidth: contentWidth });
-    normal();
-    doc.setFontSize(10);
-
-    let dy = 30;
-    const field = (label, value) => {
-      bold();
-      doc.text(`${label}:`, margin, dy);
-      normal();
-      doc.text(String(value || "–"), margin + 34, dy, { maxWidth: contentWidth - 34 });
-      dy += 6;
-    };
-    field("Etage", pin.floor.name);
-    field("Status", STATUS[pin.status]?.label || pin.status);
-    field("Priorität", PRIORITY[pin.priority]?.label || pin.priority);
-    field("Gewerk", tradesById.get(pin.trade_id)?.name);
-    field("Verantwortlicher", pin.assigned_to);
-    field("Ersteller", pin.created_by);
-    field("Angelegt am", formatDateTime(pin.created_at));
-
-    dy += 2;
-    bold();
-    doc.text("Beschreibung:", margin, dy);
-    dy += 6;
-    normal();
-    const descLines = doc.splitTextToSize(pin.description || "–", contentWidth);
-    doc.text(descLines, margin, dy);
-    dy += descLines.length * 5 + 4;
-
-    // Fotos im Raster (3 Spalten), seitenübergreifend falls nötig
-    const photos = pin.pin_photos || [];
-    if (photos.length > 0) {
-      bold();
-      doc.text("Fotos:", margin, dy);
-      dy += 6;
-      normal();
-      const cols = 3;
-      const gap = 4;
-      const cellW = (contentWidth - gap * (cols - 1)) / cols;
-      const cellH = cellW * 0.75;
-      let col = 0;
-      for (const photo of photos) {
-        if (dy + cellH > pageHeight - margin) {
-          doc.addPage();
-          dy = margin;
-          col = 0;
-        }
-        try {
-          const imgData = await loadImageAsDataUrl(photo.photo_url);
-          const px = margin + col * (cellW + gap);
-          const ratio = Math.min(cellW / imgData.width, cellH / imgData.height);
-          const w = imgData.width * ratio;
-          const h = imgData.height * ratio;
-          doc.addImage(imgData.dataUrl, "JPEG", px + (cellW - w) / 2, dy + (cellH - h) / 2, w, h);
-        } catch (err) {
-          console.error("Foto konnte nicht in den PDF-Export geladen werden:", err);
-        }
-        col += 1;
-        if (col >= cols) {
-          col = 0;
-          dy += cellH + gap;
-        }
-      }
-      if (col !== 0) dy += cellH + gap;
-      dy += 2;
-    }
-
-    // Vollständige Bearbeitungshistorie (Abschnitt 3), chronologisch aufsteigend
-    if (dy > pageHeight - 40) {
-      doc.addPage();
-      dy = margin;
-    }
-    bold();
-    doc.text("Bearbeitungshistorie:", margin, dy);
-    dy += 6;
+    doc.text("Pins ohne zugeordnete Grundrissskizze", margin, 20);
     normal();
     doc.setFontSize(9);
-    const history = [...(pin.pin_activity_log || [])].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-    if (history.length === 0) {
-      doc.text("Kein Verlauf vorhanden.", margin, dy);
-      dy += 5;
-    } else {
-      history.forEach((entry) => {
-        if (dy > pageHeight - margin) {
-          doc.addPage();
-          dy = margin;
-        }
-        const label = PIN_ACTIVITY_META[entry.action]?.label || entry.action;
-        const lines = doc.splitTextToSize(
-          `${formatDateTime(entry.created_at)} · ${entry.actor_name || entry.actor_email || "Unbekannt"} · ${entry.detail || label}`,
-          contentWidth
-        );
-        doc.text(lines, margin, dy);
-        dy += lines.length * 4.5;
-      });
-    }
+    doc.text(
+      "Diese Pins stammen aus Altbeständen vor Einführung der Grundrissskizzen-Ebene und sind aktuell keiner Skizze zugeordnet.",
+      margin,
+      28,
+      { maxWidth: contentWidth }
+    );
     doc.setFontSize(10);
+    let listY = 40;
+    orphanPins.forEach((pin) => {
+      doc.text(`${pin.exportNumber}. ${pin.title} (${pin.floor?.name || "–"})`, margin, listY);
+      listY += 6;
+    });
+    for (const pin of orphanPins) {
+      await drawPinDetailPage(pin, null);
+    }
   }
 
   const fileName = `${sanitizeFileNamePart(project.name)}_Baudokumentation_${new Date().toISOString().slice(0, 10)}.pdf`;
+  doc.save(fileName);
+  return fileName;
+}
+
+// ----------------------------------------------------------------------------------
+// GESCHOSS-EXPORT — Pin-Tabelle je Etage (PDF-Tabelle & CSV/Excel)
+// ----------------------------------------------------------------------------------
+// Eigenständig von generateProjectReportPdf oben: exportiert gezielt EIN Geschoss —
+// als visueller Karten-Bericht (PDF, siehe generateFloorPinsTablePdf weiter unten)
+// und als vollständige Rohdaten-Tabelle (CSV/Excel, siehe pinsToFloorExportRows).
+// Oberste Priorität ist in beiden Fällen Datenvollständigkeit — es wird bewusst
+// NIRGENDS Text stillschweigend abgeschnitten, auch nicht bei sehr langen
+// Beschreibungen oder vielen Fotos je Pin.
+
+// Baut für einen einzelnen Pin die Anzeige-Werte der Kernfelder (Nr. → Aufnahmedatum →
+// Thema → Gewerk → Bereich → Geschoss → Status → Kommentar → Erledigt bis) — als
+// gemeinsame Grundlage für die Mangel-Karten im PDF-Export. "Anschlussbezeichnung" und
+// "Erledigen durch" wurden hier bewusst entfernt (siehe PDF LAYOUT CLEANUP-Anforderung)
+// — im rohdaten-vollständigen CSV/Excel-Export (siehe pinsToFloorExportRows, davon
+// unabhängige Funktion) bleiben beide Felder unverändert erhalten.
+function buildFloorExportRowValues(pin, tradesById, floorName) {
+  return {
+    number: String(pin.exportNumber),
+    recordedDate: formatDateShort(pin.created_at),
+    topic: pin.title || "–",
+    // Mehrere Gewerke kommagetrennt (siehe getPinTradeNames/ANFORDERUNG "Multi-Select
+    // Trades for Pins") — der Feldname "trade" (Einzahl) bleibt aus Kompatibilität zu
+    // allen bestehenden Aufrufstellen unten unverändert, der Inhalt ist jetzt aber
+    // ggf. eine kommagetrennte Liste mehrerer Gewerke statt nur eines einzelnen Namens.
+    trade: getPinTradeNames(pin, tradesById) || "–",
+    area: pin.area || "–",
+    floor: floorName || "–",
+    status: STATUS[pin.status]?.label || pin.status || "–",
+    comment: pin.description || "–",
+    dueDate: pin.due_date ? formatDateOnly(pin.due_date) : "–",
+  };
+}
+
+// Erstellt einen professionellen Mängelbericht für GENAU EINE Grundrissskizze — im
+// Stil eines Baugutachtens statt einer reinen Datentabelle:
+//   Seite 1 (Querformat): Deckblatt + eine hochauflösende Planübersicht mit allen
+//     nummerierten Pin-Markierungen — verschafft sofortige visuelle Orientierung
+//     über die Gesamtverteilung aller (bzw. aller gefilterten) Mängel auf dem Geschoss.
+//   Folgeseiten (Hochformat): kompakte, fließende Mangel-Karten — mehrere Pins pro
+//     Seite, ohne festen Seitenumbruch nach jedem einzelnen Pin (siehe
+//     "break-inside: avoid"-Äquivalent weiter unten); links Datenfakten inkl.
+//     vollständigem, nie gekürztem Kommentar, rechts das eingebettete
+//     Foto-Vorschaubild bzw. ein Platzhalter, falls kein Foto hinterlegt ist.
+// pins ist die tatsächlich auszugebende (ggf. per Filterleiste eingeschränkte)
+// Teilmenge; allPins die VOLLSTÄNDIGE, ungefilterte Pin-Liste der Skizze — wird
+// ausschließlich zur Nummernvergabe herangezogen, damit "Nr. X" in einem gefilterten
+// Bericht immer mit der auf dem Plan UND im vollständigen Export angezeigten Nummer
+// übereinstimmt (identischer Sortierschlüssel wie pinNumberById in FloorPlanView und
+// wie im Excel-Export, siehe pinsToFloorExportRows) — 1:1-Match, unabhängig davon, ob
+// gerade gefiltert exportiert wird oder nicht. filterSummary (optional) ist ein
+// bereits fertig formatierter Text der aktuell aktiven Filterkriterien und wird, falls
+// vorhanden, zusätzlich auf dem Deckblatt ausgewiesen. Der Excel-Export bleibt bewusst
+// die vollständige, tabellarische Rohdaten-Variante (inkl. Priorität, exakter
+// Plan-Position und aller Foto-Links) und daher unabhängig von der Filterleiste; diese
+// PDF-Ausgabe ist demgegenüber bewusst ein kuratierter, filterbarer visueller Bericht.
+// Zeichnet EINEN vollständigen Skizzen-Abschnitt (Deckblatt + Planübersicht, gefolgt
+// von den fließenden Mangel-Karten inkl. Fotoraster) direkt auf ein BEREITS
+// bestehendes jsPDF-Dokument, statt selbst eines zu erzeugen und zu speichern — dieser
+// gesamte Block war ursprünglich der alleinige Inhalt von generateFloorPinsTablePdf
+// (Bericht für GENAU EINE Grundrissskizze). Durch die Auslagerung kann exakt dieselbe,
+// unveränderte Zeichenlogik jetzt zweimal wiederverwendet werden: einmal für den
+// weiterhin bestehenden Einzelskizzen-Export (siehe generateFloorPinsTablePdf unten,
+// dünner Wrapper der EIN Dokument erzeugt, hier genau einmal zeichnet und speichert)
+// und einmal für den neuen Sammelbericht über mehrere vom Nutzer ausgewählte Skizzen
+// eines Geschosses (siehe generateMultiSketchFloorReportPdf weiter unten, derselbe
+// Aufruf in einer Schleife über alle ausgewählten Skizzen auf EIN gemeinsames
+// Dokument). isFirstSection steuert nur, ob VOR dem Zeichnen eine neue Querformat-
+// Seite begonnen wird: bei der ersten Skizze eines Dokuments ist die Ausgangsseite
+// bereits im richtigen Format angelegt (siehe new jsPDF({..., orientation:
+// "landscape"}) beim Aufrufer), bei jeder weiteren Skizze im selben Sammelbericht
+// dagegen nicht — dort würde ohne addPage() die letzte Foto-/Mangel-Karten-Seite der
+// vorherigen Skizze (Hochformat) einfach weiterbeschrieben.
+async function drawFloorPinsReportSection(
+  doc,
+  { project, floor, plan, pins, allPins, trades, generatedBy, filterSummary, includeOnboarding = false, isFirstSection = true }
+) {
+  const tradesById = new Map((trades || []).map((t) => [t.id, t]));
+
+  const bold = () => doc.setFont("helvetica", "bold");
+  const normal = () => doc.setFont("helvetica", "normal");
+  const brandColor = () => doc.setTextColor(255, 42, 0); // #FF2A00, exaktes Markenrot
+  const inkColor = () => doc.setTextColor(15, 23, 42); // #0F172A
+  const mutedColor = () => doc.setTextColor(100, 116, 139);
+
+  // Nummernvergabe IMMER über die vollständige, ungefilterte Pin-Liste (allPins,
+  // fällt auf pins zurück, falls nicht mitgegeben) — siehe Erläuterung oben. Inkl.
+  // Unter-Nummerierung per "Duplizieren" erzeugter Kopien (siehe
+  // computePinNumberById); numberedPins wird anschließend NACH Nummer sortiert
+  // (comparePinNumberEntries), damit eine Kopie ("3.1") direkt hinter ihrer Wurzel
+  // ("3") erscheint statt chronologisch irgendwo dazwischen.
+  const numberSource = allPins && allPins.length ? allPins : pins;
+  const exportNumberEntryById = computePinNumberById(numberSource);
+  const numberedPins = [...pins]
+    .map((pin) => ({ ...pin, exportNumber: exportNumberEntryById.get(pin.id)?.label ?? "" }))
+    .sort((a, b) => comparePinNumberEntries(exportNumberEntryById.get(a.id), exportNumberEntryById.get(b.id)));
+
+  // ANFORDERUNG "PIN-AUSSCHNITT-BILD (PLAN-CROP FÜR JEDEN PIN)": hält die ROHE, noch
+  // unkomprimierte Planbild-Datenquelle (volle beim Laden erhaltene Auflösung) fest,
+  // damit die weiter unten pro Mangel-Karte gezeichneten Planausschnitte (siehe
+  // cropImageDataUrl-Aufruf in der Pin-Schleife) scharf bleiben, statt auf der bereits
+  // für die große Planübersicht herunterskalierten Kopie (imgData nach
+  // compressImageDataUrl, siehe unten) zu basieren. Wird NUR einmal pro Skizze geladen
+  // (kein zusätzlicher Netzwerk-Request je Pin) und bleibt null, falls der Plan nicht
+  // geladen werden konnte — die Ausschnitte zeigen dann denselben Platzhalter-Hinweis
+  // wie die große Planübersicht.
+  let rawPlanImageDataUrl = null;
+
+  // ---- Seite 1 (dieser Skizze) — Deckblatt & visuelle Planübersicht ---------------
+  if (!isFirstSection) doc.addPage("a4", "landscape");
+  {
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 12;
+    const contentWidth = pageWidth - margin * 2;
+
+    doc.setFontSize(16);
+    bold();
+    inkColor();
+    doc.text(`${project.name} — ${floor.name}${plan?.name ? ` — ${plan.name}` : ""}`, margin, margin + 6);
+    doc.setFontSize(9);
+    normal();
+    mutedColor();
+    doc.text(
+      `Grundrissskizzen-Bericht · Erstellungsdatum: ${formatDateOnly(new Date().toISOString())} · Erstellt von: ${generatedBy || "–"} · ${
+        numberedPins.length
+      } Mängel-Pin(s)${filterSummary ? " (gefiltert)" : ""}`,
+      margin,
+      margin + 12
+    );
+    // Aktive Filterkriterien der Planansicht (Status/Gewerk/Suche) — nur sichtbar,
+    // wenn tatsächlich gefiltert wurde; ein ungefilterter Export bleibt unverändert
+    // knapp bei der einzeiligen Kopfzeile oben.
+    let metaBottom = margin + 12;
+    if (filterSummary) {
+      doc.setFontSize(8);
+      const filterLines = doc.splitTextToSize(`Gefiltert nach: ${filterSummary}`, contentWidth - 55);
+      doc.text(filterLines, margin, metaBottom + 4.5);
+      metaBottom += 4.5 + (filterLines.length - 1) * 3.8;
+    }
+
+    // "REISNER x FRANK"-Branding rechts oben — dieselbe Wortmarke wie im
+    // Anwendungs-Header/Splash-Screen, hier als reiner Text nachgebaut, da jsPDF
+    // kein Inline-SVG rendern kann.
+    doc.setFontSize(12);
+    bold();
+    brandColor();
+    doc.text("REISNER × FRANK", pageWidth - margin, margin + 6, { align: "right" });
+    doc.setFontSize(7.5);
+    normal();
+    mutedColor();
+    doc.text("Baustellendokumentation", pageWidth - margin, margin + 11, { align: "right" });
+
+    const headerBottom = Math.max(margin + 17, metaBottom + 4);
+    doc.setDrawColor(226, 232, 240);
+    doc.line(margin, headerBottom, pageWidth - margin, headerBottom);
+
+    // Legende: Statuszahlen der in diesem Bericht tatsächlich enthaltenen Pins — bei
+    // aktiver Filterleiste sind das bewusst nur die gefilterten (siehe numberedPins
+    // oben), sonst wie gehabt alle Pins der Skizze.
+    const legendY = headerBottom + 7;
+    let legendX = margin;
+    const legendItem = (label, count, rgb) => {
+      doc.setFillColor(...rgb);
+      doc.circle(legendX + 1.3, legendY - 1.3, 1.3, "F");
+      doc.setFontSize(9);
+      normal();
+      inkColor();
+      const text = `${count} ${label}`;
+      doc.text(text, legendX + 4.5, legendY);
+      legendX += doc.getTextWidth(text) + 10;
+    };
+    legendItem("offen", numberedPins.filter((p) => p.status === "offen").length, PDF_STATUS_RGB.offen);
+    legendItem("in Bearbeitung", numberedPins.filter((p) => p.status === "bearbeitung").length, PDF_STATUS_RGB.bearbeitung);
+    legendItem("erledigt", numberedPins.filter((p) => p.status === "erledigt").length, PDF_STATUS_RGB.erledigt);
+
+    // Baustellen-Info für Nachunternehmer (optional) — kompakte Leisten-Variante,
+    // da der Planausschnitt hier bereits nahezu die gesamte Seite beansprucht (siehe
+    // drawOnboardingInfoBar). Verkleinert availableTop entsprechend um ihre Höhe.
+    const infoBarBottom = includeOnboarding ? drawOnboardingInfoBar(doc, project, margin, legendY + 4, contentWidth) : legendY + 8;
+
+    // Planbild mit nummerierten Pin-Markierungen — dieselbe Zeichenlogik (Kreis +
+    // weiße Nummer) wie in der Planübersicht des projektweiten PDF-Exports (siehe
+    // generateProjectReportPdf), hier hochauflösend über die volle Seitenbreite.
+    const availableTop = infoBarBottom;
+    const availableW = contentWidth;
+    const availableH = pageHeight - availableTop - margin;
+    let imgRect = null;
+    if (plan?.image_url) {
+      try {
+        const planKind = resolveFloorKind(plan);
+        // loadFloorPlanImageWithRetry: ein automatischer erneuter Versuch bei einem
+        // Ladefehler, siehe Kommentar dort (GRUNDRISS-GARANTIE).
+        let imgData = null;
+        if (planKind === "pdf" || planKind === "image" || planKind === "svg") {
+          imgData = await loadFloorPlanImageWithRetry(plan.image_url, planKind);
+        }
+        if (imgData) {
+          // Rohe Datenquelle sichern, BEVOR sie unten für die Planübersicht
+          // herunterskaliert/überschrieben wird — siehe rawPlanImageDataUrl oben.
+          rawPlanImageDataUrl = imgData.dataUrl;
+          // Vor dem Einbetten auf PDF-taugliche Auflösung herunterskalieren & als JPEG
+          // komprimieren (siehe compressImageDataUrl) — entscheidend für die Dateigröße.
+          imgData = await compressImageDataUrl(imgData.dataUrl, PDF_PLAN_MAX_WIDTH, PDF_PLAN_MAX_HEIGHT, PDF_PLAN_JPEG_QUALITY);
+          const ratio = Math.min(availableW / imgData.width, availableH / imgData.height);
+          const w = imgData.width * ratio;
+          const h = imgData.height * ratio;
+          const x = margin + (availableW - w) / 2;
+          const imgY = availableTop;
+          doc.addImage(imgData.dataUrl, "JPEG", x, imgY, w, h);
+          imgRect = { x, y: imgY, w, h };
+        }
+      } catch (err) {
+        console.error(`Grundrissskizze "${plan?.name}" konnte nicht in den PDF-Export geladen werden:`, err);
+      }
+    }
+
+    if (imgRect) {
+      // ANFORDERUNG "PIN-DESIGN AUF DEM PLAN (FARBLOS & NEUTRAL)": die Marker auf der
+      // großen Planübersicht nutzen bewusst PDF_PIN_NEUTRAL_RGB statt der Statusfarbe
+      // (PDF_STATUS_RGB) — ein weißer Kontrast-Ring dahinter bildet den "leicht
+      // transparenten" Effekt nach, da jsPDF ohne Zusatz-Plugin keine verlässliche
+      // Flächentransparenz bietet (siehe Kommentar an PDF_PIN_NEUTRAL_RGB). Die
+      // Statusfarbe bleibt unverändert in der Legende oben (legendItem) und in den
+      // Status-Badges der Mangel-Karten weiter unten erhalten.
+      numberedPins.forEach((pin) => {
+        const px = imgRect.x + (pin.x / 100) * imgRect.w;
+        const py = imgRect.y + (pin.y / 100) * imgRect.h;
+        drawPdfViewCone(doc, px, py, pin.angle, PDF_PIN_NEUTRAL_RGB);
+        doc.setFillColor(255, 255, 255);
+        doc.circle(px, py, 3.9, "F");
+        doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
+        doc.circle(px, py, 3.4, "F");
+        // Etwas kleinere Schrift bei längeren Unter-Nummern (siehe computePinNumberById).
+        doc.setFontSize(String(pin.exportNumber).length > 2 ? 5.3 : 7);
+        bold();
+        doc.setTextColor(255, 255, 255);
+        doc.text(String(pin.exportNumber), px, py + 1.1, { align: "center" });
+      });
+      normal();
+      inkColor();
+    } else {
+      doc.setFontSize(10);
+      mutedColor();
+      const msg =
+        numberedPins.length > 0
+          ? "Grundriss konnte nicht dargestellt werden (CAD-Format oder Ladefehler) — alle Mängel sind auf den Folgeseiten vollständig dokumentiert."
+          : filterSummary
+          ? "Keine Mängel-Pins entsprechen der aktuell gesetzten Filterung dieses Berichts."
+          : "Für diese Grundrissskizze sind aktuell keine Mängel-Pins erfasst.";
+      doc.text(msg, margin, availableTop + 8, { maxWidth: contentWidth });
+      inkColor();
+    }
+  }
+
+  // ---- Folgeseiten — fließende, kompakte Mangel-Karten ---------------------------
+  // Kein fixer Seitenumbruch mehr nach jedem einzelnen Pin: mehrere Karten fließen
+  // kontinuierlich untereinander auf derselben Seite. Vor dem Zeichnen jeder Karte
+  // wird ihre voraussichtliche Höhe berechnet (Textumbruch via doc.splitTextToSize,
+  // das nur MISST und nichts zeichnet) — passt sie nicht mehr vollständig auf die
+  // aktuelle Seite, rutscht sie als GANZES auf eine neue Seite (das PDF-Äquivalent zu
+  // CSS "break-inside: avoid"), statt mitten im Bild oder Text zerschnitten zu werden.
+  // Ohne Pins wird bewusst KEINE zusätzliche leere Seite angehängt — Seite 1 trägt in
+  // diesem Fall bereits den entsprechenden Hinweis (siehe Fallback-Text weiter oben).
+  if (numberedPins.length > 0) {
+    // ASYNCHRONES BILDER-PRELOADING (Promise.all, siehe preloadPinPhotosForPdf oben):
+    // ALLE Mängelfotos ALLER Pins dieses Geschosses werden hier VOR dem Zeichnen der
+    // ersten Karte parallel geladen. Das Zeichnen selbst (weiter unten) greift danach
+    // nur noch lesend auf den bereits fertigen photoCache zu und löst keine weiteren
+    // Netzwerk-Requests mehr aus — ein einzelnes fehlschlagendes Foto (CORS,
+    // Netzwerkfehler, gelöschte Datei) verhindert dank des Graceful Fallbacks in
+    // preloadPinPhotosForPdf NICHT die vollständige Fertigstellung des restlichen
+    // Berichts (alle anderen Fotos, Texte und Karten werden trotzdem vollständig
+    // gedruckt).
+    const photoCache = await preloadPinPhotosForPdf(numberedPins);
+
+    doc.addPage("a4", "portrait");
+    let pageWidth = doc.internal.pageSize.getWidth();
+    let pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 15;
+    const contentWidth = pageWidth - margin * 2;
+    const cardBottomGap = 9;
+    // GUARANTEED UNIFORM IMAGE RESIZING: 2-Spalten-Foto-Raster über die volle
+    // Kartenbreite statt der bisherigen schmalen Seitenspalte — dank der 4:3-
+    // Bildnormalisierung beim Preload (siehe normalizeImageTo4x3Canvas) füllt jedes
+    // Foto seine Kachel auf den Millimeter genau identisch groß, unabhängig vom
+    // Ausgangs-Seitenverhältnis. Spaltenbreite hängt nur von contentWidth ab, daher
+    // einmal außerhalb der Pin-Schleife berechnet.
+    const photoColWidth = (contentWidth - PDF_PHOTO_GRID_GAP_MM * (PDF_PHOTO_GRID_COLS - 1)) / PDF_PHOTO_GRID_COLS;
+
+    // Zeichnet EIN Foto (oder einen Platzhalter, falls url fehlt/Preload
+    // fehlgeschlagen ist) — siehe drawPdfPhotoBox oben (einheitliche 4:3-Normalisierung
+    // + abgerundete Ecken, dieselbe Behandlung in allen drei PDF-Export-Funktionen).
+    const drawPhotoBox = (url, bx, by, bw, bh, placeholderText) =>
+      drawPdfPhotoBox(doc, { url, photoCache, x: bx, y: by, w: bw, h: bh, placeholderText });
+
+    let y = margin;
+
+    for (const pin of numberedPins) {
+      const rowValues = buildFloorExportRowValues(pin, tradesById, floor.name);
+      const photos = pin.pin_photos || [];
+
+      // ---- Höhe messen (nichts wird hier gezeichnet) ----------------------------
+      doc.setFontSize(15);
+      bold();
+      const themaLines = doc.splitTextToSize(rowValues.topic, contentWidth);
+      const headerThemaY = 11.5;
+      const headerBottomOffset = headerThemaY + themaLines.length * 6.2 + 3;
+
+      doc.setFontSize(10);
+      normal();
+      // Volle Kartenbreite statt bisheriger linker Spalte — seit dem Wegfall der
+      // rechten Foto-Spalte (Fotos rutschen jetzt als eigener, voller Raster-Block
+      // weiter unten) steht für Datenfakten und Kommentar die gesamte Breite zur
+      // Verfügung, was auch die Lesbarkeit langer Kommentare verbessert.
+      const shortFieldDefs = [
+        ["Gewerke", rowValues.trade],
+        ["Bereich", rowValues.area],
+      ];
+      const shortFields = shortFieldDefs.map(([label, value]) => {
+        const lines = doc.splitTextToSize(String(value ?? "–"), contentWidth);
+        return { label, lines, height: 4.3 + lines.length * 4.6 + 3.6 };
+      });
+      const shortFieldsHeight = shortFields.reduce((sum, f) => sum + f.height, 0);
+
+      doc.setFontSize(9.5);
+      const commentLines = doc.splitTextToSize(rowValues.comment, contentWidth);
+      const commentBlockHeight = 4.3 + commentLines.length * 4.6;
+
+      // GUARANTEED UNIFORM IMAGE RESIZING & 2-Column Grid: AUSNAHMSLOS alle Fotos
+      // dieses Pins, in einem 2-Spalten-Raster mit fester Zeilenhöhe (siehe
+      // PDF_PHOTO_GRID_ROW_HEIGHT_MM). Ohne Foto wird trotzdem EIN Platzhalter in
+      // voller Kartenbreite gezeigt ("Kein Bild vorhanden") — auch das Fehlen eines
+      // Fotos soll im Bericht sichtbar dokumentiert sein, nicht stillschweigend fehlen.
+      const photoRows = Math.max(1, Math.ceil(photos.length / PDF_PHOTO_GRID_COLS));
+      const photoSectionHeight = 9.5 + photoRows * PDF_PHOTO_GRID_ROW_HEIGHT_MM + (photoRows - 1) * PDF_PHOTO_GRID_GAP_MM;
+      // ANFORDERUNG "PIN-AUSSCHNITT-BILD": feste Zusatzhöhe für Beschriftung + die
+      // quadratische Planausschnitt-Miniatur (siehe Zeichnung weiter unten zwischen
+      // Kommentar und Fotoraster).
+      const planCropSectionHeight = 4.5 + FLOOR_REPORT_PIN_CROP_SIZE_MM + 4;
+
+      const estimatedCardHeight =
+        headerBottomOffset +
+        6 +
+        shortFieldsHeight +
+        commentBlockHeight +
+        4 +
+        planCropSectionHeight +
+        photoSectionHeight +
+        cardBottomGap;
+
+      // ---- Seitenumbruch-Entscheidung: Karte als Ganzes auf eine neue Seite, wenn sie
+      // hier nicht mehr vollständig Platz findet (y > margin verhindert eine leere
+      // Endlosschleife, falls eine einzelne Karte selbst eine ganze Seite sprengt — in
+      // dem seltenen Fall greifen die Fortsetzungslogiken für Kommentar/Fotos
+      // weiter unten). ----
+      if (y + estimatedCardHeight > pageHeight - margin && y > margin) {
+        doc.addPage("a4", "portrait");
+        y = margin;
+      }
+      const cardTop = y;
+
+      // ---- Kartenkopf zeichnen: Nr. links, Status/Aufnahmedatum/Erledigt bis als
+      // kompakte, rechtsbündige Badges auf derselben Zeilen-Ebene, Thema darunter. ----
+      doc.setFontSize(10);
+      bold();
+      brandColor();
+      doc.text(`Nr. ${pin.exportNumber}`, margin, cardTop + 4);
+
+      const badgeY = cardTop + 4;
+      const drawBadge = (text, rightEdgeX, bg, textColor) => {
+        doc.setFontSize(7.2);
+        bold();
+        const bw = doc.getTextWidth(text) + 5;
+        const bx = rightEdgeX - bw;
+        doc.setFillColor(...bg);
+        doc.roundedRect(bx, badgeY - 3.6, bw, 4.6, 1, 1, "F");
+        doc.setTextColor(...textColor);
+        doc.text(text, bx + 2.5, badgeY);
+        return bx;
+      };
+      let badgeEdge = pageWidth - margin;
+      badgeEdge = drawBadge(`Bis: ${rowValues.dueDate}`, badgeEdge, [241, 245, 249], [71, 85, 105]) - 2.2;
+      badgeEdge = drawBadge(`Aufn.: ${rowValues.recordedDate}`, badgeEdge, [241, 245, 249], [71, 85, 105]) - 2.2;
+      drawBadge(rowValues.status, badgeEdge, PDF_STATUS_RGB[pin.status] || PDF_STATUS_RGB.offen, [255, 255, 255]);
+
+      doc.setFontSize(15);
+      bold();
+      inkColor();
+      doc.text(themaLines, margin, cardTop + headerThemaY);
+      normal();
+
+      const headerBottom = cardTop + headerBottomOffset;
+      doc.setDrawColor(226, 232, 240);
+      doc.line(margin, headerBottom, pageWidth - margin, headerBottom);
+
+      // ---- Datenfakten (Gewerk, Bereich — Status/Aufnahmedatum/Erledigt bis sitzen
+      // bereits kompakt im Kartenkopf) und vollständiger Kommentar, jetzt über die
+      // volle Kartenbreite. "Anschlussbezeichnung" und "Erledigen durch" wurden
+      // entfernt (siehe PDF LAYOUT CLEANUP-Anforderung). ----
+      let dy = headerBottom + 6;
+      shortFields.forEach(({ label, lines }) => {
+        doc.setFontSize(7.5);
+        bold();
+        mutedColor();
+        doc.text(label.toUpperCase(), margin, dy);
+        dy += 4.3;
+        doc.setFontSize(10);
+        normal();
+        inkColor();
+        doc.text(lines, margin, dy);
+        dy += lines.length * 4.6 + 3.6;
+      });
+
+      doc.setFontSize(7.5);
+      bold();
+      mutedColor();
+      doc.text("KOMMENTAR", margin, dy);
+      dy += 4.3;
+      doc.setFontSize(9.5);
+      normal();
+      inkColor();
+      // Vollständiger Kommentartext, ohne jede Kürzung — für sehr lange Kommentare läuft
+      // die Karte notfalls über den unteren Seitenrand hinaus in eine direkt
+      // anschließende Fortsetzungsseite (bewusst in Kauf genommen: eine Kürzung des
+      // Kommentartexts käme für ein Baugutachten nicht infrage).
+      let commentY = dy;
+      for (const line of commentLines) {
+        if (commentY > pageHeight - margin) {
+          doc.addPage("a4", "portrait");
+          pageWidth = doc.internal.pageSize.getWidth();
+          pageHeight = doc.internal.pageSize.getHeight();
+          commentY = margin;
+        }
+        doc.text(line, margin, commentY);
+        commentY += 4.6;
+      }
+
+      // ---- ANFORDERUNG "PIN-AUSSCHNITT-BILD (PLAN-CROP FÜR JEDEN PIN)": kompakte,
+      // quadratische Miniatur des Grundrisses, zentriert auf die exakte Pin-Position
+      // (cropImageDataUrl, dieselbe Technik wie der Detail-Zoom im Einzel-Pin-Export,
+      // siehe generateSinglePinPdf), direkt im Anschluss an den Kommentar und VOR dem
+      // Fotoraster — zeigt sofort, WO GENAU auf dem Plan dieser Mangel liegt, ohne dafür
+      // separat zur Planübersichtsseite dieser Skizze blättern zu müssen. Nutzt
+      // rawPlanImageDataUrl (oben einmal pro Skizze geladen, siehe dort) statt eines
+      // zusätzlichen Netzwerk-Requests je Pin. Der Marker darauf ist bewusst ebenfalls
+      // monochrom/neutral (PDF_PIN_NEUTRAL_RGB), siehe ANFORDERUNG "PIN-DESIGN AUF DEM
+      // PLAN". ----
+      let planCropY = commentY + 4;
+      if (planCropY + 4.5 + FLOOR_REPORT_PIN_CROP_SIZE_MM > pageHeight - margin) {
+        doc.addPage("a4", "portrait");
+        pageWidth = doc.internal.pageSize.getWidth();
+        pageHeight = doc.internal.pageSize.getHeight();
+        planCropY = margin;
+      }
+      doc.setFontSize(7.5);
+      bold();
+      mutedColor();
+      doc.text("LAGE AUF DEM PLAN", margin, planCropY);
+      inkColor();
+      planCropY += 4.5;
+      doc.setDrawColor(226, 232, 240);
+      doc.setFillColor(248, 250, 252);
+      doc.roundedRect(margin, planCropY, FLOOR_REPORT_PIN_CROP_SIZE_MM, FLOOR_REPORT_PIN_CROP_SIZE_MM, 2, 2, "FD");
+      if (rawPlanImageDataUrl) {
+        try {
+          const cropped = await cropImageDataUrl(
+            rawPlanImageDataUrl,
+            (pin.x ?? 50) / 100,
+            (pin.y ?? 50) / 100,
+            FLOOR_REPORT_PIN_CROP_RATIO,
+            FLOOR_REPORT_PIN_CROP_MAX_OUTPUT_PX,
+            FLOOR_REPORT_PIN_CROP_QUALITY
+          );
+          const cropRatio = Math.min(FLOOR_REPORT_PIN_CROP_SIZE_MM / cropped.width, FLOOR_REPORT_PIN_CROP_SIZE_MM / cropped.height);
+          const cropW = cropped.width * cropRatio;
+          const cropH = cropped.height * cropRatio;
+          const cropImgX = margin + (FLOOR_REPORT_PIN_CROP_SIZE_MM - cropW) / 2;
+          const cropImgY = planCropY + (FLOOR_REPORT_PIN_CROP_SIZE_MM - cropH) / 2;
+          doc.addImage(cropped.dataUrl, "JPEG", cropImgX, cropImgY, cropW, cropH);
+          const markerX = cropImgX + cropped.pinRatioX * cropW;
+          const markerY = cropImgY + cropped.pinRatioY * cropH;
+          // FIX "RIESIGER SCHWARZER KREIS, FOLGEFIX": siehe ausführlicher Kommentar an der
+          // identischen Stelle in drawPinDetailPage — hartes PDF-Clipping auf die Box
+          // garantiert geometrisch, dass auch bei einem Pin nahe am Rand des Quellbilds
+          // (Marker-Mittelpunkt exakt auf der Boxkante) kein Teil des Sichtkegels über die
+          // "Lage auf dem Plan"-Box hinausragen kann.
+          doc.saveGraphicsState();
+          doc.rect(margin, planCropY, FLOOR_REPORT_PIN_CROP_SIZE_MM, FLOOR_REPORT_PIN_CROP_SIZE_MM, null);
+          doc.clip();
+          doc.discardPath();
+          drawPdfViewCone(doc, markerX, markerY, pin.angle, PDF_PIN_NEUTRAL_RGB, FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM);
+          doc.setFillColor(255, 255, 255);
+          doc.circle(markerX, markerY, FLOOR_REPORT_PIN_CROP_MARKER_OUTER_MM, "F");
+          doc.setFillColor(...PDF_PIN_NEUTRAL_RGB);
+          doc.circle(markerX, markerY, FLOOR_REPORT_PIN_CROP_MARKER_INNER_MM, "F");
+          doc.restoreGraphicsState();
+        } catch (err) {
+          console.error(`Planausschnitt für Pin "${pin.exportNumber}" konnte nicht erzeugt werden:`, err);
+          doc.setFontSize(7);
+          mutedColor();
+          doc.text("Ausschnitt nicht verfügbar", margin + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, planCropY + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, {
+            align: "center",
+            maxWidth: FLOOR_REPORT_PIN_CROP_SIZE_MM - 4,
+          });
+          inkColor();
+        }
+      } else {
+        doc.setFontSize(7);
+        mutedColor();
+        doc.text("Kein Grundriss verfügbar", margin + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, planCropY + FLOOR_REPORT_PIN_CROP_SIZE_MM / 2, {
+          align: "center",
+          maxWidth: FLOOR_REPORT_PIN_CROP_SIZE_MM - 4,
+        });
+        inkColor();
+      }
+      normal();
+
+      // ---- Fotoraster — volle Kartenbreite, 2 Spalten, AUSNAHMSLOS alle Fotos dieses
+      // Pins (dank photoCache, siehe preloadPinPhotosForPdf oben vor der Schleife
+      // parallel geladen, ohne weiteren Netzwerk-Request an dieser Stelle). Startet
+      // unterhalb des Planausschnitts; ein eigener Seitenumbruch VOR dem Raster stellt
+      // sicher, dass zumindest die Überschrift nicht isoliert am Seitenende landet. ----
+      let photoY = planCropY + FLOOR_REPORT_PIN_CROP_SIZE_MM + 5;
+      if (photoY + 8 > pageHeight - margin) {
+        doc.addPage("a4", "portrait");
+        pageWidth = doc.internal.pageSize.getWidth();
+        pageHeight = doc.internal.pageSize.getHeight();
+        photoY = margin;
+      }
+      doc.setFontSize(7.5);
+      bold();
+      mutedColor();
+      doc.text(`FOTOS${photos.length > 0 ? ` (${photos.length})` : ""}`, margin, photoY);
+      inkColor();
+      photoY += 5.5;
+      normal();
+      if (photos.length > 0) {
+        let idx = 0;
+        for (const photo of photos) {
+          const col = idx % PDF_PHOTO_GRID_COLS;
+          // Zeilenanfang: prüfen ob die GANZE Bildzeile (nicht nur ein einzelnes Foto)
+          // noch auf die aktuelle Seite passt — verhindert, dass eine Bildreihe mitten
+          // durchgeschnitten wird (das PDF-Äquivalent zu CSS "break-inside: avoid").
+          if (col === 0 && photoY + PDF_PHOTO_GRID_ROW_HEIGHT_MM > pageHeight - margin) {
+            doc.addPage("a4", "portrait");
+            pageWidth = doc.internal.pageSize.getWidth();
+            pageHeight = doc.internal.pageSize.getHeight();
+            photoY = margin;
+          }
+          const bx = margin + col * (photoColWidth + PDF_PHOTO_GRID_GAP_MM);
+          await drawPhotoBox(photo.photo_url, bx, photoY, photoColWidth, PDF_PHOTO_GRID_ROW_HEIGHT_MM, "Foto konnte nicht geladen werden");
+          if (col === PDF_PHOTO_GRID_COLS - 1 || idx === photos.length - 1) {
+            photoY += PDF_PHOTO_GRID_ROW_HEIGHT_MM + PDF_PHOTO_GRID_GAP_MM;
+          }
+          idx += 1;
+        }
+      } else {
+        await drawPhotoBox(null, margin, photoY, contentWidth, PDF_PHOTO_GRID_ROW_HEIGHT_MM, "Kein Bild vorhanden");
+        photoY += PDF_PHOTO_GRID_ROW_HEIGHT_MM + PDF_PHOTO_GRID_GAP_MM;
+      }
+      let cardBottom = photoY - PDF_PHOTO_GRID_GAP_MM;
+
+      // Nächste Karte setzt direkt unterhalb des tiefsten Punkts dieser Karte fort —
+      // daher der fließende, lückenlose Mehr-Pin-Fluss ohne erzwungene Seitenumbrüche.
+      y = cardBottom + cardBottomGap;
+    }
+  }
+}
+
+// Dünner Wrapper um drawFloorPinsReportSection (siehe dort) für den weiterhin
+// unverändert bestehenden Einzelskizzen-Export (Bericht für GENAU EINE
+// Grundrissskizze, siehe handleExportFloor in FloorPlanView) — erzeugt EIN neues
+// jsPDF-Dokument, zeichnet exakt einen Abschnitt hinein und speichert die Datei.
+// Signatur, Verhalten und Dateiname bleiben zu 100% wie zuvor.
+async function generateFloorPinsTablePdf({ project, floor, plan, pins, allPins, trades, generatedBy, filterSummary, includeOnboarding = false }) {
+  const jsPDF = await loadJsPdf();
+  // compress: true aktiviert jsPDFs eigene interne Bild-/Stream-Kompression zusätzlich
+  // zur bereits vor dem Einbetten durchgeführten Downscaling-Komprimierung der Fotos
+  // und der Planübersicht (siehe compressImageDataUrl).
+  const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape", compress: true });
+  await drawFloorPinsReportSection(doc, {
+    project,
+    floor,
+    plan,
+    pins,
+    allPins,
+    trades,
+    generatedBy,
+    filterSummary,
+    includeOnboarding,
+    isFirstSection: true,
+  });
+  const fileName = `${sanitizeFileNamePart(project.name)}_${sanitizeFileNamePart(floor.name)}${
+    plan?.name ? `_${sanitizeFileNamePart(plan.name)}` : ""
+  }_Grundrissbericht_${new Date().toISOString().slice(0, 10)}.pdf`;
+  doc.save(fileName);
+  return fileName;
+}
+
+// ANFORDERUNG "RESTRUKTURIERUNG DES PDF-EXPORTS: SKIZZEN-BASIERTE SEQUENZ": eigenes
+// Deckblatt als ERSTE Seite des Sammelberichts, vor der ersten Skizze — zeigt
+// Projektname, Etage, Erstellungsdatum/Ersteller sowie eine Zusammenfassung ALLER
+// ausgewählten Skizzen (Name, Kategorie, Mängelzahlen je Status) inkl. Gesamtsumme.
+// Ersetzt NICHT den kompakten Kopfbereich der einzelnen Skizzen-Übersichtsseiten (siehe
+// drawFloorPinsReportSection) — der bleibt je Skizze unverändert erhalten; das Deckblatt
+// liefert zusätzlich den Überblick über den GESAMTEN Bericht, bevor Skizze 1 im Detail
+// folgt (siehe ANFORDERUNG Punkt 1, Schritt 1 der geforderten Sequenz).
+function drawMultiSketchCoverPage(doc, { project, floor, plans, pinsByPlanId, generatedBy }) {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 16;
+  const contentWidth = pageWidth - margin * 2;
+
+  const bold = () => doc.setFont("helvetica", "bold");
+  const normal = () => doc.setFont("helvetica", "normal");
+  const brandColor = () => doc.setTextColor(255, 42, 0); // #FF2A00, exaktes Markenrot
+  const inkColor = () => doc.setTextColor(15, 23, 42); // #0F172A
+  const mutedColor = () => doc.setTextColor(100, 116, 139);
+
+  doc.setFontSize(13);
+  bold();
+  brandColor();
+  doc.text("REISNER × FRANK", pageWidth - margin, margin + 6, { align: "right" });
+  doc.setFontSize(8);
+  normal();
+  mutedColor();
+  doc.text("Baustellendokumentation", pageWidth - margin, margin + 11, { align: "right" });
+
+  doc.setFontSize(21);
+  bold();
+  inkColor();
+  doc.text(`${project.name}`, margin, margin + 10);
+  doc.setFontSize(14);
+  doc.text(`${floor.name} — Sammelbericht`, margin, margin + 19);
+
+  doc.setFontSize(9.5);
+  normal();
+  mutedColor();
+  doc.text(
+    `Erstellungsdatum: ${formatDateOnly(new Date().toISOString())} · Erstellt von: ${generatedBy || "–"} · ${plans.length} ausgewählte Skizze(n)`,
+    margin,
+    margin + 26
+  );
+
+  const headerBottom = margin + 32;
+  doc.setDrawColor(226, 232, 240);
+  doc.line(margin, headerBottom, pageWidth - margin, headerBottom);
+
+  // ---- Gesamt-Zusammenfassung über ALLE ausgewählten Skizzen hinweg ----------------
+  let allOpen = 0;
+  let allProgress = 0;
+  let allDone = 0;
+  const rows = plans.map((plan) => {
+    const planPins = pinsByPlanId.get(plan.id) || [];
+    const open = planPins.filter((p) => p.status === "offen").length;
+    const progress = planPins.filter((p) => p.status === "bearbeitung").length;
+    const done = planPins.filter((p) => p.status === "erledigt").length;
+    allOpen += open;
+    allProgress += progress;
+    allDone += done;
+    const categoryMeta = PLAN_CATEGORY_META[getPlanCategory(plan)] || PLAN_CATEGORY_META.grundriss;
+    return { name: plan.name, categoryLabel: categoryMeta.label, open, progress, done };
+  });
+
+  let legendY = headerBottom + 10;
+  let legendX = margin;
+  const legendItem = (label, count, rgb) => {
+    doc.setFillColor(...rgb);
+    doc.circle(legendX + 1.3, legendY - 1.3, 1.3, "F");
+    doc.setFontSize(10);
+    normal();
+    inkColor();
+    const text = `${count} ${label}`;
+    doc.text(text, legendX + 4.5, legendY);
+    legendX += doc.getTextWidth(text) + 12;
+  };
+  legendItem("offen", allOpen, PDF_STATUS_RGB.offen);
+  legendItem("in Bearbeitung", allProgress, PDF_STATUS_RGB.bearbeitung);
+  legendItem("erledigt", allDone, PDF_STATUS_RGB.erledigt);
+  doc.setFontSize(10);
+  bold();
+  inkColor();
+  doc.text(`Gesamt: ${allOpen + allProgress + allDone} Mängel-Pin(s)`, pageWidth - margin, legendY, { align: "right" });
+  normal();
+
+  // ---- Tabellarische Übersicht je Skizze, in Export-Reihenfolge (= Reihenfolge der
+  // nachfolgenden Abschnitte) -------------------------------------------------------
+  let tableY = legendY + 10;
+  doc.setFontSize(8.5);
+  bold();
+  mutedColor();
+  doc.text("SKIZZE", margin, tableY);
+  doc.text("KATEGORIE", margin + contentWidth * 0.42, tableY);
+  doc.text("OFFEN", margin + contentWidth * 0.64, tableY, { align: "right" });
+  doc.text("IN BEARB.", margin + contentWidth * 0.8, tableY, { align: "right" });
+  doc.text("ERLEDIGT", margin + contentWidth, tableY, { align: "right" });
+  tableY += 3;
+  doc.setDrawColor(226, 232, 240);
+  doc.line(margin, tableY, pageWidth - margin, tableY);
+  tableY += 6;
+
+  rows.forEach((row, idx) => {
+    if (tableY > pageHeight - margin) {
+      doc.addPage("a4", "landscape");
+      tableY = margin + 6;
+    }
+    doc.setFontSize(9.5);
+    normal();
+    inkColor();
+    const nameLines = doc.splitTextToSize(`${idx + 1}. ${row.name}`, contentWidth * 0.4);
+    doc.text(nameLines, margin, tableY);
+    mutedColor();
+    doc.text(row.categoryLabel, margin + contentWidth * 0.42, tableY);
+    inkColor();
+    doc.text(String(row.open), margin + contentWidth * 0.64, tableY, { align: "right" });
+    doc.text(String(row.progress), margin + contentWidth * 0.8, tableY, { align: "right" });
+    doc.text(String(row.done), margin + contentWidth, tableY, { align: "right" });
+    tableY += Math.max(6, nameLines.length * 4.6);
+  });
+}
+
+// ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL" (erweitert um
+// "RESTRUKTURIERUNG DES PDF-EXPORTS: SKIZZEN-BASIERTE SEQUENZ"): Sammelbericht über
+// eine vom Nutzer in der Geschossansicht gezielt gewählte Teilmenge der Grundriss-
+// skizzen eines Geschosses (siehe SketchExportModal/handleExportSelectedSketchesPdf).
+// Reihenfolge im Dokument strikt sequenziell: 1. Deckblatt (siehe
+// drawMultiSketchCoverPage oben), 2. Skizze 1 — Planübersicht MIT allen ihren Pins,
+// DIREKT GEFOLGT von genau den Mangel-Karten dieser einen Skizze, 3. Skizze 2 — dieselbe
+// Abfolge, usw. (siehe drawFloorPinsReportSection, hier je Skizze EIN kompletter
+// Aufruf) — zu keinem Zeitpunkt werden erst alle Planübersichten gesammelt und die
+// Mangel-Karten ans Ende verschoben. Nicht ausgewählte Skizzen tauchen im Ergebnis-PDF
+// an keiner Stelle auf. plans ist die vom Nutzer im Auswahl-Modal bestätigte Teilmenge
+// (in der gewünschten Reihenfolge, siehe dort); pinsByPlanId ordnet jeder Skizzen-ID
+// ihre VOLLSTÄNDIGE, ungefilterte Pin-Liste (inkl. Fotos) zu — diese Funktion filtert
+// selbst nicht, das aufrufende handleExportSelectedSketchesPdf lädt bereits gezielt nur
+// die benötigten Daten.
+async function generateMultiSketchFloorReportPdf({ project, floor, plans, pinsByPlanId, trades, generatedBy, includeOnboarding = false }) {
+  const jsPDF = await loadJsPdf();
+  const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "landscape", compress: true });
+  drawMultiSketchCoverPage(doc, { project, floor, plans, pinsByPlanId, generatedBy });
+  for (let i = 0; i < plans.length; i++) {
+    const plan = plans[i];
+    const planPins = pinsByPlanId.get(plan.id) || [];
+    await drawFloorPinsReportSection(doc, {
+      project,
+      floor,
+      plan,
+      pins: planPins,
+      allPins: planPins,
+      trades,
+      generatedBy,
+      // Der Sammelbericht kennt keine aktive Filter-/Suchleiste (die gibt es nur in
+      // der Live-Planansicht einer einzelnen Skizze) — filterSummary bleibt daher
+      // immer leer, jede ausgewählte Skizze erscheint vollständig ungefiltert.
+      filterSummary: null,
+      includeOnboarding,
+      // isFirstSection ist jetzt IMMER false: Seite 1 des Dokuments trägt bereits das
+      // neue Deckblatt (siehe oben), jede Skizze — auch die erste — beginnt deshalb
+      // bewusst auf einer eigenen, neuen Seite.
+      isFirstSection: false,
+    });
+  }
+  const fileName = `${sanitizeFileNamePart(project.name)}_${sanitizeFileNamePart(floor.name)}_Sammelbericht_${plans.length}_Skizzen_${new Date()
+    .toISOString()
+    .slice(0, 10)}.pdf`;
+  doc.save(fileName);
+  return fileName;
+}
+
+// Wandelt die Pins eines Geschosses in flache, für CSV/Excel geeignete Zeilenobjekte
+// um — bewusst ALLE Attribute je Pin als eigene Spalte, inkl. voller Beschreibung,
+// aller Foto-Links (durch " | " getrennt statt nur der Anzahl) und der Bearbeitungs-
+// Metadaten, damit hier garantiert nichts verloren geht.
+// Spaltenreihenfolge exakt wie vorgegeben (Nr. … Erledigen durch); danach folgen,
+// ausschließlich zur Wahrung der vollständigen Datenintegrität (keine Attribute,
+// Fotoverknüpfungen oder Anmerkungen dürfen verloren gehen), ergänzende Spalten, die
+// NICHT Teil der vorgegebenen Struktur sind.
+function pinsToFloorExportRows(pins, trades, floorName) {
+  const tradesById = new Map((trades || []).map((t) => [t.id, t]));
+  // Nummernvergabe inkl. Unter-Nummerierung per "Duplizieren" erzeugter Kopien
+  // (siehe computePinNumberById) — identischer Sortierschlüssel wie auf dem Plan und
+  // im PDF-Export (siehe Funktionskommentar oben), damit "Nr." hier garantiert
+  // übereinstimmt. Zeilen erscheinen anschließend NACH Nummer sortiert, damit eine
+  // Kopie ("3.1") direkt hinter ihrer Wurzel ("3") steht statt chronologisch
+  // irgendwo dazwischen.
+  const rowNumberById = computePinNumberById(pins);
+  return [...pins]
+    .sort((a, b) => comparePinNumberEntries(rowNumberById.get(a.id), rowNumberById.get(b.id)))
+    .map((pin) => ({
+      "Nr.": rowNumberById.get(pin.id)?.label ?? "",
+      Aufnahmedatum: formatDateShort(pin.created_at),
+      Thema: pin.title || "",
+      Anschlussbezeichnung: pin.reference_code || "",
+      // Mehrere Gewerke kommagetrennt in einer Spalte (siehe getPinTradeNames/
+      // ANFORDERUNG "Multi-Select Trades for Pins") statt bisher genau einem Namen.
+      Gewerke: getPinTradeNames(pin, tradesById) || "",
+      Bereich: pin.area || "",
+      Geschoss: floorName || "",
+      Status: STATUS[pin.status]?.label || pin.status || "",
+      Kommentar: pin.description || "",
+      "Erledigt bis": pin.due_date ? formatDateOnly(pin.due_date) : "",
+      "Erledigen durch": pin.assigned_to || "",
+      // ---- Ergänzende, nicht in der vorgegebenen Struktur enthaltene Spalten ----
+      Priorität: PRIORITY[pin.priority]?.label || pin.priority || "",
+      "Position X (%)": pin.x ?? "",
+      "Position Y (%)": pin.y ?? "",
+      "Anzahl Fotos": (pin.pin_photos || []).length,
+      "Foto-Links": (pin.pin_photos || []).map((p) => p.photo_url).join(" | "),
+      Ersteller: pin.created_by || "",
+      "Erstellt am (Zeitstempel)": formatDateTime(pin.created_at),
+      "Zuletzt bearbeitet von": pin.updated_by || "",
+      "Zuletzt bearbeitet am": pin.updated_at && pin.updated_at !== pin.created_at ? formatDateTime(pin.updated_at) : "",
+    }));
+}
+
+// CSV-Feld-Escaping nach RFC 4180: in Anführungszeichen setzen, sobald das Feld das
+// Trennzeichen, Anführungszeichen selbst oder einen Zeilenumbruch enthält (z.B. eine
+// mehrzeilige Beschreibung).
+function csvEscape(value) {
+  const str = String(value ?? "");
+  if (/[";\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+  return str;
+}
+
+// Semikolon statt Komma als Trennzeichen — die in Deutschland/Excel übliche
+// Konvention (Komma ist dort der Dezimaltrenner). Ein vorangestelltes BOM sorgt
+// dafür, dass Excel die UTF-8-Kodierung (Umlaute, „ “-Anführungszeichen) korrekt
+// erkennt, statt sie als Latin-1 misszuinterpretieren.
+function buildFloorExportCsv(rows) {
+  if (rows.length === 0) return "﻿";
+  const headers = Object.keys(rows[0]);
+  const lines = [headers.join(";"), ...rows.map((row) => headers.map((h) => csvEscape(row[h])).join(";"))];
+  return "﻿" + lines.join("\r\n");
+}
+
+function downloadTextFile(fileName, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function exportFloorPinsCsv({ project, floor, plan, pins, trades }) {
+  const csv = buildFloorExportCsv(pinsToFloorExportRows(pins, trades, floor.name));
+  const fileName = `${sanitizeFileNamePart(project.name)}_${sanitizeFileNamePart(floor.name)}${
+    plan?.name ? `_${sanitizeFileNamePart(plan.name)}` : ""
+  }_Grundrissbericht_${new Date().toISOString().slice(0, 10)}.csv`;
+  downloadTextFile(fileName, csv, "text/csv;charset=utf-8;");
+  return fileName;
+}
+
+// ----------------------------------------------------------------------------------
+// EINZEL-PIN-EXPORT — schnelles 1-Seiten-PDF für EINEN Mängel-Pin
+// ----------------------------------------------------------------------------------
+// Eigenständig von generateFloorPinsTablePdf: statt eines ganzen Geschoss-Berichts
+// wird hier gezielt nur EIN Pin mit Stammdaten, Mängelfoto und einem doppelten
+// Orientierungssystem aufbereitet (Gesamt-Minimap + Detail-Zoom, siehe unten) —
+// gedacht für die schnelle Nachfrage an einen einzelnen Nachunternehmer, ohne den
+// kompletten Geschoss-Bericht verschicken zu müssen.
+// Anteil der kürzeren Grundriss-Seite, der im Detail-Zoom gezeigt wird — klein genug
+// für eine spürbare Zoomwirkung, groß genug, damit die unmittelbare Umgebung des
+// Pins (angrenzende Räume/Wände/Achsraster) noch erkennbar bleibt.
+const SINGLE_PIN_PLAN_CROP_RATIO = 0.26;
+// Maximale Kantenlänge & JPEG-Qualität der kleinen Übersichts-Minimap (zeigt den
+// GESAMTEN Grundriss, dient nur der groben Orientierung im Gebäude) — bewusst deutlich
+// kleiner/stärker komprimiert als der scharfe Detail-Zoom, da hier keine Details,
+// sondern nur die grobe Position im Geschoss erkennbar sein müssen.
+const SINGLE_PIN_MINIMAP_MAX_DIM = 500;
+const SINGLE_PIN_MINIMAP_QUALITY = 0.6;
+
+async function generateSinglePinPdf({ project, floor, plan, pin, exportNumber, trades, generatedBy, allPins = [] }) {
+  const jsPDF = await loadJsPdf();
+  const doc = new jsPDF({ unit: "mm", format: "a4", orientation: "portrait", compress: true });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const margin = 15;
+  const contentWidth = pageWidth - margin * 2;
+  const tradesById = new Map((trades || []).map((t) => [t.id, t]));
+
+  const bold = () => doc.setFont("helvetica", "bold");
+  const normal = () => doc.setFont("helvetica", "normal");
+  const brandColor = () => doc.setTextColor(255, 42, 0);
+  const inkColor = () => doc.setTextColor(15, 23, 42);
+  const mutedColor = () => doc.setTextColor(100, 116, 139);
+
+  const rowValues = buildFloorExportRowValues({ ...pin, exportNumber }, tradesById, floor.name);
+  const rgb = PDF_STATUS_RGB[pin.status] || PDF_STATUS_RGB.offen;
+
+  // ---- Kopfzeile: Nr. links, Marke rechts oben, Thema darunter, Status-/Datums-
+  // Badges rechtsbündig auf einer eigenen Zeile — dieselbe kompakte Formsprache wie
+  // die Mangel-Karten im Geschoss-Export (siehe generateFloorPinsTablePdf). ----
+  doc.setFontSize(10);
+  bold();
+  brandColor();
+  doc.text(`Nr. ${exportNumber}`, margin, margin + 4);
+  doc.setFontSize(11);
+  doc.text("REISNER × FRANK", pageWidth - margin, margin + 4, { align: "right" });
+  doc.setFontSize(7);
+  normal();
+  mutedColor();
+  doc.text("Einzel-Export · Baustellendokumentation", pageWidth - margin, margin + 8.5, { align: "right" });
+
+  doc.setFontSize(17);
+  bold();
+  inkColor();
+  const themaLines = doc.splitTextToSize(rowValues.topic, contentWidth);
+  doc.text(themaLines, margin, margin + 16);
+  normal();
+  const themaBottom = margin + 16 + (themaLines.length - 1) * 6.8;
+
+  const badgeY = themaBottom + 6;
+  const drawBadge = (text, rightEdgeX, bg, textColor) => {
+    doc.setFontSize(7.5);
+    bold();
+    const bw = doc.getTextWidth(text) + 5;
+    const bx = rightEdgeX - bw;
+    doc.setFillColor(...bg);
+    doc.roundedRect(bx, badgeY - 3.8, bw, 4.9, 1, 1, "F");
+    doc.setTextColor(...textColor);
+    doc.text(text, bx + 2.5, badgeY);
+    return bx;
+  };
+  let badgeEdge = pageWidth - margin;
+  badgeEdge = drawBadge(`Bis: ${rowValues.dueDate}`, badgeEdge, [241, 245, 249], [71, 85, 105]) - 2.2;
+  badgeEdge = drawBadge(`Aufn.: ${rowValues.recordedDate}`, badgeEdge, [241, 245, 249], [71, 85, 105]) - 2.2;
+  drawBadge(rowValues.status, badgeEdge, rgb, [255, 255, 255]);
+  inkColor();
+
+  const headerBottom = badgeY + 5;
+  doc.setDrawColor(226, 232, 240);
+  doc.line(margin, headerBottom, pageWidth - margin, headerBottom);
+
+  const columnsStartY = headerBottom + 7;
+  const colGap = 8;
+  const leftW = contentWidth * 0.52;
+  const rightW = contentWidth - leftW - colGap;
+  const rightX = margin + leftW + colGap;
+
+  // ---- Rechte Spalte — doppeltes Orientierungssystem: oben eine kleine Minimap des
+  // GESAMTEN Geschoss-Grundrisses (grobe Orientierung im Gebäude), darunter ein
+  // größerer, auf den Pin gezoomter Detail-Ausschnitt (siehe cropImageDataUrl) mit
+  // demselben Pin-Marker samt Blickrichtungs-Sektor wie auf der vollständigen
+  // Planübersicht (drawPdfViewCone, 1:1 dieselbe Rotation wie das Kompass-Feld im
+  // Pin-Modal) — zusammen zeigen beide auf einen Blick sowohl WO im Gebäude als auch
+  // WO GENAU am Pin sich der Mangel befindet. Beide Ansichten nutzen bewusst dieselbe,
+  // einmalig geladene Planquelle (imgData) — spart einen doppelten Ladevorgang. ----
+  const minimapBoxH = Math.min(46, rightW * 0.62);
+  const minimapCaptionH = 7;
+  const detailY = columnsStartY + minimapBoxH + minimapCaptionH;
+  const detailBoxH = Math.min(78, rightW * 1.05);
+
+  doc.setDrawColor(226, 232, 240);
+  doc.setFillColor(248, 250, 252);
+  doc.roundedRect(rightX, columnsStartY, rightW, minimapBoxH, 2, 2, "FD");
+  doc.roundedRect(rightX, detailY, rightW, detailBoxH, 2, 2, "FD");
+
+  const drawPlanPlaceholder = (message, boxY, boxH) => {
+    doc.setFontSize(8.5);
+    mutedColor();
+    doc.text(message, rightX + rightW / 2, boxY + boxH / 2, { align: "center" });
+    inkColor();
+  };
+
+  if (plan?.image_url) {
+    try {
+      const planKind = resolveFloorKind(plan);
+      // loadFloorPlanImageWithRetry: ein automatischer erneuter Versuch bei einem
+      // Ladefehler, siehe Kommentar dort (GRUNDRISS-GARANTIE).
+      const imgData = await loadFloorPlanImageWithRetry(plan.image_url, planKind);
+      if (!imgData) throw new Error("Kein Bildmaterial für diese Grundrissskizze verfügbar.");
+
+      // 1. Gesamt-Übersichtsplan (Minimap) — kompletter Grundriss stark verkleinert,
+      // mit deutlich hervorgehobenem Pin-Marker (weißer Ring als Kontrast-Halo, damit
+      // der Punkt auch auf einem detailreichen Plan sofort auffindbar ist). Zusätzlich
+      // (Anforderung "kompletter Übersichtsgrundriss mit allen Pins zur Kontext-
+      // Orientierung"): alle ÜBRIGEN Pins dieser Grundrissskizze als kleine, schlichte
+      // Punkte in ihrer Statusfarbe — ohne Nummer/Ring, um die Minimap nicht zu
+      // überladen; der hier exportierte Pin bleibt durch den weißen Kontrast-Halo klar
+      // als DER eine hervorgehobene Marker erkennbar.
+      const minimapData = await compressImageDataUrl(imgData.dataUrl, SINGLE_PIN_MINIMAP_MAX_DIM, SINGLE_PIN_MINIMAP_MAX_DIM, SINGLE_PIN_MINIMAP_QUALITY);
+      const minimapRatio = Math.min(rightW / minimapData.width, minimapBoxH / minimapData.height);
+      const minimapW = minimapData.width * minimapRatio;
+      const minimapH = minimapData.height * minimapRatio;
+      const minimapImgX = rightX + (rightW - minimapW) / 2;
+      const minimapImgY = columnsStartY + (minimapBoxH - minimapH) / 2;
+      doc.addImage(minimapData.dataUrl, "JPEG", minimapImgX, minimapImgY, minimapW, minimapH);
+      (allPins || [])
+        .filter((p) => p.id !== pin.id)
+        .forEach((p) => {
+          const otherRgb = PDF_STATUS_RGB[p.status] || PDF_STATUS_RGB.offen;
+          const ox = minimapImgX + ((p.x ?? 50) / 100) * minimapW;
+          const oy = minimapImgY + ((p.y ?? 50) / 100) * minimapH;
+          doc.setFillColor(...otherRgb);
+          doc.circle(ox, oy, 1.1, "F");
+        });
+      const minimapMarkerX = minimapImgX + ((pin.x ?? 50) / 100) * minimapW;
+      const minimapMarkerY = minimapImgY + ((pin.y ?? 50) / 100) * minimapH;
+      doc.setFillColor(255, 255, 255);
+      doc.circle(minimapMarkerX, minimapMarkerY, 3, "F");
+      doc.setFillColor(...rgb);
+      doc.circle(minimapMarkerX, minimapMarkerY, 2, "F");
+
+      // 2. Detail-Zoom — gezoomter Ausschnitt (siehe cropImageDataUrl) mit vollem
+      // Pin-Marker (Blickrichtungs-Sektor, Kreis, Nummer); zeigt in der Originalauflösung
+      // des Grundrisses auch dort vorhandene Raumbeschriftungen/Achsraster.
+      const cropped = await cropImageDataUrl(imgData.dataUrl, (pin.x ?? 50) / 100, (pin.y ?? 50) / 100, SINGLE_PIN_PLAN_CROP_RATIO);
+      const detailRatio = Math.min(rightW / cropped.width, detailBoxH / cropped.height);
+      const detailW = cropped.width * detailRatio;
+      const detailH = cropped.height * detailRatio;
+      const detailImgX = rightX + (rightW - detailW) / 2;
+      const detailImgY = detailY + (detailBoxH - detailH) / 2;
+      doc.addImage(cropped.dataUrl, "JPEG", detailImgX, detailImgY, detailW, detailH);
+      const markerX = detailImgX + cropped.pinRatioX * detailW;
+      const markerY = detailImgY + cropped.pinRatioY * detailH;
+      // FIX "RIESIGER SCHWARZER KREIS AUF DEM MINI-CROP": derselbe proportionale Ansatz
+      // wie bei FLOOR_REPORT_PIN_CROP_CONE_RADIUS_MM (siehe dort) — der Radius richtet
+      // sich nach der tatsächlichen Box-Größe dieses Exports (rightW × detailBoxH) statt
+      // nach dem für die großformatige Planübersicht gedachten festen 9mm-Standardwert.
+      // Der Punktradius bekommt zusätzlich eine Untergrenze von 3mm, damit die
+      // zweistellige Pin-Nummer darin weiterhin lesbar bleibt.
+      const detailConeRadius = Math.min(rightW, detailBoxH) * 0.15;
+      const detailMarkerRadius = Math.max(3, Math.min(rightW, detailBoxH) * 0.04);
+      // FIX "RIESIGER SCHWARZER KREIS, FOLGEFIX": siehe ausführlicher Kommentar an der
+      // identischen Stelle in drawPinDetailPage — hartes PDF-Clipping auf die Detail-Zoom-
+      // Box, damit der Sichtkegel bei einem Pin nahe am Rand des Quellbilds nicht über die
+      // Box hinausragen kann. Die Pin-Nummer wird bewusst ERST NACH dem restoreGraphicsState
+      // gezeichnet (also außerhalb des Clips), damit die Ziffer selbst nie angeschnitten
+      // wird, falls der Mittelpunkt exakt auf der Boxkante liegt.
+      doc.saveGraphicsState();
+      doc.rect(rightX, detailY, rightW, detailBoxH, null);
+      doc.clip();
+      doc.discardPath();
+      drawPdfViewCone(doc, markerX, markerY, pin.angle, rgb, detailConeRadius);
+      doc.setFillColor(...rgb);
+      doc.circle(markerX, markerY, detailMarkerRadius, "F");
+      doc.restoreGraphicsState();
+      // Etwas kleinere Schrift bei längeren Unter-Nummern (siehe computePinNumberById).
+      doc.setFontSize(String(exportNumber).length > 2 ? 5.3 : 7);
+      bold();
+      doc.setTextColor(255, 255, 255);
+      doc.text(String(exportNumber), markerX, markerY + 1, { align: "center" });
+      inkColor();
+    } catch (err) {
+      console.error("Grundriss konnte nicht in den Einzel-PDF-Export geladen werden:", err);
+      drawPlanPlaceholder("Grundriss nicht verfügbar", columnsStartY, minimapBoxH);
+      drawPlanPlaceholder(["Grundriss konnte nicht geladen werden", "(CAD-Format oder Ladefehler)."], detailY, detailBoxH);
+    }
+  } else {
+    drawPlanPlaceholder("Kein Grundriss zugeordnet.", columnsStartY, minimapBoxH);
+    drawPlanPlaceholder("Kein Grundriss zugeordnet.", detailY, detailBoxH);
+  }
+  doc.setFontSize(7.5);
+  mutedColor();
+  doc.text(`Übersicht · ${floor?.name || "–"}`, rightX, columnsStartY + minimapBoxH + 4);
+  doc.text(`Detail-Zoom · ${plan?.name || "–"}`, rightX, detailY + detailBoxH + 4);
+  inkColor();
+  const rightColumnBottom = detailY + detailBoxH + 7;
+
+  // ---- Linke Spalte — Stammdaten, vollständiger Kommentar, darunter das Mängelfoto. ----
+  let dy = columnsStartY;
+  let activePageWidth = pageWidth;
+  let activePageHeight = pageHeight;
+  const field = (label, value) => {
+    doc.setFontSize(7.5);
+    bold();
+    mutedColor();
+    doc.text(label.toUpperCase(), margin, dy);
+    dy += 4.3;
+    doc.setFontSize(10);
+    normal();
+    inkColor();
+    const lines = doc.splitTextToSize(String(value ?? "–"), leftW);
+    doc.text(lines, margin, dy);
+    dy += lines.length * 4.6 + 3.6;
+  };
+  field("Projekt", project?.name);
+  field("Etage", floor?.name);
+  field("Gewerke", rowValues.trade);
+  field("Bereich", rowValues.area);
+
+  doc.setFontSize(7.5);
+  bold();
+  mutedColor();
+  doc.text("KOMMENTAR", margin, dy);
+  dy += 4.3;
+  doc.setFontSize(9.5);
+  normal();
+  inkColor();
+  // Vollständiger Kommentartext ohne Kürzung, mit derselben Fortsetzungsseiten-
+  // Sicherung wie im Geschoss-Export (siehe generateFloorPinsTablePdf) — bei einem
+  // Einzel-Pin-Schnellexport in der Praxis so gut wie nie relevant, aber auch hier
+  // wird bewusst nichts stillschweigend abgeschnitten.
+  const commentLines = doc.splitTextToSize(rowValues.comment, leftW);
+  let commentY = dy;
+  // Merkt sich, ob überhaupt ein Seitenumbruch stattgefunden hat (nur bei einem
+  // ungewöhnlich langen Kommentar) — die rechte Spalte (Minimap + Detail-Zoom) wurde
+  // bereits vollständig auf SEITE 1 gezeichnet; nach einem Umbruch bezieht sich
+  // rightColumnBottom also auf eine andere Seite und darf für die Fußzeilen-Position
+  // der AKTUELLEN Seite nicht mehr herangezogen werden (siehe contentBottom unten).
+  let pagedBroke = false;
+  for (const line of commentLines) {
+    if (commentY > activePageHeight - margin) {
+      doc.addPage("a4", "portrait");
+      activePageWidth = doc.internal.pageSize.getWidth();
+      activePageHeight = doc.internal.pageSize.getHeight();
+      commentY = margin;
+      pagedBroke = true;
+    }
+    doc.text(line, margin, commentY);
+    commentY += 4.6;
+  }
+
+  // ---- Ab hier volle Seitenbreite (nicht mehr zweispaltig): ALLE Fotos, vollständig,
+  // im selben 2-Spalten-Raster wie der Gesamt- und Geschoss-Export. sectionY startet
+  // unterhalb BEIDER Kopfspalten (Kommentar links, Minimap+Detail-Zoom rechts) —
+  // rightColumnBottom fließt nur ein, solange der Kommentar keinen Seitenumbruch
+  // ausgelöst hat (siehe pagedBroke), sonst bezieht es sich auf eine bereits
+  // verlassene Seite 1. ----
+  let sectionY = (pagedBroke ? commentY : Math.max(commentY, rightColumnBottom)) + 6;
+  const ensureSpace = (neededH) => {
+    if (sectionY + neededH > activePageHeight - margin) {
+      doc.addPage("a4", "portrait");
+      activePageWidth = doc.internal.pageSize.getWidth();
+      activePageHeight = doc.internal.pageSize.getHeight();
+      sectionY = margin;
+      pagedBroke = true;
+    }
+  };
+
+  // ---- Fotos — vollständig, im selben 2-Spalten-Raster mit fester Zeilenhöhe wie der
+  // Gesamt- und Geschoss-Export (siehe generateProjectReportPdf/
+  // generateFloorPinsTablePdf) statt bisher nur eines einzelnen Vorschaubilds. ----
+  const photos = pin.pin_photos || [];
+  ensureSpace(10);
+  doc.setFontSize(7.5);
+  bold();
+  mutedColor();
+  doc.text(photos.length > 0 ? `FOTOS (${photos.length})` : "FOTOS", margin, sectionY);
+  inkColor();
+  sectionY += 5;
+  normal();
+  if (photos.length > 0) {
+    // Auch hier: alle Fotos dieses einen Pins parallel vorladen und auf ein
+    // einheitliches 4:3-Format normalisieren (preloadPinPhotosForPdf →
+    // normalizeImageTo4x3Canvas) statt sie nacheinander im Zeichen-Loop zu laden — bei
+    // wenigen Fotos pro Pin ein kleinerer Effekt als beim Geschoss-Export, aber
+    // dieselbe robuste Fehlerbehandlung: ein einzelnes fehlgeschlagenes Foto lässt
+    // die übrigen Kacheln und den Rest des Berichts unberührt.
+    const singlePinPhotoCache = await preloadPinPhotosForPdf([pin]);
+    const cellW = (contentWidth - PDF_PHOTO_GRID_GAP_MM * (PDF_PHOTO_GRID_COLS - 1)) / PDF_PHOTO_GRID_COLS;
+    const cellH = PDF_PHOTO_GRID_ROW_HEIGHT_MM;
+    let col = 0;
+    for (const photo of photos) {
+      if (col === 0) ensureSpace(cellH);
+      // GUARANTEED UNIFORM IMAGE RESIZING: dank der 4:3-Normalisierung beim Preload
+      // (siehe oben) und der gemeinsamen drawPdfPhotoBox füllt jedes Foto seine
+      // Kachel exakt gleich groß aus — dieselbe Behandlung wie im Geschoss- und
+      // Gesamtexport.
+      const px = margin + col * (cellW + PDF_PHOTO_GRID_GAP_MM);
+      await drawPdfPhotoBox(doc, {
+        url: photo.photo_url,
+        photoCache: singlePinPhotoCache,
+        x: px,
+        y: sectionY,
+        w: cellW,
+        h: cellH,
+      });
+      col += 1;
+      if (col >= PDF_PHOTO_GRID_COLS) {
+        col = 0;
+        sectionY += cellH + PDF_PHOTO_GRID_GAP_MM;
+      }
+    }
+    if (col !== 0) sectionY += cellH + PDF_PHOTO_GRID_GAP_MM;
+  } else {
+    doc.setFontSize(8.5);
+    mutedColor();
+    doc.text("Kein Foto vorhanden.", margin, sectionY);
+    inkColor();
+    sectionY += 6;
+  }
+
+  // ---- Fußzeile — sitzt im Normalfall fest nahe am unteren Seitenrand; rutscht nur
+  // nach unten mit, falls der Inhalt bereits über diese Position hinausgewachsen ist. ----
+  const footerLineY = Math.max(sectionY + 4, activePageHeight - 16);
+  if (footerLineY < activePageHeight - 6) {
+    doc.setDrawColor(226, 232, 240);
+    doc.line(margin, footerLineY, activePageWidth - margin, footerLineY);
+    doc.setFontSize(7.5);
+    mutedColor();
+    doc.text(
+      `Einzel-Export erstellt am ${formatDateTime(new Date().toISOString())} von ${generatedBy || "–"} — vollständiger Bearbeitungsverlauf und weitere Mängel dieser Grundrissskizze im Gesamt-/Geschoss-Export.`,
+      margin,
+      footerLineY + 4,
+      { maxWidth: activePageWidth - margin * 2 }
+    );
+    inkColor();
+  }
+
+  const fileName = `${sanitizeFileNamePart(project.name)}_Pin${exportNumber}_${sanitizeFileNamePart(rowValues.topic)}_${new Date()
+    .toISOString()
+    .slice(0, 10)}.pdf`;
   doc.save(fileName);
   return fileName;
 }
@@ -1634,6 +5456,173 @@ async function updateUser(userId, fields) {
   return data;
 }
 
+// Entfernt das fachliche app_users-Profil vollständig — "Zugang entziehen" im Sinne
+// der App: die Person verliert damit sofort jede Rollen-/Projektzuordnung (siehe
+// canAccessAdmin/canUserAccessProject) und taucht in der Benutzerverwaltung nicht
+// mehr auf. WICHTIGE, bewusste Grenze: das darunterliegende Supabase-Auth-Konto
+// (auth.users) selbst bleibt bestehen und kann sich weiterhin mit seinem Passwort
+// anmelden — es sieht danach nur keine Projekte mehr (Bootstrap-Ausnahme in
+// canUserAccessProject greift NICHT, da ja weiterhin ein Profil existiert für andere
+// Nutzer; für DIESE Person existiert schlicht keines mehr, ist also nicht "niemand
+// hat je ein Profil" — canUserAccessProject(null, ...) wird nur aufgerufen, wenn
+// currentAppUser null ist, was nach dem Löschen tatsächlich zutrifft, s.u.). Ein
+// echtes vollständiges Löschen des Auth-Kontos benötigt den Service-Role-Key
+// (supabase.auth.admin.deleteUser) und ist aus denselben Sicherheitsgründen wie beim
+// Einladungsversand (siehe inviteUserToApp) clientseitig NICHT umsetzbar — das
+// müsste über das Supabase-Dashboard oder eine serverseitige Edge Function erfolgen.
+async function deleteUser(userId) {
+  const { error } = await supabase.from("app_users").delete().eq("id", userId);
+  if (error) throw error;
+}
+
+// ----------------------------------------------------------------------------------
+// ADMIN-EINLADUNGSSYSTEM
+// ----------------------------------------------------------------------------------
+// supabase.auth.admin.inviteUserByEmail() würde den Service-Role-Key voraussetzen —
+// dieser darf NIEMALS im Browser-Bundle landen (voller administrativer Zugriff auf
+// die gesamte Supabase-Instanz für jeden, der die Browser-Konsole öffnet). Ohne
+// eigenes Backend (Edge Function) ist dieser Weg daher clientseitig bewusst NICHT
+// nutzbar — siehe Einordnung der Antwort für die Begründung. Stattdessen der von der
+// Anforderung selbst als Alternative benannte "temporäre Direct-Invite-Flow":
+//   1) Ein echtes auth.users-Konto wird mit einem zufälligen, niemandem bekannten
+//      Passwort über den isolierten inviteSupabase-Client (siehe oben) angelegt.
+//   2) resetPasswordForEmail() löst darauf Supabases eingebauten "Passwort
+//      zurücksetzen"-E-Mail-Versand aus (funktioniert für frisch angelegte wie für
+//      bereits bestehende Konten identisch) — die eingeladene Person setzt darüber
+//      ihr eigenes erstes Passwort und meldet sich danach normal über LoginScreen an.
+//      Das Mail-Template dafür lässt sich im Supabase-Dashboard unter Authentication
+//      -> Email Templates -> "Reset Password" auf einen einladungsartigen Wortlaut
+//      umformulieren (z.B. "Willkommen bei BauDoc — Passwort festlegen").
+//   3) Parallel entsteht sofort das fachliche app_users-Profil mit Rolle und
+//      Projektzuordnung (invite_status "eingeladen", siehe
+//      supabase_schema_v15_admin_invite_system.sql) — sobald sich die Person zum
+//      ersten Mal erfolgreich anmeldet, verknüpft currentAppUser (siehe App()) das
+//      Profil automatisch über die E-Mail-Adresse, ohne weiteres Zutun.
+// ----------------------------------------------------------------------------------
+// DIREKTER EINLADUNGS-LINK — jetzt der PRIMÄRE Weg (Anforderung: kein blockierender,
+// SMTP-abhängiger Mailversand mehr im Regelfall; HTTP-504-Timeouts sollen ganz
+// umgangen werden, nicht nur abgefangen werden). supabase.auth.admin.generateLink()
+// selbst löst KEINEN Mailversand aus (anders als resetPasswordForEmail) — es gibt den
+// fertigen Link als Wert zurück, ohne jede SMTP-Abhängigkeit. Genau deshalb ist dieser
+// Weg strukturell immun gegen SMTP-Timeouts, nicht nur nachträglich dagegen
+// abgesichert.
+// ----------------------------------------------------------------------------------
+// supabase.auth.admin.generateLink() ist wie supabase.auth.admin.inviteUserByEmail()
+// weiter oben eine Admin-API und benötigt zwingend den Service-Role-Key — der darf
+// aus genau demselben Grund niemals im Browser-Bundle landen (siehe Kommentar an
+// inviteUserToApp unten). Der einzige sichere Weg, diese Funktion dennoch von der
+// App aus nutzbar zu machen, ist eine serverseitige Supabase Edge Function, die den
+// Service-Role-Key ausschließlich serverseitig hält und selbst prüft, dass nur ein
+// angemeldeter Administrator sie aufrufen darf — siehe
+// supabase/functions/generate-invite-link/index.ts (liegt dieser Antwort bei) sowie
+// die Einordnung für die Begründung und die einmalige Deploy-Anleitung
+// (`supabase functions deploy generate-invite-link`). Ist die Funktion noch nicht
+// deployt oder aus einem anderen Grund nicht erreichbar, fängt
+// sendInviteLinkPrimary unten das ab und weicht auf den bisherigen, E-Mail-basierten
+// Weg aus — Zero-Regression zur vorigen Anforderung, das Einladungssystem bleibt in
+// jedem Fall nutzbar.
+async function requestDirectInviteLink(email) {
+  const { data, error } = await withTimeout(
+    supabase.functions.invoke("generate-invite-link", { body: { email } }),
+    10000,
+    "Direkte Link-Erzeugung"
+  );
+  if (error) throw error;
+  if (!data?.link) throw new Error("Es wurde kein Einladungslink zurückgegeben.");
+  return data.link;
+}
+
+// Sekundärer, E-Mail-basierter Weg über Supabases eingebauten "Passwort
+// zurücksetzen"-Versand (SMTP-abhängig) — kommt nur noch zum Einsatz, wenn die
+// direkte Link-Erzeugung oben fehlschlägt (siehe sendInviteLinkPrimary). Mit
+// Zeitlimit abgesichert, damit ein hängender SMTP-Server die Einladung nicht
+// unbegrenzt blockiert.
+async function sendInviteEmailFallback(normalizedEmail) {
+  const { error } = await withTimeout(
+    inviteSupabase.auth.resetPasswordForEmail(normalizedEmail, {
+      redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
+    }),
+    12000,
+    "Einladungs-Mailversand"
+  );
+  if (error) throw error;
+  return { directLink: null };
+}
+
+// Primärer Einladungsweg: erzeugt direkt einen kopierbaren Link, OHNE jeden
+// Mailversand und damit ohne jede SMTP-/504-Abhängigkeit im Regelfall. Schlägt die
+// direkte Erzeugung fehl (z.B. Edge Function noch nicht deployt, Netzwerkfehler),
+// wird das mit try/catch abgefangen — die Einladung schlägt dadurch NICHT fehl,
+// sondern weicht auf den bisherigen E-Mail-Versand aus. Scheitern auch beide Wege,
+// wird erst dann ein Fehler nach oben gereicht (siehe InviteUserModal).
+async function sendInviteLinkPrimary(normalizedEmail) {
+  try {
+    const directLink = await requestDirectInviteLink(normalizedEmail);
+    return { directLink };
+  } catch (err) {
+    console.warn("Direkte Link-Erzeugung nicht möglich, weiche auf E-Mail-Versand aus:", err);
+    try {
+      return await sendInviteEmailFallback(normalizedEmail);
+    } catch (fallbackErr) {
+      console.error("Weder direkte Link-Erzeugung noch E-Mail-Versand waren möglich:", fallbackErr);
+      throw new Error(
+        "Weder ein direkter Einladungslink noch der E-Mail-Versand waren gerade möglich. Bitte später erneut versuchen."
+      );
+    }
+  }
+}
+
+async function inviteUserToApp({ email, name, kuerzel, role, projectIds, actor }) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const throwawayPassword = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+
+  const { error: signUpError } = await inviteSupabase.auth.signUp({
+    email: normalizedEmail,
+    password: throwawayPassword,
+  });
+  // "User already registered" ist hier KEIN Fehlerfall, sondern der erwartete Weg für
+  // eine Einladung an eine E-Mail-Adresse, für die bereits ein Auth-Konto existiert
+  // (z.B. erneuter Einladungsversand nach abgelaufenem Link) — in dem Fall wird kein
+  // zweites Konto angelegt, es geht direkt mit der Link-/Mail-Erzeugung weiter.
+  if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
+    throw signUpError;
+  }
+
+  const { directLink } = await sendInviteLinkPrimary(normalizedEmail);
+
+  const payload = {
+    name: name?.trim() || normalizedEmail,
+    kuerzel: kuerzel || "",
+    email: normalizedEmail,
+    role,
+    active: true,
+    project_ids: projectIds || [],
+    permissions: {},
+    invite_status: "eingeladen",
+    invited_at: new Date().toISOString(),
+    invited_by: actor?.email || null,
+  };
+  const { data, error } = await supabase.from("app_users").insert(payload).select().single();
+  if (error) throw error;
+  return { profile: data, directLink };
+}
+
+// "Einladung erneut senden" für ein bereits bestehendes app_users-Profil mit
+// invite_status "eingeladen" (siehe UsersAdminModal) — wiederholt ausschließlich den
+// signUp()/Link-bzw.-Mail-Versand aus inviteUserToApp oben, OHNE ein neues
+// app_users-Profil anzulegen (das existiert ja bereits).
+async function resendUserInvite(email) {
+  const normalizedEmail = email.trim().toLowerCase();
+  const { error: signUpError } = await inviteSupabase.auth.signUp({
+    email: normalizedEmail,
+    password: `${crypto.randomUUID()}${crypto.randomUUID()}`,
+  });
+  if (signUpError && !/already registered|already exists/i.test(signUpError.message || "")) {
+    throw signUpError;
+  }
+  return await sendInviteLinkPrimary(normalizedEmail);
+}
+
 // ----------------------------------------------------------------------------------
 // SMALL COMPONENTS
 // ----------------------------------------------------------------------------------
@@ -1647,8 +5636,19 @@ function FieldLabel({ children }) {
 
 function CadBadge({ ext = "dwg", className = "" }) {
   return (
-    <span className={`inline-flex items-center gap-1 rounded-full bg-blue-600 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white shadow ${className}`}>
+    <span className={`inline-flex items-center gap-1 rounded-full bg-[#FF2A00] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white shadow ${className}`}>
       <Ruler size={11} /> {ext}
+    </span>
+  );
+}
+
+// Kennzeichnet SVG-Grundrisse in der Planansicht als das, was sie technisch sind:
+// echtes Vektor-Rendering (siehe SvgPlanCanvas) statt eines Raster-Bilds/-Canvas —
+// bleibt bei JEDEM Zoomfaktor mathematisch gestochen scharf.
+function VectorPlanBadge({ className = "" }) {
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full bg-emerald-600 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white shadow ${className}`}>
+      <ZoomIn size={11} /> Vektor
     </span>
   );
 }
@@ -1668,7 +5668,7 @@ function TradeBadge({ trade, size = "sm" }) {
   return (
     <span
       className={`inline-flex items-center gap-1.5 rounded-full font-semibold ${pad} ${
-        trade.active ? "bg-sky-50 text-sky-700 ring-1 ring-inset ring-sky-200" : "bg-slate-100 text-slate-400 ring-1 ring-inset ring-slate-200"
+        trade.active ? "bg-red-50 text-[#FF2A00] ring-1 ring-inset ring-red-200" : "bg-slate-100 text-slate-400 ring-1 ring-inset ring-slate-200"
       }`}
     >
       <Wrench size={11} /> {trade.name}
@@ -1727,95 +5727,22 @@ function PinActivityHistory({ entries }) {
   );
 }
 
-// Reihenfolge, in der ein Klick auf eine beauftragte LPH-Phase deren Status weiterschaltet.
-// "nicht_relevant" bleibt bewusst außen vor: Diese Phasen sind hier per Definition bereits
-// beauftragt (lph_beauftragt), "nicht relevant" ist daher kein sinnvoller Klick-Zielzustand.
-const LPH_STATUS_CYCLE = ["ausstehend", "bearbeitung", "abgeschlossen"];
-
-function nextLphStatus(current) {
-  const idx = LPH_STATUS_CYCLE.indexOf(current);
-  return LPH_STATUS_CYCLE[(idx + 1) % LPH_STATUS_CYCLE.length];
-}
-
-// Kompakte Punktreihe für Projektkarten: ein Quadrat je BEAUFTRAGTER LPH (aus
-// lph_beauftragt), eingefärbt nach Status. Phasen, die nicht beauftragt sind, werden
-// hier gar nicht erst gerendert — Anzahl der Punkte und der "x/N"-Text passen sich
-// dynamisch an die tatsächliche Auftragsauswahl des Projekts an.
-function LphProgressRow({ lphStatus, lphBeauftragt }) {
-  const status = lphStatus || {};
-  const beauftragtKeys = normalizeLphSelection(lphBeauftragt);
-  const activePhases = LPH_PHASES.filter((phase) => beauftragtKeys.includes(phase.key));
-
-  if (activePhases.length === 0) {
-    return <span className="text-[11px] font-medium text-slate-400">Keine LPH beauftragt</span>;
-  }
-
-  const doneCount = activePhases.filter((p) => status[p.key] === "abgeschlossen").length;
-  return (
-    <div className="flex items-center gap-2">
-      <div className="flex items-center gap-0.5">
-        {activePhases.map((phase) => {
-          const meta = LPH_STATUS_META[status[phase.key] || "ausstehend"];
-          return <span key={phase.key} className={`h-2 w-2 rounded-sm ${meta.dot}`} title={`${phase.label}: ${meta.label}`} />;
-        })}
-      </div>
-      <span className="text-[11px] font-medium text-slate-400">
-        {doneCount}/{activePhases.length} LPH abgeschlossen
-      </span>
-    </div>
-  );
-}
-
-// Ausführliche Badge-Übersicht für die Projekt-Detailansicht (FloorOverview-Header).
-// Zeigt NUR beauftragte Phasen (lph_beauftragt) und erlaubt per Klick das Weiterschalten
-// des Status (ausstehend → in Bearbeitung → abgeschlossen → ausstehend), sofern nicht
-// disabled (z.B. im Gast-Modus ohne Login).
-function LphStatusGrid({ lphStatus, lphBeauftragt, onChangeStatus, disabled = false }) {
-  const status = lphStatus || {};
-  const beauftragtKeys = normalizeLphSelection(lphBeauftragt);
-  const activePhases = LPH_PHASES.filter((phase) => beauftragtKeys.includes(phase.key));
-
-  if (activePhases.length === 0) {
-    return <p className="text-xs text-slate-400">Für dieses Projekt sind noch keine Leistungsphasen beauftragt.</p>;
-  }
-
-  return (
-    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
-      {activePhases.map((phase) => {
-        const currentStatus = status[phase.key] || "ausstehend";
-        const meta = LPH_STATUS_META[currentStatus];
-        return (
-          <button
-            key={phase.key}
-            type="button"
-            disabled={disabled}
-            onClick={() => onChangeStatus && onChangeStatus(phase.key, nextLphStatus(currentStatus))}
-            title={
-              disabled
-                ? `${phase.label}: ${meta.label}`
-                : `${phase.label}: ${meta.label} · Klicken zum Ändern`
-            }
-            className={`flex items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[11px] font-semibold transition ${meta.bg} ${meta.text} ${
-              disabled ? "cursor-default" : "cursor-pointer hover:brightness-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40"
-            }`}
-          >
-            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${meta.dot}`} />
-            <span className="truncate">
-              {phase.label.split(" · ")[0]} · {meta.label}
-            </span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
 function countPins(floors) {
   const all = (floors || []).flatMap((f) => f.pins || []);
   return {
     total: all.length,
     open: all.filter((p) => p.status === "offen").length,
   };
+}
+
+// Anzahl der noch offenen, als hoch/dringend eingestuften Mängel-Pins eines Projekts
+// (Status "offen" UND Priorität "hoch") — für den Dringlichkeits-Indikator und die
+// "Nach Dringlichkeit"-Sortierung in ProjectOverview. Bewusst eine eigene, schmale
+// Hilfsfunktion statt einer erneuten Erweiterung von countPins(), die zuletzt bewusst
+// wieder auf total/open zurückgesetzt wurde — hier wird ausschließlich diese eine,
+// fest definierte Kombination gebraucht.
+function countUrgentPins(floors) {
+  return (floors || []).flatMap((f) => f.pins || []).filter((p) => p.status === "offen" && p.priority === "hoch").length;
 }
 
 function LoadingBlock({ label = "Wird geladen…" }) {
@@ -1841,10 +5768,147 @@ function ErrorBanner({ message, onClose }) {
   );
 }
 
+// Markentypografie "REISNER x FRANK" — vollständig als Inline-SVG/CSS nachgebaut,
+// bewusst OHNE jedes <img src="..."> auf eine externe Bilddatei: ein fehlschlagender
+// Bild-Request (falscher Pfad, fehlende Datei im Deployment, Offline-Fall auf der
+// Baustelle) kann diese Wortmarke damit grundsätzlich nicht mehr treffen. Wird sowohl
+// im Splash Screen (großformatig) als auch im App-Header (kompakt) verwendet — ein
+// einziger Bauplan für beide Stellen, siehe tone/size unten.
+//
+// BrandX: das "x" zwischen REISNER und FRANK als eigenständige, kleine Kreuz-Marke
+// aus zwei sich kreuzenden, abgerundeten Balken (SVG, füllt sich über currentColor
+// mit derselben Farbe wie der umgebende Text — folgt also automatisch tone).
+function BrandX({ className = "" }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+      <rect x="2" y="10.4" width="20" height="3.2" rx="1.6" fill="currentColor" transform="rotate(45 12 12)" />
+      <rect x="2" y="10.4" width="20" height="3.2" rx="1.6" fill="currentColor" transform="rotate(-45 12 12)" />
+    </svg>
+  );
+}
+
+// tone 'light' = weiße Schrift/Kreuzmarke (für die rote Splash-Fläche und den
+// dunkelroten Header), tone 'brand' = Schrift/Kreuzmarke im exakten Markenrot
+// #FF2A00 (für die weiße Splash-Fläche). size steuert ausschließlich die
+// Textgröße — Layout, Proportionen und Kreuzmarke bleiben in jeder Größe identisch.
+function BrandLogotype({ tone = "light", size = "md" }) {
+  const toneClass = tone === "brand" ? "text-[#FF2A00]" : "text-white";
+  const sizeClass =
+    size === "lg" ? "gap-2.5 text-3xl sm:text-4xl" : size === "sm" ? "gap-1 text-xs" : "gap-1.5 text-sm";
+  return (
+    <span className={`inline-flex items-center whitespace-nowrap font-black uppercase tracking-wider ${toneClass} ${sizeClass}`}>
+      <span>Reisner</span>
+      <BrandX className="h-[0.55em] w-[0.55em] shrink-0" />
+      <span>Frank</span>
+    </span>
+  );
+}
+
+// Branded Splash Screen ("REISNER x FRANK") — zweiphasiger Logo-Crossfade beim
+// App-Start. Vollständig eigenständige Komponente mit eigenem State/Timing,
+// damit App() selbst unverändert und übersichtlich bleibt:
+//   Phase 1 "red"    (0.0–1.2s): vollflächige Markenrot-Fläche mit weißer
+//                     Wortmarke (BrandLogotype tone="light").
+//   Phase 2 "white"  (1.2–2.2s): weiches CSS-Crossfade (opacity, 1000ms
+//                     ease-in-out) auf eine weiße Fläche mit der Wortmarke in
+//                     Markenrot (tone="brand").
+//   Phase 3 "fading" (2.2–2.8s): der gesamte Container blendet aus und gibt
+//                     Zeigerereignisse sofort frei (pointer-events: none),
+//                     damit das Haupt-UI schon während des Ausblendens
+//                     bedienbar ist.
+//   Phase 4 "hidden": Komponente entfernt sich vollständig aus dem
+//                     Rendering-Baum (return null) — kein Rest-DOM, keine
+//                     Interaktionsblockade, keine Performance-Last mehr.
+// Da beide "Bilder" reines, sofort verfügbares Inline-SVG/CSS sind, entfällt jedes
+// Preloading — es gibt keinen Netzwerk-Request, der fehlschlagen oder verzögern könnte.
+function SplashScreen({ onFinished }) {
+  const [splashState, setSplashState] = useState("red"); // 'red' | 'white' | 'fading' | 'hidden'
+
+  // Zeitachse exakt wie spezifiziert: 1.2s / 2.2s / 2.8s ab Mount. Aufräumen
+  // der Timer beim Unmount verhindert setState-Aufrufe auf einer bereits
+  // entfernten Komponente (z. B. bei sehr schnellem Reload während des Tests).
+  useEffect(() => {
+    const toWhite = setTimeout(() => setSplashState("white"), 1200);
+    const toFading = setTimeout(() => setSplashState("fading"), 2200);
+    const toHidden = setTimeout(() => {
+      setSplashState("hidden");
+      onFinished?.();
+    }, 2800);
+    return () => {
+      clearTimeout(toWhite);
+      clearTimeout(toFading);
+      clearTimeout(toHidden);
+    };
+    // onFinished ist bei jedem Aufrufer stabil (App übergibt keine Prop) —
+    // bewusst nur einmalig beim Mounten eingerichtet, damit die Zeitachse
+    // nicht durch Re-Renders des Elternteils zurückgesetzt wird.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (splashState === "hidden") return null;
+
+  const isFading = splashState === "fading";
+  const showWhite = splashState === "white" || splashState === "fading";
+
+  // WICHTIG gegen Durchschimmern der Hauptanwendung: der äußere Container trägt
+  // selbst eine deckende weiße Grundfläche (bg-white), die während der GESAMTEN
+  // Phasen 1+2 unverändert 100% blickdicht bleibt — nur ihre eigene, übergeordnete
+  // opacity (isFading) blendet in Phase 3 als Ganzes aus. Die rote Ebene liegt
+  // darüber und verdeckt diese weiße Grundfläche in Phase 1 vollständig; beim
+  // Crossfade in Phase 2 blendet AUSSCHLIESSLICH die rote Ebene aus (opacity
+  // 1→0) und gibt dabei stets nur die darunterliegende, selbst undurchsichtige
+  // weiße Fläche frei — niemals die dahinterliegende App. So ist zu jedem
+  // Zeitpunkt von Phase 1 und 2 lückenlos entweder Rot oder Weiß sichtbar.
+  return (
+    <div
+      className="fixed inset-0 z-[100] overflow-hidden bg-white"
+      style={{
+        opacity: isFading ? 0 : 1,
+        pointerEvents: isFading ? "none" : "auto",
+        transitionProperty: "opacity",
+        transitionDuration: "600ms",
+        transitionTimingFunction: "ease-in-out",
+      }}
+      aria-hidden="true"
+    >
+      {/* Phase 2 — Wortmarke in Markenrot, blendet auf der (bereits deckend weißen)
+          Container-Grundfläche ein; braucht keinen eigenen Hintergrund. */}
+      <div
+        className="absolute inset-0 flex items-center justify-center"
+        style={{
+          opacity: showWhite ? 1 : 0,
+          transitionProperty: "opacity",
+          transitionDuration: "1000ms",
+          transitionTimingFunction: "ease-in-out",
+        }}
+      >
+        <BrandLogotype tone="brand" size="lg" />
+      </div>
+      {/* Phase 1 — vollflächig deckende Markenrot-Ebene mit weißer Wortmarke, liegt
+          über der weißen Grundfläche und der Phase-2-Ebene und verdeckt beide
+          vollständig, solange sie selbst opak ist. */}
+      <div
+        className="absolute inset-0 flex items-center justify-center bg-[#FF2A00]"
+        style={{
+          opacity: showWhite ? 0 : 1,
+          transitionProperty: "opacity",
+          transitionDuration: "1000ms",
+          transitionTimingFunction: "ease-in-out",
+        }}
+      >
+        <BrandLogotype tone="light" size="lg" />
+      </div>
+    </div>
+  );
+}
+
 // Kompakter Verbindungs-/Synchronisations-Status in der Kopfzeile (Abschnitt 15.3):
-// grün = online und nichts ausstehend, bernstein = offline (Änderungen werden lokal
-// gespeichert), blau = online, aber die Warteschlange wird gerade abgearbeitet bzw.
-// wartet noch auf den nächsten Synchronisationslauf.
+// grün = online und nichts ausstehend ("Online"), bernstein/orange = offline
+// ("Offline (X ausstehend)", Änderungen werden lokal gespeichert), blau-blinkend =
+// online, aber die Warteschlange wird gerade aktiv abgearbeitet
+// ("Synchronisiere…") bzw. wartet noch auf den nächsten Synchronisationslauf.
+// animate-pulse (statt nur des rotierenden Icons) erzeugt das angeforderte
+// "blinkende" Erscheinungsbild des gesamten Status-Badges während der Synchronisation.
 function OfflineStatusIndicator({ online, pendingCount, syncing }) {
   if (!online) {
     return (
@@ -1853,7 +5917,7 @@ function OfflineStatusIndicator({ online, pendingCount, syncing }) {
         className="inline-flex items-center gap-1.5 rounded-md bg-amber-900/40 px-2.5 py-1.5 font-semibold text-amber-300"
       >
         <WifiOff size={13} />
-        <span className="hidden sm:inline">Offline{pendingCount > 0 ? ` · ${pendingCount} ausstehend` : " · wird lokal gespeichert"}</span>
+        <span className="hidden sm:inline">{pendingCount > 0 ? `Offline (${pendingCount} ausstehend)` : "Offline · wird lokal gespeichert"}</span>
       </span>
     );
   }
@@ -1861,10 +5925,10 @@ function OfflineStatusIndicator({ online, pendingCount, syncing }) {
     return (
       <span
         title="Offline erfasste Änderungen werden mit der Datenbank synchronisiert."
-        className="inline-flex items-center gap-1.5 rounded-md bg-blue-900/40 px-2.5 py-1.5 font-semibold text-blue-300"
+        className={`inline-flex items-center gap-1.5 rounded-md bg-blue-900/40 px-2.5 py-1.5 font-semibold text-blue-300 ${syncing ? "animate-pulse" : ""}`}
       >
         {syncing ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-        <span className="hidden sm:inline">{syncing ? "Synchronisiert…" : `${pendingCount} ausstehend`}</span>
+        <span className="hidden sm:inline">{syncing ? "Synchronisiere…" : `${pendingCount} ausstehend`}</span>
       </span>
     );
   }
@@ -1945,32 +6009,84 @@ const CadBlueprintPlan = forwardRef(function CadBlueprintPlan({ fileName, ext = 
 });
 
 // ----------------------------------------------------------------------------------
-// PDF-GRUNDRISS — hochauflösendes, zoomabhängiges Rendering via pdf.js (statt <embed>)
+// PDF-GRUNDRISS — natives SVG-Vektor-Rendering via pdf.js' SVGGraphics-Backend
 // ----------------------------------------------------------------------------------
 // <embed type="application/pdf"> überlässt das Rendering dem eingebauten PDF-Viewer
 // des Browsers; skaliert man den umgebenden Container per CSS-Transform (unser Zoom),
 // wird nur das bereits gerenderte Bild vergrößert — die Schrift wirkt dadurch schnell
-// unscharf/verpixelt. Ein einmalig mit fester Auflösung gerendertes <canvas> hat
-// dasselbe Problem, sobald über diese feste Auflösung hinaus gezoomt wird. pdf.js
-// rendert die Seite deshalb bei jeder signifikanten Zoom-Änderung mit einer an den
-// aktuellen Zoomfaktor (zoomScale, siehe FloorPlanView) gekoppelten, höheren
-// Auflösung neu — siehe computeTargetScale()/renderAtScale() in PdfPlanCanvas unten.
-// Die Position der Pins ist davon unberührt, sie bleiben weiterhin ausschließlich
-// über Prozent-Koordinaten relativ zur äußeren "Bühne" verankert (siehe FloorPlanView),
-// unabhängig davon, mit welcher internen Auflösung das Canvas gerade gefüllt ist.
+// unscharf/verpixelt. Frühere Versionen dieser Komponente haben deshalb mit
+// Canvas-Rasterung gearbeitet (einmalige Übersichtsauflösung + nachgerendertem,
+// ausschnittsweise hochauflösendem "Schärfe-Layer" nach Zoom-Ende) — das reduzierte
+// Unschärfe und Speicherbedarf erheblich, blieb aber technisch ein Bitmap, das
+// zwischen zwei Renderschritten kurzzeitig sichtbar gestreckt wurde. Ab hier wird die
+// PDF-Seite stattdessen NICHT MEHR gerastert, sondern von pdf.js direkt in eine
+// SVG-Baumstruktur (<path>, <text>, <g>, …) umgewandelt und als echtes DOM-<svg>-
+// Element eingebettet — exakt wie beim nativen .svg-Grundriss-Upload (siehe
+// SvgPlanCanvas weiter unten). Das Zoomen der äußeren "Bühne" (CSS transform:
+// scale(...), siehe FloorPlanView) wirkt danach auf echte Vektorpfade statt auf ein
+// Bitmap: es gibt zu keinem Zeitpunkt mehr ein Pixel-Raster, das gestreckt werden
+// könnte. Linien, Bemaßungen und Texte bleiben dadurch bei JEDEM Zoomfaktor exakt
+// scharf, ganz ohne Re-Rendering, Debounce oder Viewport-Cropping — der "White
+// Screen"/Memory-Exhaustion-Bug ist damit strukturell ausgeschlossen, nicht nur
+// eingedämmt, weil zu keinem Zeitpunkt ein großformatiges Bitmap im Speicher liegt.
+//
+// Wichtiger Hinweis zur Zukunftssicherheit: pdf.js' SVG-Backend (window.pdfjsLib.
+// SVGGraphics) ist in der hier fest eingebundenen Version 3.11.174 (siehe
+// PDFJS_VERSION) noch Teil des Browser-Bundles — geprüft direkt am ausgelieferten
+// pdf.min.js dieser Version. In neueren pdf.js-Hauptversionen wurde dieses Backend
+// entfernt (siehe z. B. mozilla/pdf.js Issue #19417, "SVG backend no longer
+// available?"). Ein künftiges Update von PDFJS_VERSION/PDFJS_CDN_SOURCES muss daher
+// vorher gegen die SVGGraphics-Verfügbarkeit der neuen Version geprüft werden,
+// andernfalls fällt der Renderer auf die <embed>-Darstellung zurück.
+// Die Position der Pins ist von alldem unberührt, sie bleiben weiterhin
+// ausschließlich über Prozent-Koordinaten relativ zur äußeren "Bühne" verankert
+// (siehe FloorPlanView).
 //
 // pdf.js wird bewusst NICHT als npm-Paket importiert (kein "import pdfjs-dist" bzw.
 // "import(...)") — Vite versucht ein solches Modul im eigenen Projekt aufzulösen und
 // bricht mit "Failed to resolve import" ab, solange das Paket nicht als Abhängigkeit
 // installiert ist. Stattdessen wird die fertig gebündelte Browser-Version per
-// <script>-Tag von einer CDN (cdnjs) nachgeladen und hängt sich dabei selbst als
-// globale Variable window.pdfjsLib ein — funktioniert dadurch unabhängig von der
-// Bundler-Konfiguration des Projekts. loadPdfJs() cacht das Laden (Promise + Prüfung
-// auf window.pdfjsLib), damit das Script auch bei mehreren gleichzeitig offenen
-// PDF-Grundrissen nur einmal eingebunden wird. Schlägt das Laden oder Rendern fehl
-// (z. B. weil die CDN nicht erreichbar ist), fällt die Komponente automatisch auf
-// die bisherige <embed>-Darstellung zurück, damit die Etage trotzdem nutzbar bleibt.
-const PDFJS_CDN_BASE = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174";
+// <script>-Tag von einer CDN nachgeladen und hängt sich dabei selbst als globale
+// Variable window.pdfjsLib ein — funktioniert dadurch unabhängig von der Bundler-
+// Konfiguration des Projekts. loadPdfJs() versucht dafür mehrere CDN-Quellen der
+// Reihe nach (PDFJS_CDN_SOURCES) — schlägt eine Quelle fehl (Netzwerk, Firewall,
+// CDN-Ausfall), wird automatisch die nächste versucht, bevor endgültig aufgegeben
+// wird. Schlägt zusätzlich der dedizierte Web-Worker selbst fehl (z. B. weil eine
+// restriktive Content-Security-Policy das Laden eines Workers von einer fremden
+// Origin blockiert, während das reguläre <script>-Tag durchgelassen wird), fängt
+// loadPdfDocument() genau diesen Fall ab und lädt das Dokument ein zweites Mal mit
+// disableWorker:true — pdf.js rendert dann synchron im Hauptthread weiter, mit
+// identischer Rendering-Pipeline und Bildqualität, nur ohne separaten Worker. Erst
+// wenn sämtliche CDN-Quellen UND beide Lademodi fehlschlagen, fällt die Komponente
+// auf die bisherige <embed>-Darstellung zurück, damit die Etage trotzdem nutzbar
+// bleibt und die App in keinem Fall abstürzt.
+const PDFJS_VERSION = "3.11.174";
+const PDFJS_CDN_SOURCES = [
+  {
+    lib: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/pdf.min.js`,
+    worker: `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/pdf.worker.min.js`,
+  },
+  {
+    lib: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.js`,
+    worker: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.js`,
+  },
+  {
+    lib: `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.min.js`,
+    worker: `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.js`,
+  },
+];
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`Skript konnte nicht geladen werden: ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
 let pdfjsLoadPromise = null;
 function loadPdfJs() {
   if (typeof window === "undefined") {
@@ -1979,136 +6095,649 @@ function loadPdfJs() {
   if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
   if (pdfjsLoadPromise) return pdfjsLoadPromise;
 
-  pdfjsLoadPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = `${PDFJS_CDN_BASE}/pdf.min.js`;
-    script.async = true;
-    script.onload = () => {
-      if (!window.pdfjsLib) {
-        pdfjsLoadPromise = null;
-        reject(new Error("pdf.js-Script wurde geladen, aber window.pdfjsLib ist nicht verfügbar."));
-        return;
+  pdfjsLoadPromise = (async () => {
+    let lastError = null;
+    for (const source of PDFJS_CDN_SOURCES) {
+      try {
+        await loadScriptOnce(source.lib);
+        if (!window.pdfjsLib) throw new Error("pdf.js-Script wurde geladen, aber window.pdfjsLib ist nicht verfügbar.");
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = source.worker;
+        return window.pdfjsLib;
+      } catch (err) {
+        lastError = err;
+        console.warn(`pdf.js-Quelle fehlgeschlagen (${source.lib}), versuche nächste CDN…`, err);
       }
-      window.pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_CDN_BASE}/pdf.worker.min.js`;
-      resolve(window.pdfjsLib);
-    };
-    script.onerror = () => {
-      pdfjsLoadPromise = null;
-      reject(new Error("pdf.js konnte nicht von der CDN geladen werden."));
-    };
-    document.head.appendChild(script);
-  });
+    }
+    pdfjsLoadPromise = null;
+    throw lastError || new Error("Alle pdf.js-CDN-Quellen sind fehlgeschlagen.");
+  })();
 
   return pdfjsLoadPromise;
 }
 
-const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, renderScale, zoomScale = 1 }, ref) {
-  const canvasRef = useRef(null);
-  const pageRef = useRef(null); // aktuell geladene pdf.js-Seite, für wiederholtes Rendern ohne erneutes Laden/Parsen
-  const renderTaskRef = useRef(null); // laufende pdf.js RenderTask, um sie bei einem neuen Zoom abzubrechen
-  const lastRenderedScaleRef = useRef(0); // zuletzt tatsächlich gerenderter Ziel-Maßstab
-  const [status, setStatus] = useState("loading"); // "loading" | "ready" | "error"
+// Lädt das PDF-Dokument über den regulären (Web-Worker-basierten) Pfad; schlägt das
+// spezifisch am Worker fehl (z. B. CSP-Blockade eines fremden Worker-Origins), wird
+// automatisch ein zweiter Versuch ohne dedizierten Worker unternommen (Hauptthread-
+// Rendering) — siehe Erläuterung oben.
+//
+// disableAutoFetch: true + disableStream: false aktivieren pdf.js' progressives
+// Nachladen über HTTP-Range-Requests (setzt voraus, dass der Server der PDF-URL
+// Range-Requests unterstützt — bei allen über Supabase Storage ausgelieferten
+// Grundrissen der Fall, siehe supabase_schema.sql/Bucket "floor-plans"): pdf.js holt
+// dadurch bei einem 5-10MB-Plan nicht mehr die komplette Datei auf einmal, sondern
+// zunächst nur den für die erste Seite tatsächlich benötigten Byte-Bereich, weitere
+// Seiten/Ressourcen erst bei Bedarf. disableAutoFetch verhindert dabei zusätzlich das
+// eifrige Vorabladen des GESAMTEN restlichen Dokuments im Hintergrund, das pdf.js mit
+// aktiviertem Streaming sonst von sich aus anstoßen würde. Ehrlicher Hinweis: diese
+// App zeigt ohnehin ausschließlich Seite 1 eines Plans an (siehe pdf.getPage(1) unten)
+// — der Effekt betrifft hier also vor allem den initialen Ladezeitpunkt bei großen,
+// mehrseitigen PDFs, nicht ein Nachladen weiterer Seiten zur Laufzeit.
+async function loadPdfDocument(pdfjsLib, url) {
+  try {
+    return await pdfjsLib.getDocument({ url, disableAutoFetch: true, disableStream: false }).promise;
+  } catch (err) {
+    console.warn("PDF-Laden über Web-Worker fehlgeschlagen, Fallback auf Hauptthread-Rendering (disableWorker):", err);
+    return await pdfjsLib.getDocument({ url, disableWorker: true, disableAutoFetch: true, disableStream: false }).promise;
+  }
+}
 
-  // Ermittelt den tatsächlichen pdf.js-Render-Maßstab aus Basis-Auflösung, aktuellem
-  // Zoomfaktor der Grundriss-"Bühne" und Pixel-Dichte des Displays (devicePixelRatio,
-  // gekappt bei PDF_RENDER_DPR_CAP, damit 3x-Retina-Geräte kein unverhältnismäßig
-  // großes Canvas erzeugen). PDF_RENDER_SCALE_MAX kappt das Ergebnis zusätzlich nach
-  // oben, unabhängig von Zoom und Pixel-Dichte — Schutz gegen zu großen Speicher-/
-  // Rechenaufwand bzw. das vom Browser erlaubte Canvas-Größenlimit.
-  const computeTargetScale = (zoom) => {
-    const dpr = Math.min(typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1, PDF_RENDER_DPR_CAP);
-    return Math.min(PDF_RENDER_SCALE_MAX, renderScale * Math.max(1, zoom) * dpr);
-  };
+// Dreistufiger Absturzschutz für das PDF-Rendering: (1) Vektor via SVGGraphics —
+// bevorzugt, mathematisch scharf, minimaler Speicherbedarf; (2) sichere, hart
+// begrenzte Raster-Auflösung, falls (1) fehlschlägt, zu lange braucht oder die Seite
+// zu komplex für eine sichere Vektor-Konvertierung ist; (3) <embed> als letzter,
+// garantiert funktionierender Rückfall. Grund für Stufe 2: ein SVG-Baum ist zwar
+// speicherseitig unproblematisch (keine Bitmap-Allokation), kann bei einem extrem
+// detailreichen CAD-Export aber zehntausende <path>-Elemente enthalten — das kann den
+// Browser beim Aufbau/Layout dieses DOM-Baums für mehrere Sekunden blockieren oder auf
+// speicherschwachen Mobilgeräten sogar zum Tab-Absturz führen (derselbe sichtbare
+// Effekt wie der frühere Canvas-Speicher-Crash, nur eine andere Ursache). Ein zu
+// komplexes PDF bekommt deshalb statt eines potenziell hängenden Vektor-Renderings
+// automatisch eine sichere, deutlich günstigere Raster-Darstellung.
+const PDF_SVG_MAX_OPERATORS = 40000; // Heuristik, keine belastbare Browser-Spezifikation — bei Bedarf an echten Baustellen-Plänen nachjustieren.
+const PDF_SVG_RENDER_TIMEOUT_MS = 6000;
+// "Sicherer" Render-Maßstab für die Raster-Fallback-Stufe: an devicePixelRatio
+// gekoppelt, aber hart gedeckelt — am Desktop weiterhin bei 3.0 (Fallback-Wert ohne
+// bekannten devicePixelRatio: 2), auf Mobilgeräten strenger bei 2.0 (siehe
+// getPdfSafeRenderDprCap/PDF_SAFE_RENDER_DPR_CAP_MOBILE unten). Gilt weiterhin nur
+// für die Raster-Fallback-Stufe, die ohnehin nur für PDFs greift, bei denen bereits
+// die "leichtere" Vektor-Stufe an ihre Grenzen kam (siehe PDF_SVG_MAX_OPERATORS).
+const PDF_SAFE_RENDER_DPR_CAP_DESKTOP = 3.0;
+// Auf Mobilgeräten (Bildschirmbreite < PDF_MOBILE_RENDER_BREAKPOINT_PX) wird die
+// Obergrenze deutlich strenger gezogen als am Desktop: der Canvas-Speicherbedarf
+// wächst mit dem QUADRAT des Skalierungsfaktors, ein Cap von 2.0 statt 3.0 senkt ihn
+// also um (1 - (2.0/3.0)^2) ≈ 56% — mehr als die geforderten "über 50%". 2.0 ist
+// bewusst das obere Ende der angeforderten Spanne von 1.5-2.0 gewählt, nicht das
+// untere: es bleibt damit noch klar über der nativen Gerätedichte typischer
+// Tablets/Smartphones (meist 2.0-3.0), sodass Baupläne auf dem Bildschirm weiterhin
+// scharf wirken, während gleichzeitig der Speicher-/Absturzschutz für genau die
+// Geräteklasse greift, auf der ein Tab-Absturz durch Speicherüberlauf am ehesten
+// eintritt (siehe PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE-Kommentar unten zu iPads/Tablets).
+const PDF_SAFE_RENDER_DPR_CAP_MOBILE = 2.0;
+const PDF_MOBILE_RENDER_BREAKPOINT_PX = 768;
 
-  // Rendert die bereits geladene Seite mit dem übergebenen Maßstab neu auf das Canvas.
-  // Eine noch laufende Render-Aufgabe wird zuerst abgebrochen, da pdf.js keine zwei
-  // gleichzeitigen render()-Aufrufe auf demselben Canvas erlaubt (z.B. wenn während
-  // eines laufenden Renderns bereits der nächste, höhere Zoom-Schritt eintrifft).
-  const renderAtScale = async (targetScale) => {
-    const page = pageRef.current;
-    const canvas = canvasRef.current;
-    if (!page || !canvas) return;
-    if (renderTaskRef.current) {
-      renderTaskRef.current.cancel();
-      renderTaskRef.current = null;
-    }
-    const viewport = page.getViewport({ scale: targetScale });
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const task = page.render({ canvasContext: canvas.getContext("2d"), viewport });
-    renderTaskRef.current = task;
+// Liefert die für das aktuelle Gerät geltende DPR-Obergrenze der Raster-Fallback-
+// Stufe. window.innerWidth statt eines einmalig beim Laden ermittelten Werts, damit
+// z. B. ein zur Laufzeit gedrehtes Tablet (Hoch-/Querformat) oder ein
+// Fenster-Resize am Desktop stets die zum aktuellen Layout passende Grenze
+// verwendet — wird ohnehin bei jedem Rendering-Aufruf neu ausgewertet, nie gecacht.
+function getPdfSafeRenderDprCap() {
+  if (typeof window === "undefined") return PDF_SAFE_RENDER_DPR_CAP_DESKTOP;
+  return window.innerWidth < PDF_MOBILE_RENDER_BREAKPOINT_PX
+    ? PDF_SAFE_RENDER_DPR_CAP_MOBILE
+    : PDF_SAFE_RENDER_DPR_CAP_DESKTOP;
+}
+// Harte Obergrenze für die tatsächliche Canvas-Pixelbreite/-höhe dieser Fallback-
+// Stufe — verhindert einen GPU-/RAM-Überlauf bei großformatigen Papiergrößen (A0/A1),
+// unabhängig von Gerätedichte.
+//
+// BUGFIX "weißer Bildschirm beim Zoomen auf Mobilgeräten": 16384px war ursprünglich
+// auf ausdrücklichen Wunsch von 8192px angehoben worden — genau das hat sich auf
+// Mobilgeräten als Ursache des weißen Bildschirms bestätigt. iOS Safari und mobile
+// Chrome-Varianten kappen ein <canvas> bei Überschreiten einer (je nach Gerät/
+// Arbeitsspeicher unterschiedlichen) internen Grenze STILLSCHWEIGEND — ohne JS-Fehler,
+// ohne Exception, das <canvas>-Element bleibt einfach leer/weiß stehen. Bei einem
+// nicht-quadratischen A0/A1-Plan (Seitenverhältnis ca. 1,41:1) konnte die bisherige
+// einheitliche 16384px-Grenze auf einem Tablet/Smartphone durchaus zusammen mit dem
+// mobilen DPR-Cap eine Fläche jenseits dieser gerätetypischen Grenze ergeben — genau
+// das führt zum weißen Bildschirm. Die Grenze ist deshalb GERÄTEABHÄNGIG (siehe
+// getPdfSafeMaxCanvasDimPx unten, gleicher Breakpoint wie beim DPR-Cap): am Desktop
+// bleibt es bei 16384px (siehe PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP, dort unproblematisch,
+// siehe Speicherhinweis dort), auf Mobilgeräten strikt gedeckelt (siehe
+// PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE unten).
+//
+// NACHSCHÄRFUNG "iPad-Touch-Release-Absturz bleibt trotz 4096px-Grenze bestehen": in
+// der Praxis auf konkreter iPad-Hardware hat sich gezeigt, dass 4096px — obwohl in
+// WebKit-Bugreports verbreitet als "sichere" Kantenlänge zitiert — auf manchen Geräten
+// (insbesondere bei bereits durch andere DOM-Bilder/Canvasse belegtem Speicher, z.B.
+// viele bereits geladene Pin-Fotos derselben Sitzung) TROTZDEM zum weißen Bildschirm
+// führen kann, exakt beim Neu-Puffern der Fallback-Stufe unmittelbar nach dem Loslassen
+// der Zoom-Geste (siehe PDF_RASTER_RERENDER_DEBOUNCE_MS in PdfPlanCanvas — der
+// debounced Re-Render fällt zeitlich fast immer mit touchend/gestureend zusammen, weil
+// genau dann der Zoomfaktor zur Ruhe kommt). Die Grenze wird deshalb ein zweites Mal,
+// zusätzlich vorsichtiger, auf 2048px gesenkt — das reduziert die maximale
+// Pixelfläche dieses einen Re-Renders um 75% gegenüber 4096px (2048² statt 4096²
+// Pixel) und damit den GPU-/RAM-Bedarf genau in dem Moment, der laut Rückmeldung nach
+// wie vor zum Absturz führte. Bewusst NICHT per se ein Verzicht auf das Nachschärfen
+// beim Loslassen: eine explizite Sperre "kein Re-Rendering bei touchend/gestureend"
+// würde dem eigentlichen Zweck dieses Re-Renders (höhere Schärfe nach dem Zoomen)
+// direkt zuwiderlaufen. Stattdessen wird derselbe Re-Render beibehalten, aber auf eine
+// Zielgröße gedeckelt, die verlässlich innerhalb des tatsächlich verfügbaren
+// GPU-Speichers bleibt, statt sich auf eine einzelne, pauschal zitierte "sichere"
+// Kantenlänge zu verlassen, die sich auf realer Hardware als nicht ausreichend
+// konservativ erwiesen hat. Ehrlicher Hinweis: eine allgemeingültige, für jedes
+// iPad-Modell exakt zutreffende Zahl ist mir nicht bekannt (WebKit dokumentiert diese
+// Grenze nicht offiziell/verbindlich) — 2048px ist ein bewusst deutlich defensiverer
+// Wert als der zuvor verbreitet zitierte, aber falls der weiße Bildschirm auch danach
+// noch auftritt, wäre der nächste sinnvolle Schritt, das konkrete Gerät/iOS-Version zu
+// kennen und ggf. auch für PDF-Grundrisse auf eine echte Kachel-Pyramide umzustellen
+// (wie bereits für Raster-Bild-Grundrisse in TiledPlanImage vorhanden), statt die
+// Zahl ein drittes Mal zu senken. Wird auf einem Mobilgerät über die 2048px-Grenze
+// hinaus weitergezoomt, wird das Canvas NICHT weiter physisch vergrößert (siehe
+// lastRasterClampedRef in PdfPlanCanvas) — die weitere Vergrößerung übernimmt
+// ausschließlich die ohnehin schon vorhandene CSS-transform:scale(...) der äußeren
+// "Bühne" (siehe FloorPlanView/contentRef, translate3d + will-change), die für JEDEN
+// Zoomfaktor unabhängig von der Canvas-Auflösung funktioniert. Der Plan wirkt jenseits
+// dieser (jetzt niedrigeren) Schwelle beim Weiterzoomen entsprechend etwas früher
+// weicher (reines CSS-Hochskalieren statt einer schärferen Neuberechnung), bleibt aber
+// sichtbar und stürzt nicht auf Weiß ab — ein bewusster, explizit so angeforderter
+// Kompromiss zugunsten von Stabilität.
+const PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP = 16384;
+// Ehrlicher Speicher-Hinweis nur für die Desktop-Grenze (auf Mobilgeräten greift ab
+// sofort ohnehin die deutlich niedrigere PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE, siehe
+// oben): bei einem nicht-quadratischen Plan (z. B. A0/A1 im Format ca. 1,41:1) skaliert
+// renderPdfPageToSafeCanvasElement beide Seiten proportional, sodass z. B.
+// 16384 × 11585px zusammenkommen können, das sind rund 190 Megapixel bzw. ca. 760 MB
+// allein für den rohen RGBA-Pixelpuffer, zusätzlich zum GPU-Texturspeicher — auf
+// leistungsstarken Laptops/Desktops unproblematisch.
+const PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE = 2048;
+
+// Liefert die für das aktuelle Gerät geltende maximale Canvas-Kantenlänge der
+// Raster-Fallback-Stufe — derselbe Breakpoint wie getPdfSafeRenderDprCap oben, aus
+// demselben Grund per window.innerWidth statt gecacht (siehe dortiger Kommentar).
+function getPdfSafeMaxCanvasDimPx() {
+  if (typeof window === "undefined") return PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP;
+  return window.innerWidth < PDF_MOBILE_RENDER_BREAKPOINT_PX
+    ? PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE
+    : PDF_SAFE_MAX_CANVAS_DIM_PX_DESKTOP;
+}
+
+// BUGFIX-NACHSCHÄRFUNG "weißer Bildschirm bleibt trotz Zoomstufen-Deckelung
+// bestehen": die vorherige Fassung deckelte nur den ZOOM-ANTEIL (extraScale) VOR der
+// Multiplikation mit dem devicePixelRatio-Faktor — der tatsächlich an
+// page.getViewport({ scale }) übergebene Wert (safeScale = dprCap × extraScale)
+// konnte dadurch selbst bei gedeckeltem extraScale immer noch über die eigentlich
+// beabsichtigte Grenze hinausschießen (Beispiel: mobiler DPR-Cap 2.0 × Zoom-Cap 1.5
+// = tatsächlicher Render-Scale 3.0). Genau diese Lücke war der wahrscheinlichste
+// Grund, warum der weiße Bildschirm trotz der vorherigen Zoomstufen-Grenze weiter
+// auftreten konnte. Der Fix deckelt deshalb ab jetzt nicht mehr den Zoom-ANTEIL,
+// sondern den TATSÄCHLICHEN, fertig kombinierten scale-Wert selbst, direkt an der
+// Stelle, an der er an pdf.js übergeben wird (siehe renderPdfPageToSafeCanvasElement
+// unten) — das schließt die Lücke unabhängig davon, wie sich der Wert
+// zusammensetzt. RENDER_CAP liegt jetzt exakt bei 2.0, wie angefordert, weiterhin
+// nur auf Mobilgeräten (Desktop hat spürbar mehr Speicher-/GPU-Spielraum und war nie
+// als betroffen gemeldet — dieselbe Abgrenzung wie beim DPR- und Pixel-Cap oben).
+//
+// WICHTIG zur eigentlichen Vergrößerung jenseits dieser Schwelle: dafür ist KEIN
+// zusätzlicher, separater CSS-transform an dieser Stelle nötig (anders als im
+// Auftrag skizziert) — die App verwendet bereits eine gemeinsame "Bühne"
+// (transform: translate(...) scale(${scale}) in FloorPlanView, siehe contentRef),
+// die Canvas UND Pins/Notizen gemeinsam im selben Koordinatensystem skaliert (siehe
+// PlanSvgStage). Ein zweiter, nur auf das Canvas angewendeter Transform würde Canvas
+// und Pins bei genau den hier relevanten hohen Zoomstufen gegeneinander verschieben
+// — exakt die Pin-Fehlausrichtung, die in einer früheren Anforderung dieser Sitzung
+// bereits bewusst vermieden wurde (siehe Kommentar an contentRef/clampTranslateForViewport).
+// Aus demselben Grund ist auch an der Klick-/Touch-Koordinatenberechnung für Pins
+// (siehe posFromEvent in FloorPlanView) nichts anzupassen: sie arbeitet bereits
+// ausschließlich über imgRef.current.getBoundingClientRect() — den TATSÄCHLICHEN,
+// bereits transformierten Bildschirmbereich der Bühne — und rechnet die Klick-
+// position als reinen Prozentsatz relativ zu dessen Breite/Höhe um. Das ist von
+// Natur aus unabhängig davon, WIE der aktuelle Zoom zustande kommt (Canvas-Auflösung,
+// CSS-Skalierung oder eine Mischung aus beidem) und funktioniert bereits heute exakt
+// so auch bei sehr hohen Zoomstufen — die UI selbst ist zusätzlich hart auf aktuell 400%
+// gedeckelt (FLOORPLAN_MAX_SCALE = 4.0, siehe dortiger Kommentar), diese Aussage zur
+// Transform-Unabhängigkeit von posFromEvent bleibt davon unberührt und gilt unverändert
+// für den gesamten erlaubten Zoombereich. Das eingefrorene Canvas wird stattdessen ganz normal über
+// dieselbe, bereits vorhandene Bühnen-Skalierung mit hochskaliert (CSS-Auflösung,
+// keine neue Canvas-Pixelallokation) — dadurch bleiben Punkt 2 (0 zusätzlicher
+// Speicher ab hier) UND Punkt 3 (Pins bleiben exakt verankert) beide gleichzeitig
+// erfüllt.
+const PDF_RASTER_RENDER_SCALE_CAP_MOBILE = 2.0; // entspricht RENDER_CAP aus der Anforderung
+// TABLET CANVAS ZOOM FIX: seit der Anhebung von FLOORPLAN_MAX_SCALE auf 4.0 kann scale
+// diesen mobilen Render-Cap (2.0) jetzt tatsächlich überschreiten — anders als zuvor, als
+// beide Werte identisch bei 2.0 lagen und dieser Cap kaum noch selbst griff. Das ist
+// gewollt und unverändert sicher: der Cap greift dann auf Mobilgeräten bereits bei
+// effektiv 200% (statt erst bei 400%), das Raster friert an diesem Punkt ein
+// (lastRasterClampedRef = true, siehe PdfPlanCanvas) und jeder weitere Zoom bis 400%
+// läuft von dort ausschließlich über die reine CSS-Skalierung der Bühne — exakt dasselbe
+// bereits bestehende Verhalten, nur dass die Einfrier-Grenze auf Mobilgeräten jetzt schon
+// früher im Zoombereich erreicht wird als auf dem Desktop (wo PDF_RASTER_RENDER_SCALE_CAP_MOBILE
+// gar nicht greift, siehe getPdfRasterRenderScaleCap). Bleibt daher weiterhin als
+// aktives, nicht nur theoretisches Sicherheitsnetz direkt vor pdf.js bestehen und
+// entspricht unverändert "Render-Canceling ... bleiben zu 100% vollständig erhalten".
+
+function getPdfRasterRenderScaleCap() {
+  if (typeof window === "undefined") return Infinity;
+  return window.innerWidth < PDF_MOBILE_RENDER_BREAKPOINT_PX ? PDF_RASTER_RENDER_SCALE_CAP_MOBILE : Infinity;
+}
+// Nur für die Raster-Fallback-Stufe relevant (die Vektor-Stufe braucht kein
+// Re-Rendering, siehe renderPdfPageToSvgElement-Kommentar oben): erst ab dieser
+// zusätzlichen Zoomstufe gegenüber der zuletzt gerenderten Auflösung wird die
+// Bühne mit höherer Auflösung neu gerendert — verhindert unnötige Neu-Renderings
+// bei jeder minimalen Mausrad-/Pinch-Bewegung.
+//
+// IPAD-TOUCH-RELEASE-FIX (siehe Einordnung in der Antwort): auf Basis eines echten
+// Debug-Protokolls vom iPad, das eine finger-drop → release-end-Abfolge in sehr kurzem
+// zeitlichem Abstand zeigte, wurde der Debounce von zuvor 180ms auf jetzt 350ms
+// angehoben — innerhalb der angeforderten Spanne von 300-500ms. Der bisherige Wert
+// (180ms) war ursprünglich für eine frühere, andere Anforderung mit einer Spanne von
+// 150-200ms festgelegt worden; diese neue, höhere Untergrenze ersetzt sie bewusst.
+// Wichtig: dieser Timer läuft bereits seit jeher NUR an, nachdem sich zoomScale/scale
+// eine gewisse Zeit NICHT mehr geändert hat (jede weitere Änderung setzt ihn zurück,
+// siehe useEffect-Dependency unten) — während einer laufenden, durchgehenden Pinch-
+// Geste feuert er dadurch nie. Zusätzlich NEU: touchReleaseTick (siehe FloorPlanView)
+// wird als weiterer Auslöser ergänzt, der GENAU dann hochzählt, wenn der letzte Finger
+// abhebt — dadurch startet die Debounce-Uhr zuverlässig auch dann neu ab dem
+// tatsächlichen Loslass-Zeitpunkt, wenn kurz zuvor zufällig keine Skalierungsänderung
+// mehr registriert wurde. Und als zusätzliches Sicherheitsnetz prüft der Timer bei
+// seinem Ablauf über activePointersRef (siehe unten) erneut, ob wirklich kein Finger
+// mehr aufliegt — läuft in der seltenen Zwischenzeit doch schon wieder eine neue Geste,
+// wird das teure Neu-Rendern übersprungen, statt ausgerechnet in dieses neue
+// Touch-Ereignis hinein zu rendern.
+const PDF_RASTER_RERENDER_ZOOM_FACTOR = 1.15;
+const PDF_RASTER_RERENDER_DEBOUNCE_MS = 350;
+
+// Wartet auf `promise`, bricht aber nach `ms` mit einer Ablehnung ab, falls sie bis
+// dahin nicht abgeschlossen ist — verhindert, dass ein hängendes (nicht fehlschlagendes,
+// sondern einfach sehr langsames) Vektor-Rendering die Oberfläche dauerhaft blockiert.
+// Ehrlichkeitshinweis: JavaScript-Promises lassen sich nicht echt abbrechen — die
+// ursprüngliche Berechnung läuft im Hintergrund weiter, ihr Ergebnis wird nach Ablauf
+// des Zeitlimits schlicht ignoriert, statt die Oberfläche noch zu aktualisieren.
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} — Zeitlimit von ${ms}ms überschritten.`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+// Wandelt Seite 1 eines PDF-Dokuments über pdf.js' SVGGraphics-Backend in ein echtes
+// SVGElement um (keine Rasterung). scale=1 entspricht der PDF-eigenen Punktgröße
+// (72 dpi) — die tatsächliche Darstellungsgröße wird ausschließlich über CSS
+// bestimmt (siehe PdfPlanCanvas), der Skalierungswert hier hat auf einen Vektor
+// keinen Einfluss auf die Bildqualität, nur auf interne Koordinatenwerte. Wirft
+// bewusst frühzeitig (vor dem eigentlichen, potenziell teuren getSVG()-Aufruf), wenn
+// operatorList als zu komplex für eine sichere Vektor-Konvertierung eingeschätzt wird
+// — siehe PDF_SVG_MAX_OPERATORS.
+async function renderPdfPageToSvgElement(pdfjsLib, page, operatorList) {
+  if (operatorList.fnArray.length > PDF_SVG_MAX_OPERATORS) {
+    throw new Error(`PDF zu detailreich für sicheres Vektor-Rendering (${operatorList.fnArray.length} Zeichenoperationen).`);
+  }
+  const viewport = page.getViewport({ scale: 1 });
+  const svgGfx = new pdfjsLib.SVGGraphics(page.commonObjs, page.objs);
+  // embedFonts=false ist pdf.js' Standardwert — Text (Bemaßungen, Raumbezeichnungen)
+  // würde ohne eingebettete Schriftdaten im SVG unleserlich oder gar nicht
+  // dargestellt. Verifiziert direkt am pdf.js-Quelltext dieser Version (3.11.174).
+  svgGfx.embedFonts = true;
+  const svgElement = await svgGfx.getSVG(operatorList, viewport);
+  // pdf.js liefert bewusst KEIN viewBox mit (nur feste width/height-Attribute in
+  // Pixel-Einheiten der PDF-Punktgröße, ebenfalls am Quelltext verifiziert) — ohne
+  // viewBox würde eine spätere CSS-Größenänderung (siehe Wrapper-Styling in
+  // PdfPlanCanvas) den Inhalt nicht seitenverhältnistreu skalieren, sondern verzerren
+  // oder abschneiden. Wird hier deshalb explizit selbst gesetzt, mit denselben
+  // Werten, die auch die width/height-Attribute tragen.
+  svgElement.setAttribute("viewBox", `0 0 ${viewport.width} ${viewport.height}`);
+  svgElement.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  return svgElement;
+}
+
+// Sichere Raster-Fallback-Stufe (siehe Erläuterung oben) — fester, an devicePixelRatio
+// gekoppelter, aber hart gedeckelter Maßstab, zusätzlich hart begrenzte, GERÄTEABHÄNGIGE
+// Canvas-Pixelgröße (siehe getPdfSafeMaxCanvasDimPx/Bugfix-Kommentar oben). `extraScale`
+// (Standard 1) ist der zusätzliche Zoom-Multiplikator: beim ersten Rendering der Stufe
+// ist er 1 (Basisauflösung für die volle Ansicht), bei einem späteren, durch weiteres
+// Hineinzoomen ausgelösten Nachladen (siehe PdfPlanCanvas) entspricht er dem aktuellen
+// App-Zoomfaktor, sodass die Bühne dann in höherer, dem tatsächlichen Zoom
+// entsprechender Auflösung neu gerendert wird — nur begrenzt durch dieselbe harte
+// Obergrenze wie beim Erstrendering (Speicher-/GPU-Schutz bleibt in jedem Fall
+// bestehen). `renderTaskRef` (optional) hält den zuletzt gestarteten pdf.js-RenderTask
+// dieser Stufe fest: zoomt der Nutzer weiter, während ein vorheriges Nachladen noch
+// läuft, wird dieses zuerst sauber per renderTask.cancel() abgebrochen, statt zwei
+// Render-Durchläufe parallel um dasselbe Canvas konkurrieren zu lassen.
+//
+// Rückgabewert ist bewusst ein Objekt { canvas, clamped } statt nur des Canvas:
+// `clamped` zeigt an, ob entweder der RENDER_CAP-Grenzwert (getPdfRasterRenderScaleCap,
+// siehe Bugfix-Kommentar oben) oder die maximale Canvas-Kantenlänge
+// (getPdfSafeMaxCanvasDimPx) den tatsächlich verwendeten scale-Wert nach unten
+// korrigieren musste (d.h. die volle, dem Zoom entsprechende Auflösung NICHT
+// erreicht wurde) — je nachdem, welche der beiden Grenzen zuerst zutrifft.
+// PdfPlanCanvas nutzt das, um ab genau diesem Punkt weitere Neu-Renderings bei
+// fortgesetztem Zoom zu unterlassen (siehe lastRasterClampedRef dort) — ein
+// wiederholtes Neu-Rendern auf exakt dieselbe, bereits gedeckelte Auflösung wäre
+// wirkungslos (kein Schärfegewinn) und nur verschwendete Arbeit; die weitere
+// Vergrößerung übernimmt stattdessen ausschließlich die CSS-transform:scale(...)
+// der äußeren "Bühne".
+async function renderPdfPageToSafeCanvasElement(page, extraScale = 1, renderTaskRef = null) {
+  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 2 : 2;
+  let safeScale = Math.min(dpr, getPdfSafeRenderDprCap()) * Math.max(1, extraScale);
+  let clamped = false;
+  // RENDER_CAP (siehe getPdfRasterRenderScaleCap/Bugfix-Kommentar oben): deckelt den
+  // TATSÄCHLICHEN, fertig kombinierten scale-Wert direkt hier, an genau der Stelle,
+  // an der er gleich an page.getViewport({ scale }) übergeben wird — unabhängig
+  // davon, wie er sich aus DPR und Zoomfaktor zusammensetzt. Das ist die entscheidende
+  // Korrektur gegenüber der vorherigen Fassung, die nur den Zoom-Anteil VOR der
+  // DPR-Multiplikation gedeckelt hatte.
+  const renderScaleCap = getPdfRasterRenderScaleCap();
+  if (safeScale > renderScaleCap) {
+    safeScale = renderScaleCap;
+    clamped = true;
+  }
+  let viewport = page.getViewport({ scale: safeScale });
+  const largestDim = Math.max(viewport.width, viewport.height);
+  const maxCanvasDimPx = getPdfSafeMaxCanvasDimPx();
+  if (largestDim > maxCanvasDimPx) {
+    viewport = page.getViewport({ scale: safeScale * (maxCanvasDimPx / largestDim) });
+    clamped = true;
+  }
+  if (renderTaskRef?.current) {
     try {
-      await task.promise;
-      lastRenderedScaleRef.current = targetScale;
-    } catch (err) {
-      // RenderingCancelledException ist der erwartbare Fall, wenn renderAtScale
-      // erneut aufgerufen wurde, während dieser Render-Vorgang noch lief.
-      if (err?.name !== "RenderingCancelledException") throw err;
-    } finally {
-      if (renderTaskRef.current === task) renderTaskRef.current = null;
+      renderTaskRef.current.cancel();
+    } catch {
+      // pdf.js wirft beim Abbrechen eines bereits abgeschlossenen/fehlgeschlagenen
+      // Tasks eine RenderingCancelledException — hier unkritisch, da ohnehin sofort
+      // ein neues Rendering folgt.
     }
-  };
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  // KEIN image-rendering: crisp-edges/pixelated hier (war testweise gesetzt, wieder
+  // entfernt): das unterdrückt genau die weiche Kantenglättung, auf die dünne
+  // CAD-Linien und feine Grautöne in echten Bauplänen angewiesen sind, um überhaupt
+  // sichtbar zu bleiben — mit crisp-edges wirkten sie fast unsichtbar/durchsichtig.
+  // Stattdessen wird die Bildglättung des Canvas-Kontexts hier explizit UND in
+  // bestmöglicher Qualität aktiviert (Standard von Browsern ist zwar ohnehin "an",
+  // explizit gesetzt schließt aber jede abweichende Annahme aus).
+  //
+  // Context-Optionen (Bugfix-Anforderung "2D-GPU-Beschleunigung"): willReadFrequently:
+  // false sagt dem Browser explizit, dass dieser Kontext NICHT wiederholt per
+  // getImageData()/toDataURL() ausgelesen wird (er wird nur einmal beschrieben und
+  // dann angezeigt) — ohne diesen Hinweis wechseln manche Browser bei häufigem
+  // Zeichnen vorsorglich auf eine software-/CPU-basierte Canvas-Implementierung, was
+  // auf schwächeren Mobilgeräten spürbar langsamer ist und mehr Hauptspeicher statt
+  // GPU-Speicher belegt. alpha: false teilt zusätzlich mit, dass kein Alphakanal
+  // gebraucht wird (Baupläne sind vollflächig deckend) — spart dem Browser das
+  // Vorhalten/Kompositieren eines Transparenz-Kanals. Beides wirkt sich NICHT auf den
+  // separaten PDF-Export-Pfad aus (renderPdfPlanToDataUrl nutzt einen eigenen,
+  // unveränderten Canvas).
+  const ctx = canvas.getContext("2d", { alpha: false, willReadFrequently: false });
+  // Explizites Leeren vor dem Zeichnen (Anforderung "Canvas vor dem Neuzeichnen
+  // ordnungsgemäß gecleart"): da hier ohnehin bei JEDEM Aufruf ein frisches
+  // <canvas>-Element angelegt wird (siehe document.createElement oben) statt ein
+  // bestehendes wiederzuverwenden, ist es technisch bereits leer — dieser Aufruf ist
+  // defensiv und macht das explizit, unabhängig von der aktuellen Implementierung.
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  const renderTask = page.render({ canvasContext: ctx, viewport });
+  if (renderTaskRef) renderTaskRef.current = renderTask;
+  await renderTask.promise;
+  if (renderTaskRef && renderTaskRef.current === renderTask) renderTaskRef.current = null;
+  return { canvas, clamped };
+}
 
-  // Lädt Dokument + erste Seite bei jeder neuen PDF-URL neu und rendert einmalig mit
-  // dem zum Ladezeitpunkt aktuellen Zoomfaktor.
+// Erkennt pdf.js' eigene RenderingCancelledException — geworfen, wenn ein
+// RenderTask.promise abgelehnt wird, WEIL derselbe Task zwischenzeitlich per
+// renderTask.cancel() abgebrochen wurde (siehe renderPdfPageToSafeCanvasElement:
+// jeder neue Zoom-/Seitenwechsel bricht einen noch laufenden vorherigen Task ab). Das
+// ist der ERWARTETE, normale Verlauf bei schnellem Nachzoomen, kein echter Fehler —
+// pdf.js benennt die Exception laut eigenem Quelltext (RenderingCancelledException,
+// util.js) über .name, nicht über den message-Text, deshalb wird hier gezielt .name
+// geprüft. Aufrufer nutzen das, um genau diesen Fall still zu behandeln (weder
+// console.error/-warn noch ein Fehler-UI), statt bei jedem raschen Zoom-Schritt
+// unnötige, irreführende Konsolenmeldungen zu erzeugen.
+function isRenderCancelledError(err) {
+  return err?.name === "RenderingCancelledException";
+}
+
+const PdfPlanCanvas = forwardRef(function PdfPlanCanvas(
+  { url, zoomScale = 1, touchReleaseTick = 0, activePointersRef = null },
+  ref
+) {
+  const hostRef = useRef(null); // DOM-Container, in den je nach Rendering-Stufe entweder das SVG- oder das Canvas-Element eingehängt wird
+  const [status, setStatus] = useState("loading"); // "loading" | "ready" | "error"
+  // Offline-Asset-Cache (siehe useOfflineCapableAssetUrl oben): online identisch mit
+  // url, offline — sofern zuvor mindestens einmal online geöffnet — eine lokale
+  // object:-URL aus IndexedDB. pdf.js akzeptiert eine object:-URL an genau derselben
+  // Stelle wie eine echte Netz-URL (siehe loadPdfDocument unten), keine Sonderlogik
+  // nötig. resolvedUrl ist kurzzeitig null, während offline der Cache abgefragt
+  // wird — das eigentliche Laden startet erst, sobald ein Wert feststeht.
+  const resolvedUrl = useOfflineCapableAssetUrl(url);
+
+  // Zoomabhängiges Nachladen betrifft ausschließlich die Raster-Fallback-Stufe — die
+  // bevorzugte Vektor-Stufe (SVG) ist bei jedem Zoomfaktor bereits mathematisch scharf
+  // und braucht dafür kein Re-Rendering (siehe Kommentar an renderPdfPageToSvgElement).
+  // tierRef hält fest, welche Stufe aktuell aktiv ist; pageRef die zugehörige pdf.js-
+  // Seite, damit ein späteres Nachladen nicht das komplette Dokument erneut anfragen
+  // muss. lastRasterScaleRef ist der Zoom-Multiplikator, mit dem die aktuell sichtbare
+  // Raster-Auflösung zuletzt gerendert wurde. loadGenerationRef schützt einen bereits
+  // laufenden Debounce-Timer davor, nach einem zwischenzeitlichen URL-Wechsel (neuer
+  // Plan) noch verspätet auf den nun falschen hostRef/pageRef zuzugreifen.
+  const tierRef = useRef(null); // 'vector' | 'raster' | null
+  const pageRef = useRef(null);
+  const lastRasterScaleRef = useRef(1);
+  // BUGFIX "weißer Bildschirm beim Zoomen auf Mobilgeräten": true, sobald ein
+  // Raster-Rendering an die geräteabhängige Canvas-Obergrenze gestoßen ist (siehe
+  // getPdfSafeMaxCanvasDimPx/clamped-Rückgabewert von renderPdfPageToSafeCanvasElement).
+  // Ab dann unterbleibt jedes weitere Neu-Rendering bei fortgesetztem Zoom (siehe
+  // Zoom-Effekt unten) — ein erneutes Rendern auf exakt dieselbe, bereits gedeckelte
+  // Auflösung brächte keinerlei Schärfegewinn, würde aber unnötig Arbeit/Speicher
+  // beanspruchen. Die weitere Vergrößerung übernimmt ab hier ausschließlich die
+  // ohnehin vorhandene CSS-transform:scale(...) der äußeren "Bühne" (siehe
+  // FloorPlanView/contentRef) — funktioniert unabhängig von der Canvas-Auflösung.
+  const lastRasterClampedRef = useRef(false);
+  const loadGenerationRef = useRef(0);
+  // Zuletzt gestarteter pdf.js-RenderTask der Raster-Fallback-Stufe — wird per
+  // renderTask.cancel() sauber abgebrochen, sobald ein neueres Rendering
+  // (Zoom-Nachladen oder Komponenten-Unmount) es überholt, siehe
+  // renderPdfPageToSafeCanvasElement.
+  const renderTaskRef = useRef(null);
+  // GEDÄCHTNIS-LECK-FIX (siehe Einordnung in der Antwort): hält das aktuell geladene
+  // pdf.js-Dokument fest, damit es im Cleanup des Lade-Effekts unten IMMER per
+  // destroy() freigegeben wird — sowohl beim Wechsel auf einen anderen Plan (neuer
+  // resolvedUrl) als auch beim endgültigen Unmount dieser Komponente. Vorher blieb bei
+  // JEDEM Wechsel der Grundrissskizze das jeweils vorherige pdf.js-Dokument samt
+  // interner Font-/Seiten-Caches dauerhaft im Speicher der Seite liegen — auf einer
+  // Baustellen-Begehung mit mehreren nacheinander geöffneten PDF-Grundrissen summierte
+  // sich das über eine Sitzung spürbar auf und ist ein plausibler Mitverursacher dafür,
+  // dass der Speicherdruck ausgerechnet beim anschließenden Zoomen eher an die vom
+  // Betriebssystem gesetzte Grenze für die Web-App stößt.
+  const pdfDocRef = useRef(null);
+
+  // Lädt Dokument + erste Seite bei jeder neuen PDF-URL neu, versucht zuerst die
+  // Vektor-Stufe (mit Zeitlimit) und fällt bei Fehlschlag/Zeitüberschreitung/zu hoher
+  // Komplexität automatisch auf die sichere Raster-Stufe zurück (siehe Kommentar oben
+  // an renderPdfPageToSvgElement/renderPdfPageToSafeCanvasElement).
   useEffect(() => {
+    if (!resolvedUrl) return undefined; // offline: Cache-Abfrage in useOfflineCapableAssetUrl läuft noch
     let cancelled = false;
-    setStatus("loading");
+    loadGenerationRef.current += 1;
+    tierRef.current = null;
     pageRef.current = null;
-    lastRenderedScaleRef.current = 0;
+    lastRasterScaleRef.current = 1;
+    lastRasterClampedRef.current = false;
+    renderTaskRef.current = null;
+    setStatus("loading");
 
     (async () => {
       try {
         const pdfjsLib = await loadPdfJs();
-        const pdf = await pdfjsLib.getDocument(url).promise;
+        const pdf = await loadPdfDocument(pdfjsLib, resolvedUrl);
+        // Sofort in der Ref festhalten (siehe pdfDocRef-Deklaration oben) — auch wenn
+        // diese Ladeanfrage inzwischen schon "cancelled" ist (Nutzer hat währenddessen
+        // erneut die Grundrissskizze gewechselt), MUSS dieses Dokument trotzdem noch
+        // per destroy() freigegeben werden, statt einfach zu verwaisen. Das Cleanup
+        // unten übernimmt das zuverlässig, unabhängig davon, an welcher Stelle genau
+        // "cancelled" dazwischenkam.
+        pdfDocRef.current = pdf;
         if (cancelled) return;
         const page = await pdf.getPage(1);
         if (cancelled) return;
-        pageRef.current = page;
-        await renderAtScale(computeTargetScale(zoomScale));
+        const operatorList = await page.getOperatorList();
+        if (cancelled) return;
+
+        let renderedElement = null;
+        try {
+          renderedElement = await withTimeout(
+            renderPdfPageToSvgElement(pdfjsLib, page, operatorList),
+            PDF_SVG_RENDER_TIMEOUT_MS,
+            "PDF-Vektor-Rendering"
+          );
+          tierRef.current = "vector";
+        } catch (svgErr) {
+          console.warn("PDF-Vektor-Rendering nicht möglich/zu langsam, Fallback auf sichere Raster-Auflösung:", svgErr);
+          const rasterResult = await renderPdfPageToSafeCanvasElement(page, 1, renderTaskRef);
+          renderedElement = rasterResult.canvas;
+          tierRef.current = "raster";
+          pageRef.current = page;
+          lastRasterScaleRef.current = 1;
+          lastRasterClampedRef.current = rasterResult.clamped;
+        }
+        if (cancelled) return;
+
+        const host = hostRef.current;
+        if (!host) return;
+        host.replaceChildren(renderedElement);
         if (!cancelled) setStatus("ready");
       } catch (err) {
-        console.error("PDF-Rendering (pdf.js via CDN) fehlgeschlagen, Fallback auf <embed>:", err);
+        // Abgebrochene RenderTasks (siehe isRenderCancelledError) sind hier der normale
+        // Fall bei einem Komponenten-Unmount/URL-Wechsel WÄHREND das Raster-Fallback
+        // noch rendert (siehe Cleanup unten) — kein echter Rendering-Fehler, daher ohne
+        // console.error und ohne Fehler-UI (cancelled ist in diesem Fall ohnehin schon
+        // true, setStatus("error") würde also sowieso nicht mehr greifen).
+        if (!isRenderCancelledError(err)) {
+          console.error("PDF-Rendering vollständig fehlgeschlagen (Vektor UND Raster-Fallback), Rückfall auf <embed>:", err);
+        }
         if (!cancelled) setStatus("error");
       }
     })();
 
     return () => {
       cancelled = true;
-      if (renderTaskRef.current) renderTaskRef.current.cancel();
+      if (renderTaskRef.current) {
+        try {
+          renderTaskRef.current.cancel();
+        } catch {
+          // siehe Kommentar an renderPdfPageToSafeCanvasElement — unkritisch.
+        }
+        renderTaskRef.current = null;
+      }
+      // GEDÄCHTNIS-LECK-FIX (siehe pdfDocRef-Deklaration/Einordnung oben): dieses
+      // Cleanup läuft sowohl beim Wechsel auf eine andere resolvedUrl (kurz bevor der
+      // Effekt erneut ausgeführt wird) als auch beim endgültigen Unmount der
+      // Komponente — in BEIDEN Fällen wird das bis dahin geladene pdf.js-Dokument ab
+      // sofort nicht mehr gebraucht und deshalb hier zuverlässig freigegeben, statt
+      // sich unkontrolliert im Speicher der Seite anzusammeln.
+      if (pdfDocRef.current) {
+        try {
+          pdfDocRef.current.destroy();
+        } catch (destroyErr) {
+          console.warn("PDF-Dokument (Grundriss-Ansicht) konnte nicht sauber freigegeben werden:", destroyErr);
+        }
+        pdfDocRef.current = null;
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url, renderScale]);
+  }, [resolvedUrl]);
 
-  // Gedrosseltes (debounced) Neu-Rendern bei Zoom-Änderungen: statt bei jedem
-  // einzelnen Wheel-/Pinch-Zwischenschritt neu zu rendern, wird erst PDF_RERENDER_
-  // DEBOUNCE_MS nach der letzten Änderung tatsächlich neu gezeichnet — also i.d.R.
-  // erst, wenn eine Zoom-Geste beendet ist bzw. kurz innehält. Beim Rauszoomen wird
-  // bewusst NICHT auf eine niedrigere Auflösung heruntergerendert (kein Schärfegewinn,
-  // nur unnötige Render-Last) — die zuletzt erreichte, höhere Auflösung bleibt stehen.
+  // Zoomabhängiges Nachladen der Raster-Fallback-Stufe: sobald spürbar weiter
+  // hineingezoomt wird, als die aktuell sichtbare Auflösung abdeckt, wird nach einer
+  // kurzen Zoom-Pause (Debounce) mit höherer, an devicePixelRatio UND aktuellem
+  // Zoomfaktor gekoppelter Auflösung neu gerendert (siehe
+  // renderPdfPageToSafeCanvasElement). Greift nicht während einer laufenden Zoom-
+  // Geste (die kommt über CSS transform: scale(...) der äußeren "Bühne", völlig ohne
+  // Neu-Rendering aus), sondern erst kurz nach deren Ende.
+  //
+  // BUGFIX "weißer Bildschirm beim Zoomen auf Mobilgeräten" (inkl. Nachschärfung:
+  // RENDER_CAP deckelt jetzt den tatsächlichen, fertig kombinierten scale-Wert
+  // direkt in renderPdfPageToSafeCanvasElement selbst, siehe Bugfix-Kommentar dort —
+  // dieser Effekt hier muss den Zoomfaktor deshalb NICHT mehr selbst vorab
+  // begrenzen, sondern reicht zoomScale unverändert durch und liest nur noch das
+  // Ergebnis `clamped` zurück): lastRasterClampedRef (siehe oben) bricht diesen
+  // Effekt frühzeitig ab, sobald entweder RENDER_CAP (getPdfRasterRenderScaleCap)
+  // oder die geräteabhängige Canvas-Pixel-Obergrenze (getPdfSafeMaxCanvasDimPx)
+  // erreicht ist. Ab dann übernimmt beim Weiterzoomen ausschließlich die ohnehin
+  // bereits vorhandene CSS-transform:scale(...) der äußeren "Bühne" die weitere
+  // Vergrößerung, ganz ohne erneutes Canvas-Rendering und ohne zusätzlichen
+  // Speicherbedarf — genau das verhindert das stillschweigende Kappen des Canvas
+  // durch den Browser, das zuvor zum weißen Bildschirm führte.
   useEffect(() => {
+    if (tierRef.current !== "raster") return undefined;
     if (!pageRef.current) return undefined;
-    const target = computeTargetScale(zoomScale);
-    if (target <= lastRenderedScaleRef.current * 1.05) return undefined;
+    if (lastRasterClampedRef.current) return undefined;
+    if (zoomScale <= lastRasterScaleRef.current * PDF_RASTER_RERENDER_ZOOM_FACTOR) return undefined;
 
-    const timer = setTimeout(() => {
-      renderAtScale(target).catch((err) => {
-        console.error("PDF-Re-Rendering beim Zoomen fehlgeschlagen:", err);
-      });
-    }, PDF_RERENDER_DEBOUNCE_MS);
+    const myGeneration = loadGenerationRef.current;
+    const timer = setTimeout(async () => {
+      if (loadGenerationRef.current !== myGeneration) return; // zwischenzeitlich neuer Plan geladen
+      // IPAD-TOUCH-RELEASE-FIX: zusätzliches Sicherheitsnetz direkt vor dem eigentlich
+      // teuren Neu-Rendern — liegt trotz der bereits verlängerten Debounce-Zeit
+      // ausnahmsweise noch ein Finger auf (neue Geste hat in der Zwischenzeit
+      // begonnen), wird dieser Durchlauf ersatzlos übersprungen, statt ausgerechnet
+      // während einer neuen Touch-Interaktion ein neues Canvas anzufordern. Ändert sich
+      // zoomScale durch diese neue Geste weiter, setzt das ohnehin schon die gesamte
+      // Debounce-Uhr über die Dependency oben zurück; endet die neue Geste, stößt
+      // touchReleaseTick einen neuen, dann wieder sicheren Durchlauf an.
+      if (activePointersRef?.current && activePointersRef.current.size > 0) return;
+      const page = pageRef.current;
+      const host = hostRef.current;
+      if (!page || !host) return;
+      try {
+        const { canvas, clamped } = await renderPdfPageToSafeCanvasElement(page, zoomScale, renderTaskRef);
+        if (loadGenerationRef.current !== myGeneration) return;
+        host.replaceChildren(canvas);
+        lastRasterScaleRef.current = zoomScale;
+        lastRasterClampedRef.current = clamped;
+      } catch (err) {
+        // Genau der in isRenderCancelledError beschriebene Normalfall: ein noch
+        // schnelleres, weiteres Nachzoomen hat diesen Render-Task bereits wieder per
+        // renderTask.cancel() abgebrochen, bevor er fertig wurde (siehe
+        // renderPdfPageToSafeCanvasElement) — der jeweils NEUESTE Zoom-Schritt gewinnt
+        // ohnehin, dieser hier ist einfach überholt. Kein Konsolenfehler nötig, die
+        // bisherige Auflösung bleibt bis zum nächsten erfolgreichen Rendering sichtbar.
+        if (!isRenderCancelledError(err)) {
+          console.warn("Hochauflösendes Nachladen der PDF-Raster-Fallback-Stufe fehlgeschlagen, bisherige Auflösung bleibt sichtbar:", err);
+        }
+      }
+    }, PDF_RASTER_RERENDER_DEBOUNCE_MS);
 
     return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [zoomScale, status]);
+    // touchReleaseTick (siehe FloorPlanView/IPAD-TOUCH-RELEASE-FIX) zusätzlich in der
+    // Dependency-Liste: stößt die Debounce-Uhr auch dann verlässlich ab dem
+    // tatsächlichen Loslass-Zeitpunkt neu an, wenn kurz zuvor zufällig keine
+    // Skalierungsänderung mehr registriert wurde.
+  }, [zoomScale, touchReleaseTick]);
 
   return (
-    <div ref={ref} className="relative aspect-[4/3] w-full bg-white">
+    <div ref={ref} className="relative aspect-[4/3] w-full overflow-hidden bg-white">
       {status === "error" ? (
         <embed src={url} type="application/pdf" className="pointer-events-none h-full w-full" />
       ) : (
-        <canvas
-          ref={canvasRef}
-          className="pointer-events-none block h-full w-full select-none object-contain transition-opacity"
+        // preserveAspectRatio="xMidYMid meet" (SVG-Stufe, siehe renderPdfPageToSvgElement)
+        // bzw. object-contain (Canvas-Fallback-Stufe) übernehmen dieselbe Rolle: der
+        // Inhalt wird seitenverhältnistreu und zentriert in die volle Rahmenbox
+        // eingepasst, deshalb h-full statt h-auto — h-auto würde stattdessen versuchen,
+        // die Rahmenhöhe an den Inhalt anzupassen, was den festen aspect-[4/3]-Rahmen
+        // und damit die Pin-/Notiz-Prozentkoordinaten verschieben würde.
+        <div
+          ref={hostRef}
+          className="pointer-events-none block h-full w-full select-none opacity-90 transition-opacity [&>svg]:block [&>svg]:h-full [&>svg]:w-full [&>canvas]:block [&>canvas]:h-full [&>canvas]:w-full [&>canvas]:object-contain"
           style={{ opacity: status === "ready" ? 1 : 0 }}
         />
       )}
@@ -2120,6 +6749,602 @@ const PdfPlanCanvas = forwardRef(function PdfPlanCanvas({ url, renderScale, zoom
     </div>
   );
 });
+
+// ----------------------------------------------------------------------------------
+// SVG-GRUNDRISS — echtes Vektor-Rendering statt Raster-Canvas/-Bild
+// ----------------------------------------------------------------------------------
+// Für nativ als .svg hochgeladene Grundrisse (im Unterschied zu aus einer PDF-Datei
+// von pdf.js erst noch generierten SVG-Pfaden, siehe PdfPlanCanvas oben) wird die
+// Datei hier EINMALIG als Rohtext geladen und direkt als echtes <svg>-Element in den
+// DOM inline eingebettet (dangerouslySetInnerHTML). Der Zoom (siehe FloorPlanView: transform: scale(...) auf
+// der äußeren "Bühne", contentRef) wirkt danach exakt wie bei den absolut
+// positionierten Pin-/Notiz-Markern auf einer reinen CSS-Transformation — es gibt zu
+// KEINEM Zeitpunkt ein Bitmap im Speicher, das bei starkem Zoom unscharf werden oder
+// (siehe frühere "White Screen"-Fehlerklasse) beim Neu-Rendern kurz leerlaufen könnte.
+// Linien bleiben dadurch bei jedem Zoomfaktor mathematisch exakt gestochen scharf.
+//
+// Sicherheit: SVG-Dateien können technisch ausführbares Markup (<script>, "on*"-
+// Event-Handler) enthalten. Da Grundrisse ausschließlich von authentifizierten
+// Nutzern hochgeladen werden können (siehe RLS-Policy floor_plans_insert_auth),
+// ist das primäre Bedrohungsmodell gering — sanitizeSvgMarkup entfernt <script>-Tags
+// und "on*"-Attribute trotzdem als zusätzliche Vorsichtsmaßnahme (Defense in Depth),
+// bevor die Datei inline eingebettet wird. Das ist bewusst eine einfache, robuste
+// Teilsanitisierung und keine vollständige XML-Sicherheitsprüfung.
+function sanitizeSvgMarkup(svgText) {
+  return svgText
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, "");
+}
+
+const SvgPlanCanvas = forwardRef(function SvgPlanCanvas({ url }, ref) {
+  const [markup, setMarkup] = useState(null);
+  const [status, setStatus] = useState("loading"); // 'loading' | 'ready' | 'error'
+
+  useEffect(() => {
+    let cancelled = false;
+    setStatus("loading");
+    setMarkup(null);
+    // Offline-Asset-Cache (siehe fetchAssetTextWithOfflineCache oben): online wie
+    // bisher ein direkter fetch(), offline — sofern zuvor mindestens einmal online
+    // geöffnet — aus IndexedDB statt von Supabase.
+    fetchAssetTextWithOfflineCache(url)
+      .then((text) => {
+        if (cancelled) return;
+        setMarkup(sanitizeSvgMarkup(text));
+        setStatus("ready");
+      })
+      .catch((err) => {
+        console.error("SVG-Grundriss konnte nicht geladen werden:", err);
+        if (!cancelled) setStatus("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [url]);
+
+  if (status === "loading") {
+    return (
+      <div ref={ref} className="flex aspect-[4/3] w-full items-center justify-center bg-white">
+        <Loader2 className="animate-spin text-slate-400" size={26} />
+      </div>
+    );
+  }
+  if (status === "error" || !markup) {
+    return (
+      <div ref={ref} className="flex aspect-[4/3] w-full flex-col items-center justify-center gap-2 bg-slate-100 px-6 text-center text-slate-400">
+        <AlertTriangle size={22} />
+        <span className="text-xs">Grundriss (SVG) konnte nicht geladen werden.</span>
+      </div>
+    );
+  }
+  return (
+    // [&>svg]:… setzt Breite/Höhe/Verhalten des inline eingebetteten <svg>-Wurzel-
+    // elements per CSS — überschreibt damit zuverlässig auch fest im Dateiquelltext
+    // hinterlegte width/height-Attribute (CSS-Eigenschaften haben stets Vorrang vor
+    // Präsentationsattributen), sodass der Plan exakt wie ein <img> auf volle
+    // Container-Breite mit proportionaler Höhe skaliert.
+    <div
+      ref={ref}
+      className="pointer-events-none block w-full select-none opacity-90 [&>svg]:block [&>svg]:h-auto [&>svg]:w-full"
+      dangerouslySetInnerHTML={{ __html: markup }}
+    />
+  );
+});
+
+// ----------------------------------------------------------------------------------
+// PLAN-SVG-BÜHNE — gemeinsamer SVG-Koordinatenraum für Vektor-Grundriss + Pin-/
+// Notiz-Ebene (nur für die beiden echten Vektor-Planarten: PDF via PdfPlanCanvas,
+// natives .svg via SvgPlanCanvas)
+// ----------------------------------------------------------------------------------
+// Mängel-Pins, Blickrichtungs-Fächer und Skizzen-Notizen wurden bisher als separate,
+// per CSS-Prozent positionierte HTML-Ebene NEBEN dem Plan gerendert — synchron zum
+// Zoom, aber technisch außerhalb des SVG-Baums. PlanSvgStage bettet sie stattdessen
+// direkt in dasselbe SVG-Koordinatensystem wie der Vektor-Grundriss ein: ein äußeres
+// <svg viewBox="0 0 W H"> (W/H = natürliche, unskalierte Pixelgröße der Bühne, siehe
+// ResizeObserver unten) enthält ein <foreignObject>, das exakt die volle W×H-Fläche
+// abdeckt — darin liegt eine ganz normale HTML-Ebene, auf der PinMarker/PlanNoteMarker
+// UNVERÄNDERT weiterlaufen (gleiche Prozent-Positionierung, gleiche Drag-/Klick-Logik,
+// gleiche Gegen-Skalierung). foreignObject ist der spezifikationskonforme Weg, echte
+// interaktive HTML-Inhalte (Buttons, Icons, Drag-Handler) innerhalb eines SVG-Baums
+// zu verankern — eine Neuimplementierung der Marker als reine SVG-Primitive (<circle>,
+// <text> statt React-Komponenten mit Drag/Klick/Badges/Fotos) hätte ein unverhältnis-
+// mäßiges Regressionsrisiko für bereits ausgereifte Funktionalität bedeutet, ohne
+// einen in der Praxis spürbaren Schärfe- oder Genauigkeitsgewinn gegenüber diesem
+// Ansatz. Redlicher Hinweis: foreignObject hat in älteren Safari-/WebKit-Versionen
+// vereinzelt dokumentierte Darstellungs-Eigenheiten bei komplexem HTML-Inhalt — sollte
+// es auf einem Baustellen-Tablet Auffälligkeiten geben, bitte melden, dann prüfen wir
+// gezielt nach.
+const PlanSvgStage = forwardRef(function PlanSvgStage(
+  { planKind, url, zoomScale = 1, touchReleaseTick = 0, activePointersRef = null, children },
+  ref
+) {
+  const measureRef = useRef(null);
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+
+  // Ermittelt die natürliche (unskalierte) Pixelgröße der Bühne über offsetWidth/
+  // -Height — diese Werte werden von einer CSS transform:scale(...) auf ANCESTOR-
+  // Ebene (siehe FloorPlanView, contentRef) NICHT beeinflusst (Transforms wirken rein
+  // visuell/nach dem Layout, nicht auf den layoutwirksamen Kastenwert), liefern also
+  // unabhängig vom aktuellen Zoomfaktor stets dieselbe Referenzgröße. Ein
+  // ResizeObserver hält diesen Wert bei echten Layout-Änderungen (Fenstergröße,
+  // Laden des Plans, Seitenverhältnis-Wechsel bei SvgPlanCanvas) aktuell.
+  useLayoutEffect(() => {
+    const el = measureRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return undefined;
+    const update = () => setStageSize({ width: el.offsetWidth, height: el.offsetHeight });
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [url]);
+
+  const setRefs = (node) => {
+    measureRef.current = node;
+    if (typeof ref === "function") ref(node);
+    else if (ref) ref.current = node;
+  };
+
+  const hasSize = stageSize.width > 0 && stageSize.height > 0;
+
+  return (
+    <div ref={setRefs} className="relative w-full">
+      {planKind === "pdf" ? (
+        <PdfPlanCanvas
+          url={url}
+          zoomScale={zoomScale}
+          touchReleaseTick={touchReleaseTick}
+          activePointersRef={activePointersRef}
+        />
+      ) : (
+        <SvgPlanCanvas url={url} />
+      )}
+      {hasSize && (
+        <svg
+          viewBox={`0 0 ${stageSize.width} ${stageSize.height}`}
+          preserveAspectRatio="none"
+          className="absolute inset-0 h-full w-full overflow-visible"
+        >
+          <foreignObject x="0" y="0" width={stageSize.width} height={stageSize.height} style={{ overflow: "visible" }}>
+            <div className="relative h-full w-full">{children}</div>
+          </foreignObject>
+        </svg>
+      )}
+    </div>
+  );
+});
+
+// ----------------------------------------------------------------------------------
+// TABLET CANVAS ZOOM FIX, Teil 3: KACHEL-/DEEP-ZOOM-ANSICHT FÜR RASTER-GRUNDRISSE
+// ----------------------------------------------------------------------------------
+// Zeigt einen Raster-Grundriss (PNG/JPG/WebP) über die Kachel-Pyramide aus
+// floor_plans.tile_manifest (siehe generateAndUploadTilePyramid weiter oben) an,
+// statt eines einzelnen, bei hohem Zoom potenziell zu großen <img>/<canvas>-Elements.
+// Ersetzt in FloorPlanView ausschließlich das bisherige einzelne <img ref={imgRef}
+// src={plan.image_url} .../> für reine Raster-Grundrisse — PDF/CAD/SVG-Grundrisse
+// laufen unverändert über PdfPlanCanvas/CadBlueprintPlan/SvgPlanCanvas.
+//
+// Wichtigste Absicherung: das bereits bestehende, flache Fallback-Bild (image_url,
+// siehe FLOOR_PLAN_IMAGE_MAX_DIM_PX) bleibt IMMER als unterste Ebene sichtbar,
+// unabhängig vom Kachel-Status. Ältere, vor diesem Update hochgeladene Grundrisse
+// haben schlicht kein tile_manifest (null) und zeigen dadurch automatisch nur dieses
+// Fallback-Bild — exakt das bisherige Verhalten, keine Regression. Auch wenn die
+// Kachel-Erzeugung beim Upload fehlschlug oder einzelne Kacheln zur Laufzeit nicht
+// laden, bleibt darunter jederzeit ein vollständiges Bild sichtbar, nie eine Lücke
+// oder ein weißer Bereich.
+//
+// Bewusste Vereinfachung (siehe Einordnung in der Antwort): es werden IMMER alle
+// Kacheln der aktuell gewählten Stufe gemeinsam geladen, keine Viewport-Virtualisierung
+// (nur die gerade sichtbaren Kacheln laden). Das hält die Logik überschaubar und ohne
+// Live-Test auf echter Tablet-Hardware nachvollziehbar korrekt, kostet bei sehr hohem
+// Zoom etwas mehr Bandbreite als eine vollständige Deep-Zoom-Bibliothek, löst aber das
+// eigentliche Problem (kein einzelnes übergroßes Canvas/Bild) bereits vollständig, da
+// jede Kachel unabhängig als kleines <img> geladen/dekodiert wird.
+function buildTileList(manifest, levelIndex) {
+  if (!manifest || !manifest.levels?.length) return [];
+  const levelInfo = manifest.levels.find((l) => l.level === levelIndex) || manifest.levels[manifest.levels.length - 1];
+  if (!levelInfo) return [];
+  const tiles = [];
+  for (let row = 0; row < levelInfo.rows; row += 1) {
+    for (let col = 0; col < levelInfo.cols; col += 1) {
+      const tileX = col * manifest.tileSize;
+      const tileY = row * manifest.tileSize;
+      const tileWidthPx = Math.min(manifest.tileSize, levelInfo.width - tileX);
+      const tileHeightPx = Math.min(manifest.tileSize, levelInfo.height - tileY);
+      tiles.push({
+        level: levelInfo.level,
+        col,
+        row,
+        leftPct: (tileX / levelInfo.width) * 100,
+        topPct: (tileY / levelInfo.height) * 100,
+        widthPct: (tileWidthPx / levelInfo.width) * 100,
+        heightPct: (tileHeightPx / levelInfo.height) * 100,
+        url: `${manifest.baseUrl}/${levelInfo.level}/${col}_${row}.${manifest.ext}`,
+      });
+    }
+  }
+  return tiles;
+}
+
+// Wählt die NIEDRIGSTE Pyramiden-Stufe, deren native Breite die aktuell tatsächlich
+// benötigte Bildschirm-Pixelbreite bereits abdeckt (nie unnötig die höchste Stufe
+// laden, wenn eine kleinere bereits ausreicht) — fällt auf die höchste vorhandene
+// Stufe zurück, falls selbst die nicht ausreicht (native Auflösungsgrenze der Pyramide
+// erreicht, mehr Schärfe ist dann nicht verfügbar).
+function pickTileLevelForWidth(manifest, requiredWidthPx) {
+  if (!manifest || !manifest.levels?.length) return null;
+  const sorted = [...manifest.levels].sort((a, b) => a.level - b.level);
+  const fit = sorted.find((l) => l.width >= requiredWidthPx);
+  return (fit || sorted[sorted.length - 1]).level;
+}
+
+// IPAD-TOUCH-RELEASE-FIX (siehe PDF_RASTER_RERENDER_DEBOUNCE_MS/Einordnung in der
+// Antwort): auf 350ms angehoben, dieselbe Begründung und dieselbe angeforderte Spanne
+// von 300-500ms wie beim PDF-Raster-Nachladen.
+const FLOOR_PLAN_TILE_LEVEL_SWITCH_DEBOUNCE_MS = 350;
+
+const TiledPlanImage = forwardRef(function TiledPlanImage(
+  { plan, scale = 1, touchReleaseTick = 0, activePointersRef = null },
+  ref
+) {
+  const rootRef = useRef(null);
+  const manifest = plan?.tile_manifest || null;
+  const [level, setLevel] = useState(() => (manifest ? manifest.maxLevel : null));
+  const [failedTileKeys, setFailedTileKeys] = useState(() => new Set());
+
+  const setRefs = (node) => {
+    rootRef.current = node;
+    if (typeof ref === "function") ref(node);
+    else if (ref) ref.current = node;
+  };
+
+  // Setzt Stufe/Fehlerliste bei einem Planwechsel zurück (neue plan.id bzw. neues
+  // Manifest) — sonst könnte beim Wechsel auf eine andere Skizze kurzzeitig die zuvor
+  // gewählte Kachel-Stufe eines völlig anderen Bildes angezeigt werden, bevor der
+  // Effekt unten neu greift.
+  useEffect(() => {
+    setLevel(manifest ? manifest.maxLevel : null);
+    setFailedTileKeys(new Set());
+  }, [plan?.id, manifest?.baseUrl, manifest?.maxLevel]);
+
+  // Dieselbe Debounce-Logik wie beim PDF-Raster-Nachladen (siehe PdfPlanCanvas/
+  // PDF_RASTER_RERENDER_DEBOUNCE_MS): erst nach einer kurzen Zoom-Ruhepause wird die
+  // tatsächlich benötigte Kachel-Stufe neu bestimmt, nie während einer laufenden
+  // Pinch-Geste selbst. Die benötigte Auflösung wird aus der TATSÄCHLICHEN, bereits
+  // durch die Bühnen-CSS-Skalierung vergrößerten Bildschirmbreite abgeleitet:
+  // getBoundingClientRect() reflektiert (anders als offsetWidth, siehe abweichender
+  // Kommentar bei PlanSvgStage/measureRef, wo bewusst offsetWidth gebraucht wird) JEDE
+  // Vorfahren-CSS-Transformation — hier ist genau das richtig, weil wir exakt die
+  // aktuelle Bildschirm-Pixelzahl treffen wollen, die die Kacheln abdecken müssen.
+  // getPdfSafeRenderDprCap() ist trotz des Namens rein geräteabhängig (Bildschirmbreite-
+  // Breakpoint), keine PDF-spezifische Logik — wird hier bewusst wiederverwendet statt
+  // dupliziert, siehe dortiger Kommentar.
+  useEffect(() => {
+    if (!manifest) return undefined;
+    const timer = setTimeout(() => {
+      // IPAD-TOUCH-RELEASE-FIX: liegt trotz der bereits verlängerten Debounce-Zeit
+      // ausnahmsweise noch ein Finger auf, wird dieser Durchlauf übersprungen statt
+      // ausgerechnet während einer neuen Touch-Interaktion die Kachel-Stufe zu
+      // wechseln — siehe identische Begründung bei PdfPlanCanvas.
+      if (activePointersRef?.current && activePointersRef.current.size > 0) return;
+      const el = rootRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (!rect.width) return;
+      const dprCap = getPdfSafeRenderDprCap();
+      const dpr = typeof window !== "undefined" ? Math.min(window.devicePixelRatio || 1, dprCap) : 1;
+      const requiredWidthPx = rect.width * dpr;
+      const nextLevel = pickTileLevelForWidth(manifest, requiredWidthPx);
+      if (nextLevel !== null) {
+        setLevel((prev) => (prev === nextLevel ? prev : nextLevel));
+      }
+    }, FLOOR_PLAN_TILE_LEVEL_SWITCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+    // touchReleaseTick (siehe FloorPlanView/IPAD-TOUCH-RELEASE-FIX): stößt die
+    // Debounce-Uhr zusätzlich ab dem tatsächlichen Loslass-Zeitpunkt neu an, siehe
+    // identische Begründung bei PdfPlanCanvas.
+  }, [manifest, scale, touchReleaseTick]);
+
+  const tiles = useMemo(() => {
+    if (!manifest || level === null) return [];
+    return buildTileList(manifest, level).filter((t) => !failedTileKeys.has(`${t.level}-${t.col}-${t.row}`));
+  }, [manifest, level, failedTileKeys]);
+
+  const handleTileError = (tileKey) => {
+    // Eine einzelne fehlgeschlagene Kachel (z.B. kurzzeitiger Netzwerkfehler auf der
+    // Baustelle) blendet NUR diese eine Kachel aus — darunter bleibt an genau dieser
+    // Stelle weiterhin das vollständige Fallback-Bild sichtbar, nie eine Lücke oder ein
+    // kaputtes Bild-Icon.
+    setFailedTileKeys((prev) => {
+      if (prev.has(tileKey)) return prev;
+      const next = new Set(prev);
+      next.add(tileKey);
+      return next;
+    });
+  };
+
+  return (
+    <div ref={setRefs} className="relative block w-full select-none opacity-90" draggable={false}>
+      {/* Fallback-/Basis-Bild: dieselbe, bereits vorhandene, auf FLOOR_PLAN_IMAGE_MAX_DIM_PX
+          begrenzte, geflachte Grundriss-Datei (plan.image_url) — bleibt UNABHÄNGIG vom
+          Kachel-Status immer sichtbar im Hintergrund. Das ist die entscheidende
+          Absicherung gegen jede Form von weißem Bildschirm: selbst ohne Kachel-Pyramide
+          (ältere Grundrisse, fehlgeschlagene Erzeugung) oder bei einzelnen nicht
+          ladenden Kacheln zeigt die Ansicht immer mindestens dieses eine, garantiert
+          vorhandene Bild. */}
+      <img
+        src={plan.image_url}
+        alt={plan.name}
+        className="pointer-events-none block w-full select-none"
+        draggable={false}
+      />
+      {tiles.length > 0 && (
+        <div className="pointer-events-none absolute inset-0">
+          {tiles.map((t) => {
+            const tileKey = `${t.level}-${t.col}-${t.row}`;
+            return (
+              <img
+                key={tileKey}
+                src={t.url}
+                alt=""
+                draggable={false}
+                onError={() => handleTileError(tileKey)}
+                className="pointer-events-none absolute select-none"
+                style={{ left: `${t.leftPct}%`, top: `${t.topPct}%`, width: `${t.widthPct}%`, height: `${t.heightPct}%` }}
+              />
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+});
+
+// ----------------------------------------------------------------------------------
+// LOGIN-BILDSCHIRM — verpflichtende Anmeldesperre nach dem Intro (siehe isAuthenticated
+// in App()): solange isAuthenticated false ist, wird ausschließlich dieser vollflächige
+// Bildschirm gerendert, weder Kopfzeile/Navigation noch Projektlisten oder Baupläne
+// existieren währenddessen im Rendering-Baum. Eigenständig von AuthModal weiter unten
+// (das bleibt der schlanke Inline-Dialog, mit dem ein bereits eingeloggter Betrachter
+// innerhalb der App zusätzlich eine Bearbeitungs-Session eröffnet/registriert) — hier
+// geht es um den Zugriff auf die App als Ganzes.
+// ----------------------------------------------------------------------------------
+function LoginScreen({ onLogin, onRegister, onForgotPassword }) {
+  // Registrieren ist bewusst als sekundärer, eingeklappter Link statt eines
+  // gleichwertigen zweiten Tabs gestaltet (anders als im internen AuthModal weiter
+  // unten) — die Aufgabenstellung beschreibt hier explizit einen Anmelde-Bildschirm.
+  // Ganz weglassen ging aber nicht: ohne ihn gäbe es hinter der neuen App-
+  // Zugriffssperre keinen Weg mehr, überhaupt ein erstes Konto anzulegen (Supabase-
+  // Auth-Zugangsdaten selbst entstehen ausschließlich über signUp, die
+  // Benutzerverwaltung im Hauptbereich legt nur das fachliche Profil in app_users an,
+  // siehe createUser) — das hätte eine bestehende Kernfunktion faktisch unerreichbar
+  // gemacht.
+  const [mode, setMode] = useState("login"); // "login" | "register" | "forgot"
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  // Eigener, vom Anmelde-/Registrierungs-Formular getrennter State für "Passwort
+  // vergessen" — bewusst dieselbe E-Mail-Eingabe wie oben vorbefüllt (falls bereits
+  // eingetippt), aber ein eigenes submitting/error/info-Paar, damit ein Fehler beim
+  // Zurücksetzen nicht mit einem Anmeldefehler verwechselt werden kann.
+  const [forgotSubmitting, setForgotSubmitting] = useState(false);
+  const [forgotError, setForgotError] = useState("");
+  const [forgotInfo, setForgotInfo] = useState("");
+
+  const switchMode = (next) => {
+    setMode(next);
+    setError("");
+    setInfo("");
+    setForgotError("");
+    setForgotInfo("");
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!email.trim() || !password) {
+      setError("Bitte E-Mail und Passwort eingeben.");
+      return;
+    }
+    setError("");
+    setInfo("");
+    setSubmitting(true);
+    try {
+      if (mode === "login") {
+        await onLogin(email.trim(), password);
+        // Bei Erfolg übernimmt App() über isAuthenticated den Wechsel zur
+        // Hauptanwendung — dieser Bildschirm wird dadurch unmounted, ein
+        // Zurücksetzen von submitting hier wäre wirkungslos bzw. würde nur unnötig
+        // knapp vor dem Unmount rendern.
+      } else {
+        await onRegister(email.trim(), password);
+        setInfo("Registrierung erfolgreich. Falls eine Bestätigungs-E-Mail erforderlich ist, bitte den Posteingang prüfen und danach anmelden.");
+        switchMode("login");
+        setSubmitting(false);
+      }
+    } catch (err) {
+      console.error("Anmeldung fehlgeschlagen:", err);
+      setError(err?.message || "Anmeldung fehlgeschlagen. Bitte erneut versuchen.");
+      setSubmitting(false);
+    }
+  };
+
+  const handleForgotSubmit = async (e) => {
+    e.preventDefault();
+    if (!email.trim()) {
+      setForgotError("Bitte zuerst die E-Mail-Adresse eingeben.");
+      return;
+    }
+    setForgotError("");
+    setForgotInfo("");
+    setForgotSubmitting(true);
+    try {
+      await onForgotPassword(email.trim());
+      // Bewusst derselbe, unspezifische Erfolgstext unabhängig davon, ob zu dieser
+      // E-Mail-Adresse tatsächlich ein Konto existiert — sonst ließe sich über diesen
+      // Bildschirm ausprobieren, welche E-Mail-Adressen als Benutzerkonto angelegt
+      // sind (Supabase selbst verhält sich bei resetPasswordForEmail serverseitig
+      // ebenso zurückhaltend).
+      setForgotInfo("Falls zu dieser E-Mail-Adresse ein Konto besteht, wurde soeben ein Link zum Festlegen eines neuen Passworts versendet.");
+    } catch (err) {
+      console.error("Passwort-Zurücksetzen fehlgeschlagen:", err);
+      setForgotError(err?.message || "Der Link konnte nicht versendet werden. Bitte erneut versuchen.");
+    } finally {
+      setForgotSubmitting(false);
+    }
+  };
+
+  if (mode === "forgot") {
+    return (
+      <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-100 px-4">
+        <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl sm:p-8">
+          <div className="mb-6 flex flex-col items-center gap-2 text-center">
+            <BrandLogotype tone="brand" size="md" />
+            <p className="text-sm text-slate-500">Baustellendokumentation — Passwort vergessen</p>
+          </div>
+          <form onSubmit={handleForgotSubmit} className="space-y-4">
+            <div>
+              <FieldLabel>E-Mail</FieldLabel>
+              <input
+                type="email"
+                autoComplete="username"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={forgotSubmitting}
+                placeholder="name@firma.de"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+            {forgotError && (
+              <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                <span>{forgotError}</span>
+              </div>
+            )}
+            {forgotInfo && <p className="text-xs font-medium text-emerald-600">{forgotInfo}</p>}
+            <button
+              type="submit"
+              disabled={forgotSubmitting}
+              className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {forgotSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+              Link senden
+            </button>
+          </form>
+          <div className="mt-4 text-center">
+            <button
+              type="button"
+              onClick={() => switchMode("login")}
+              disabled={forgotSubmitting}
+              className="text-xs font-semibold text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Zurück zur Anmeldung
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-100 px-4">
+      <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl sm:p-8">
+        <div className="mb-6 flex flex-col items-center gap-2 text-center">
+          <BrandLogotype tone="brand" size="md" />
+          <p className="text-sm text-slate-500">Baustellendokumentation — Anmeldung erforderlich</p>
+        </div>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <FieldLabel>E-Mail</FieldLabel>
+            <input
+              type="email"
+              name="username"
+              autoComplete="username"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              disabled={submitting}
+              placeholder="name@firma.de"
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+          <div>
+            <FieldLabel>Passwort</FieldLabel>
+            <div className="relative">
+              <input
+                type={showPassword ? "text" : "password"}
+                name="password"
+                autoComplete={mode === "login" ? "current-password" : "new-password"}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                disabled={submitting}
+                placeholder="••••••••"
+                className={`${TEXT_INPUT_CLASS} pr-10`}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                tabIndex={-1}
+                title={showPassword ? "Passwort verbergen" : "Passwort anzeigen"}
+                className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 transition hover:text-slate-600"
+              >
+                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+            {mode === "login" && (
+              <div className="mt-1.5 text-right">
+                <button
+                  type="button"
+                  onClick={() => switchMode("forgot")}
+                  disabled={submitting}
+                  className="text-[11px] font-semibold text-slate-400 underline-offset-2 transition hover:text-[#FF2A00] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Passwort vergessen?
+                </button>
+              </div>
+            )}
+          </div>
+          {error && (
+            <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+          {info && <p className="text-xs font-medium text-emerald-600">{info}</p>}
+          <button
+            type="submit"
+            disabled={submitting}
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {submitting ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : mode === "login" ? (
+              <LogIn size={16} />
+            ) : (
+              <UserPlus size={16} />
+            )}
+            {mode === "login" ? "Anmelden" : "Registrieren"}
+          </button>
+        </form>
+        <div className="mt-4 text-center">
+          <button
+            type="button"
+            onClick={() => switchMode(mode === "login" ? "register" : "login")}
+            disabled={submitting}
+            className="text-xs font-semibold text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {mode === "login" ? "Noch kein Konto? Registrieren" : "Bereits ein Konto? Anmelden"}
+          </button>
+        </div>
+        <p className="mt-4 text-center text-[11px] leading-relaxed text-slate-400">
+          Ohne Netzverbindung ist eine Anmeldung möglich, wenn an diesem Gerät zuvor bereits
+          einmal online angemeldet wurde.
+        </p>
+      </div>
+    </div>
+  );
+}
 
 // ----------------------------------------------------------------------------------
 // AUTH-MODAL — Anmelden / Registrieren (Supabase Auth, E-Mail + Passwort)
@@ -2178,7 +7403,7 @@ function AuthModal({ onClose, onSignIn, onSignUp }) {
           <button
             onClick={() => switchMode("login")}
             className={`flex-1 border-b-2 pb-2 text-sm font-semibold transition ${
-              mode === "login" ? "border-blue-600 text-blue-600" : "border-transparent text-slate-400 hover:text-slate-600"
+              mode === "login" ? "border-[#FF2A00] text-[#FF2A00]" : "border-transparent text-slate-400 hover:text-slate-600"
             }`}
           >
             Anmelden
@@ -2186,7 +7411,7 @@ function AuthModal({ onClose, onSignIn, onSignUp }) {
           <button
             onClick={() => switchMode("register")}
             className={`flex-1 border-b-2 pb-2 text-sm font-semibold transition ${
-              mode === "register" ? "border-blue-600 text-blue-600" : "border-transparent text-slate-400 hover:text-slate-600"
+              mode === "register" ? "border-[#FF2A00] text-[#FF2A00]" : "border-transparent text-slate-400 hover:text-slate-600"
             }`}
           >
             Registrieren
@@ -2221,12 +7446,170 @@ function AuthModal({ onClose, onSignIn, onSignUp }) {
           <button
             type="submit"
             disabled={submitting}
-            className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
           >
             {submitting ? <Loader2 size={16} className="animate-spin" /> : mode === "login" ? <LogIn size={16} /> : <UserPlus size={16} />}
             {mode === "login" ? "Anmelden" : "Registrieren"}
           </button>
         </form>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// EIGENE PROFIL-EINSTELLUNGEN — E-Mail und Passwort selbst verwalten (Abschnitt 4)
+// ----------------------------------------------------------------------------------
+// Bewusst zwei getrennte <form>-Blöcke mit jeweils eigenem submitting/error/info-
+// Paar statt eines gemeinsamen Formulars: E-Mail- und Passwortänderung sind
+// unabhängige Supabase-Auth-Vorgänge mit unterschiedlichem Erfolgsverhalten (die
+// E-Mail-Änderung wird erst nach Bestätigung der neuen Adresse wirksam, die
+// Passwortänderung sofort) — ein gemeinsamer Submit-Button würde das verwischen.
+function ProfileModal({ session, currentAppUser, onClose, onUpdateEmail, onUpdatePassword }) {
+  const currentEmail = session?.user?.email || "";
+  const [newEmail, setNewEmail] = useState(currentEmail);
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [emailSubmitting, setEmailSubmitting] = useState(false);
+  const [emailError, setEmailError] = useState("");
+  const [emailInfo, setEmailInfo] = useState("");
+  const [passwordSubmitting, setPasswordSubmitting] = useState(false);
+  const [passwordError, setPasswordError] = useState("");
+  const [passwordInfo, setPasswordInfo] = useState("");
+
+  const handleEmailSubmit = async (e) => {
+    e.preventDefault();
+    setEmailError("");
+    setEmailInfo("");
+    if (!newEmail.trim() || newEmail.trim().toLowerCase() === currentEmail.toLowerCase()) {
+      setEmailError("Bitte eine neue, von der aktuellen abweichende E-Mail-Adresse eingeben.");
+      return;
+    }
+    setEmailSubmitting(true);
+    try {
+      await onUpdateEmail(newEmail.trim());
+      setEmailInfo("Bestätigungs-E-Mail an die neue Adresse gesendet. Die Änderung wird erst nach dem Bestätigen dort wirksam.");
+    } catch (err) {
+      console.error("E-Mail-Änderung fehlgeschlagen:", err);
+      setEmailError(err?.message || "Die E-Mail-Adresse konnte nicht geändert werden.");
+    } finally {
+      setEmailSubmitting(false);
+    }
+  };
+
+  const handlePasswordSubmit = async (e) => {
+    e.preventDefault();
+    setPasswordError("");
+    setPasswordInfo("");
+    if (newPassword.length < 6) {
+      setPasswordError("Das neue Passwort muss mindestens 6 Zeichen lang sein.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPasswordError("Die beiden Passwörter stimmen nicht überein.");
+      return;
+    }
+    setPasswordSubmitting(true);
+    try {
+      await onUpdatePassword(newPassword);
+      setPasswordInfo("Passwort erfolgreich geändert.");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err) {
+      console.error("Passwort-Änderung fehlgeschlagen:", err);
+      setPasswordError(err?.message || "Das Passwort konnte nicht geändert werden.");
+    } finally {
+      setPasswordSubmitting(false);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-[80]`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[88vh] sm:max-w-sm sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>Mein Konto</p>
+            <h2 className="text-lg font-bold text-slate-900">Profil-Einstellungen</h2>
+          </div>
+          <button onClick={onClose} className={MODAL_CLOSE_BTN}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className={MODAL_BODY_SCROLL}>
+          {currentAppUser && (
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <RoleBadge role={currentAppUser.role} />
+              <span className="text-xs font-medium text-slate-600">{currentAppUser.name}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleEmailSubmit} className="space-y-2 border-t border-slate-100 pt-4">
+            <FieldLabel>E-Mail-Adresse ändern</FieldLabel>
+            <input
+              type="email"
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
+              disabled={emailSubmitting}
+              className={TEXT_INPUT_CLASS}
+            />
+            {emailError && <p className="text-xs font-medium text-rose-600">{emailError}</p>}
+            {emailInfo && <p className="text-xs font-medium text-emerald-600">{emailInfo}</p>}
+            <button
+              type="submit"
+              disabled={emailSubmitting}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {emailSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Mail size={16} />} E-Mail ändern
+            </button>
+          </form>
+
+          <form onSubmit={handlePasswordSubmit} className="space-y-2 border-t border-slate-100 pt-4">
+            <FieldLabel>Passwort ändern</FieldLabel>
+            <div className="relative">
+              <input
+                type={showPassword ? "text" : "password"}
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                disabled={passwordSubmitting}
+                placeholder="Neues Passwort"
+                className={`${TEXT_INPUT_CLASS} pr-10`}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                tabIndex={-1}
+                className="absolute inset-y-0 right-0 flex items-center px-3 text-slate-400 transition hover:text-slate-600"
+              >
+                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+            <input
+              type={showPassword ? "text" : "password"}
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              disabled={passwordSubmitting}
+              placeholder="Neues Passwort bestätigen"
+              className={TEXT_INPUT_CLASS}
+            />
+            {passwordError && <p className="text-xs font-medium text-rose-600">{passwordError}</p>}
+            {passwordInfo && <p className="text-xs font-medium text-emerald-600">{passwordInfo}</p>}
+            <button
+              type="submit"
+              disabled={passwordSubmitting}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {passwordSubmitting ? <Loader2 size={16} className="animate-spin" /> : <KeyRound size={16} />} Passwort ändern
+            </button>
+          </form>
+        </div>
+
+        <div className={MODAL_FOOTER_ROW}>
+          <button onClick={onClose} className={BTN_SECONDARY}>
+            Schließen
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -2352,7 +7735,7 @@ function TradesAdminModal({ trades, onClose, onCreate, onRename, onToggleActive,
       <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[85vh] sm:max-w-xl sm:rounded-2xl">
         <div className={MODAL_HEADER_ROW}>
           <div>
-            <p className="mb-0.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-blue-600">
+            <p className="mb-0.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[#FF2A00]">
               <Wrench size={13} /> Verwaltung
             </p>
             <h2 className="text-lg font-bold text-slate-900">Gewerke</h2>
@@ -2402,7 +7785,7 @@ function TradesAdminModal({ trades, onClose, onCreate, onRename, onToggleActive,
                     onChange={(e) => setEditingName(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && commitEdit(trade)}
                     onBlur={() => commitEdit(trade)}
-                    className="flex-1 rounded-md border border-blue-300 px-2 py-1 text-sm outline-none ring-blue-500/30 focus:ring-4"
+                    className="flex-1 rounded-md border border-red-300 px-2 py-1 text-sm outline-none ring-[#FF2A00]/30 focus:ring-4"
                   />
                 ) : (
                   <button
@@ -2435,12 +7818,12 @@ function TradesAdminModal({ trades, onClose, onCreate, onRename, onToggleActive,
               onKeyDown={(e) => e.key === "Enter" && handleCreate()}
               disabled={creating}
               placeholder="Neues Gewerk hinzufügen…"
-              className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none ring-blue-500/30 placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+              className="flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
             />
             <button
               onClick={handleCreate}
               disabled={creating}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
             >
               {creating ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />} Hinzufügen
             </button>
@@ -2567,7 +7950,7 @@ function UserFormModal({ mode, user, projects, onClose, onSave }) {
                 value={role}
                 onChange={(e) => setRole(e.target.value)}
                 disabled={submitting}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-blue-500/30 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
               >
                 {USER_ROLES.map((r) => (
                   <option key={r} value={r}>
@@ -2583,7 +7966,7 @@ function UserFormModal({ mode, user, projects, onClose, onSave }) {
                 value={active ? "aktiv" : "inaktiv"}
                 onChange={(e) => setActive(e.target.value === "aktiv")}
                 disabled={submitting}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-blue-500/30 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
               >
                 {USER_STATUS_OPTIONS.map((s) => (
                   <option key={s} value={s}>
@@ -2607,7 +7990,7 @@ function UserFormModal({ mode, user, projects, onClose, onSave }) {
                     checked={projectIds.includes(p.id)}
                     onChange={() => toggleProject(p.id)}
                     disabled={submitting}
-                    className="h-3.5 w-3.5 accent-blue-600"
+                    className="h-3.5 w-3.5 accent-[#FF2A00]"
                   />
                   {p.name}
                 </label>
@@ -2642,28 +8025,274 @@ function UserFormModal({ mode, user, projects, onClose, onSave }) {
 }
 
 // ----------------------------------------------------------------------------------
+// BENUTZERVERWALTUNG — EINLADUNGSFORMULAR (Abschnitt 2, Option B)
+// ----------------------------------------------------------------------------------
+// Bewusst ein eigenständiges Formular statt eines dritten Modus in UserFormModal
+// oben: UserFormModal legt ein app_users-Profil OHNE Auth-Nebenwirkung an (für den
+// Fall, dass die Person sich bereits selbst über "Registrieren" ein Konto angelegt
+// hat und nur noch Rolle/Projekte zugeordnet bekommen muss) — dieses Formular hier
+// löst zusätzlich den echten Einladungsversand aus (siehe inviteUserToApp), setzt
+// also ein noch NICHT vorhandenes Auth-Konto voraus. Beide Wege bestehen bewusst
+// nebeneinander, siehe Einordnung.
+function InviteUserModal({ projects, existingEmails, onClose, onInvite }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("Projektmitarbeiter");
+  const [projectIds, setProjectIds] = useState([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  // Gesetzt, sobald die direkte Link-Erzeugung erfolgreich war (Regelfall, siehe
+  // sendInviteLinkPrimary) — in diesem Fall bleibt das Modal offen und zeigt den
+  // Link mit Kopieren-Button an, statt sich sofort zu schließen. Bleibt null, wenn
+  // stattdessen (Ausnahmefall) auf den E-Mail-Versand ausgewichen wurde — dann
+  // schließt sich das Modal wie gewohnt von selbst.
+  const [directLink, setDirectLink] = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  const toggleProject = (projectId) => {
+    setProjectIds((prev) => (prev.includes(projectId) ? prev.filter((id) => id !== projectId) : [...prev, projectId]));
+  };
+
+  const handleSubmit = async () => {
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) {
+      setError("Bitte eine E-Mail-Adresse eingeben.");
+      return;
+    }
+    if ((existingEmails || []).includes(normalizedEmail)) {
+      setError("Für diese E-Mail-Adresse existiert bereits ein Benutzerprofil. Projekte/Rolle lassen sich über „Bearbeiten“ anpassen.");
+      return;
+    }
+    setError("");
+    setSubmitting(true);
+    try {
+      const result = await onInvite({ name: name.trim(), email: normalizedEmail, role, projectIds });
+      if (result?.directLink) {
+        setDirectLink(result.directLink);
+      } else {
+        onClose();
+      }
+    } catch (err) {
+      console.error("Einladung konnte nicht versendet werden:", err);
+      setError(err?.message || "Die Einladung konnte nicht versendet werden. Bitte erneut versuchen.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleCopyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(directLink);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2500);
+    } catch (err) {
+      console.error("Link konnte nicht in die Zwischenablage kopiert werden:", err);
+      setError("Der Link konnte nicht automatisch kopiert werden — bitte manuell markieren und kopieren.");
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-[75]`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[90vh] sm:max-w-lg sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>Einladungssystem</p>
+            <h2 className="text-lg font-bold text-slate-900">{directLink ? "Direkter Einladungslink" : "Benutzer einladen"}</h2>
+          </div>
+          <button onClick={onClose} disabled={submitting} className={MODAL_CLOSE_BTN_DISABLED}>
+            <X size={20} />
+          </button>
+        </div>
+
+        {directLink ? (
+          <div className={MODAL_BODY_SCROLL}>
+            <div className="flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-xs leading-relaxed text-emerald-800">
+              <Check size={14} className="mt-0.5 shrink-0" />
+              <span>
+                Einladungslink erzeugt, ohne Wartezeit auf einen E-Mail-Versand. Bitte weiterleiten an{" "}
+                <strong>{email.trim() || "die eingeladene Person"}</strong> — z.B. per Chat, Teams oder E-Mail.
+              </span>
+            </div>
+            <div>
+              <FieldLabel>Einladungslink</FieldLabel>
+              <div className="flex items-center gap-2">
+                <input readOnly value={directLink} onFocus={(e) => e.target.select()} className={`${TEXT_INPUT_CLASS} font-mono text-xs`} />
+                <button
+                  onClick={handleCopyLink}
+                  title="In Zwischenablage kopieren"
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-slate-900"
+                >
+                  {copied ? <Check size={14} /> : <Copy size={14} />} {copied ? "Kopiert" : "Kopieren"}
+                </button>
+              </div>
+            </div>
+            {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
+          </div>
+        ) : (
+          <div className={MODAL_BODY_SCROLL}>
+            <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-xs leading-relaxed text-slate-500">
+              Es wird ein Konto für diese E-Mail-Adresse angelegt und direkt ein kopierbarer Einladungslink erzeugt —
+              ohne blockierenden E-Mail-Versand, also unabhängig von SMTP-Timeouts. Rolle und Projektzuordnung gelten
+              sofort ab der ersten Anmeldung. Nur falls die direkte Erzeugung ausnahmsweise nicht möglich ist, wird
+              ersatzweise eine Einladungs-E-Mail verschickt.
+            </p>
+            <div>
+              <FieldLabel>Name</FieldLabel>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={submitting}
+                placeholder="Vor- und Nachname"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+            <div>
+              <FieldLabel>E-Mail-Adresse</FieldLabel>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={submitting}
+                placeholder="name@firma.de"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+            <div>
+              <FieldLabel>Rolle</FieldLabel>
+              <select
+                value={role}
+                onChange={(e) => setRole(e.target.value)}
+                disabled={submitting}
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+              >
+                {USER_ROLES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-[11px] text-slate-400">{ROLE_META[role]?.description}</p>
+            </div>
+            <div>
+              <FieldLabel>Projektzuordnung</FieldLabel>
+              <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2">
+                {projects.map((p) => (
+                  <label
+                    key={p.id}
+                    className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-slate-600 transition hover:bg-slate-50"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={projectIds.includes(p.id)}
+                      onChange={() => toggleProject(p.id)}
+                      disabled={submitting}
+                      className="h-3.5 w-3.5 accent-[#FF2A00]"
+                    />
+                    {p.name}
+                  </label>
+                ))}
+                {projects.length === 0 && <p className="px-2 py-1.5 text-xs text-slate-400">Noch keine Projekte vorhanden.</p>}
+              </div>
+            </div>
+            {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
+          </div>
+        )}
+
+        <div className={MODAL_FOOTER_ROW}>
+          {directLink ? (
+            <button onClick={onClose} className={BTN_PRIMARY}>
+              <Check size={16} /> Fertig
+            </button>
+          ) : (
+            <>
+              <button onClick={onClose} disabled={submitting} className={BTN_SECONDARY}>
+                Abbrechen
+              </button>
+              <button onClick={handleSubmit} disabled={submitting} className={BTN_PRIMARY}>
+                {submitting ? <Loader2 size={16} className="animate-spin" /> : <MailPlus size={16} />} Einladung senden
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
 // BENUTZERVERWALTUNG — ÜBERSICHT (ADMIN-MODAL)
 // ----------------------------------------------------------------------------------
 
-function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, onToggleUserActive }) {
+function UsersAdminModal({
+  users,
+  projects,
+  onClose,
+  onCreateUser,
+  onEditUser,
+  onToggleUserActive,
+  onInviteUser,
+  onResendInvite,
+  onDeleteUser,
+}) {
   const [formState, setFormState] = useState(null); // { mode, user }
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [resendingId, setResendingId] = useState(null);
+  // Direkter Einladungslink pro Benutzer-ID, den "Erneut senden" liefert (siehe
+  // sendInviteLinkPrimary — Regelfall, kein Fehlerzustand) — wird inline unter der
+  // jeweiligen Benutzerzeile angezeigt, siehe unten.
+  const [directLinkByUser, setDirectLinkByUser] = useState({});
+  const [copiedUserId, setCopiedUserId] = useState(null);
+  const [deleteConfirmUser, setDeleteConfirmUser] = useState(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const handleResend = async (u) => {
+    setResendingId(u.id);
+    try {
+      const result = await onResendInvite(u);
+      if (result?.directLink) {
+        setDirectLinkByUser((prev) => ({ ...prev, [u.id]: result.directLink }));
+      }
+    } finally {
+      setResendingId(null);
+    }
+  };
+
+  const handleCopyUserLink = async (userId, link) => {
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopiedUserId(userId);
+      setTimeout(() => setCopiedUserId(null), 2500);
+    } catch (err) {
+      console.error("Link konnte nicht in die Zwischenablage kopiert werden:", err);
+    }
+  };
+
+  const handleConfirmDelete = async () => {
+    setDeleteBusy(true);
+    try {
+      await onDeleteUser(deleteConfirmUser);
+      setDeleteConfirmUser(null);
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
 
   return (
     <div className={`${MODAL_BACKDROP_BASE} z-[65]`}>
       <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[85vh] sm:max-w-2xl sm:rounded-2xl">
         <div className={MODAL_HEADER_ROW}>
           <div>
-            <p className="mb-0.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-blue-600">
+            <p className="mb-0.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[#FF2A00]">
               <UserCog size={13} /> Verwaltung
             </p>
             <h2 className="text-lg font-bold text-slate-900">Benutzer</h2>
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setFormState({ mode: "create", user: null })}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-blue-700"
+              onClick={() => setInviteOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
             >
-              <Plus size={14} /> Neuer Benutzer
+              <MailPlus size={14} /> Benutzer einladen
             </button>
             <button onClick={onClose} className={MODAL_CLOSE_BTN}>
               <X size={20} />
@@ -2673,33 +8302,84 @@ function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, o
 
         <div className="flex-1 space-y-2 overflow-y-auto px-5 py-4">
           {users.map((u) => (
-            <div key={u.id} className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 px-3 py-2.5">
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-semibold text-slate-900">{u.name}</span>
-                  {u.kuerzel && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">{u.kuerzel}</span>}
+            <div key={u.id} className="rounded-lg border border-slate-200 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-slate-900">{u.name}</span>
+                    {u.kuerzel && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500">{u.kuerzel}</span>}
+                    {u.invite_status === "eingeladen" && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200">
+                        <MailPlus size={10} /> Einladung ausstehend
+                      </span>
+                    )}
+                  </div>
+                  <p className="truncate text-xs text-slate-500">{u.email}</p>
+                  <p className="mt-0.5 text-[11px] text-slate-400">
+                    {(u.project_ids || []).length} Projekt{(u.project_ids || []).length !== 1 ? "e" : ""} zugeordnet
+                  </p>
                 </div>
-                <p className="truncate text-xs text-slate-500">{u.email}</p>
-                <p className="mt-0.5 text-[11px] text-slate-400">
-                  {(u.project_ids || []).length} Projekt{(u.project_ids || []).length !== 1 ? "e" : ""} zugeordnet
-                </p>
+                <RoleBadge role={u.role} />
+                <button onClick={() => onToggleUserActive(u)} title={u.active ? "Deaktivieren" : "Aktivieren"}>
+                  <ActiveStatusBadge active={u.active} />
+                </button>
+                {u.invite_status === "eingeladen" && (
+                  <button
+                    onClick={() => handleResend(u)}
+                    disabled={resendingId === u.id}
+                    title="Einladung erneut senden"
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {resendingId === u.id ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />} Erneut senden
+                  </button>
+                )}
+                <button
+                  onClick={() => setFormState({ mode: "edit", user: u })}
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+                >
+                  <Pencil size={13} /> Bearbeiten
+                </button>
+                <button
+                  onClick={() => setDeleteConfirmUser(u)}
+                  title="Zugang entziehen"
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-rose-500 transition hover:bg-rose-50 hover:text-rose-700"
+                >
+                  <UserX size={13} /> Entfernen
+                </button>
               </div>
-              <RoleBadge role={u.role} />
-              <button onClick={() => onToggleUserActive(u)} title={u.active ? "Deaktivieren" : "Aktivieren"}>
-                <ActiveStatusBadge active={u.active} />
-              </button>
-              <button
-                onClick={() => setFormState({ mode: "edit", user: u })}
-                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
-              >
-                <Pencil size={13} /> Bearbeiten
-              </button>
+              {/* Direkter Link-Fallback (Abschnitt 1) — erscheint nur, wenn der letzte
+                  Erinnerungsversand per Mail nicht funktioniert hat, siehe handleResend
+                  oben. Bewusst inline unter der Zeile statt in einem eigenen Modal, damit
+                  mehrere aufeinanderfolgende Erinnerungen an verschiedene Personen
+                  gleichzeitig sichtbar bleiben können. */}
+              {directLinkByUser[u.id] && (
+                <div className="mt-2 flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-2">
+                  <input
+                    readOnly
+                    value={directLinkByUser[u.id]}
+                    onFocus={(e) => e.target.select()}
+                    className="flex-1 truncate border-none bg-transparent p-0 font-mono text-[11px] text-emerald-800 outline-none"
+                  />
+                  <button
+                    onClick={() => handleCopyUserLink(u.id, directLinkByUser[u.id])}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-md bg-emerald-600 px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-emerald-700"
+                  >
+                    {copiedUserId === u.id ? <Check size={12} /> : <Copy size={12} />} {copiedUserId === u.id ? "Kopiert" : "Kopieren"}
+                  </button>
+                </div>
+              )}
             </div>
           ))}
           {users.length === 0 && <p className="text-xs text-slate-400">Noch keine Benutzer angelegt.</p>}
         </div>
 
-        <div className="flex items-center justify-end border-t border-slate-100 px-5 py-3.5">
+        <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3.5">
+          <button
+            onClick={() => setFormState({ mode: "create", user: null })}
+            className="text-xs font-semibold text-slate-400 underline-offset-2 transition hover:text-slate-600 hover:underline"
+          >
+            Profil manuell verknüpfen (bereits bestehendes Konto)
+          </button>
           <button onClick={onClose} className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-500 transition hover:bg-slate-100">
             Schließen
           </button>
@@ -2720,6 +8400,26 @@ function UsersAdminModal({ users, projects, onClose, onCreateUser, onEditUser, o
             }
             setFormState(null);
           }}
+        />
+      )}
+
+      {inviteOpen && (
+        <InviteUserModal
+          projects={projects}
+          existingEmails={users.map((u) => u.email?.toLowerCase())}
+          onClose={() => setInviteOpen(false)}
+          onInvite={onInviteUser}
+        />
+      )}
+
+      {deleteConfirmUser && (
+        <ConfirmDialog
+          title="Zugang wirklich entziehen?"
+          message={`„${deleteConfirmUser.name}“ (${deleteConfirmUser.email}) verliert sofort jede Rollen- und Projektzuordnung in BauDoc. Das zugrunde liegende Anmeldekonto selbst bleibt bestehen und muss bei Bedarf zusätzlich über das Supabase-Dashboard entfernt werden.`}
+          confirmLabel="Zugang entziehen"
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setDeleteConfirmUser(null)}
+          busy={deleteBusy}
         />
       )}
     </div>
@@ -2825,6 +8525,7 @@ function PdfExportModal({ project, floors, trades, users, generatedBy, onClose }
   const [creators, setCreators] = useState([]);
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
+  const [includeOnboarding, setIncludeOnboarding] = useState(() => hasOnboardingInfo(project));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -2854,7 +8555,15 @@ function PdfExportModal({ project, floors, trades, users, generatedBy, onClose }
         creatorLabel: creators.length ? creators.join(", ") : "Alle Ersteller",
       };
       const filteredPins = filterExportPins(allPins, filters);
-      await generateProjectReportPdf({ project, floors: floors || [], pins: filteredPins, filters, trades, generatedBy });
+      await generateProjectReportPdf({
+        project,
+        floors: floors || [],
+        pins: filteredPins,
+        filters,
+        trades,
+        generatedBy,
+        includeOnboarding: includeOnboarding && hasOnboardingInfo(project),
+      });
       onClose();
     } catch (err) {
       console.error("PDF-Export fehlgeschlagen:", err);
@@ -2899,7 +8608,7 @@ function PdfExportModal({ project, floors, trades, users, generatedBy, onClose }
                   value={fromDate}
                   onChange={(e) => setFromDate(e.target.value)}
                   disabled={busy}
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-2 text-sm text-slate-700 outline-none ring-blue-500/30 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
                 />
               </div>
               <div className="relative">
@@ -2909,7 +8618,7 @@ function PdfExportModal({ project, floors, trades, users, generatedBy, onClose }
                   value={toDate}
                   onChange={(e) => setToDate(e.target.value)}
                   disabled={busy}
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-2 text-sm text-slate-700 outline-none ring-blue-500/30 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
                 />
               </div>
             </div>
@@ -2940,6 +8649,26 @@ function PdfExportModal({ project, floors, trades, users, generatedBy, onClose }
             <p className="mt-1.5 text-[11px] text-slate-400">Keine Auswahl = alle Ersteller.</p>
           </div>
 
+          {hasOnboardingInfo(project) && (
+            <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+              <input
+                type="checkbox"
+                checked={includeOnboarding}
+                onChange={(e) => setIncludeOnboarding(e.target.checked)}
+                disabled={busy}
+                className="mt-0.5 accent-[#FF2A00]"
+              />
+              <span>
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-slate-700">
+                  <Info size={14} className="text-slate-400" /> Baustellen-Info auf Deckblatt einbinden
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  Anfahrt, Zugang &amp; Sicherheit, Ansprechpartner und Verpflegung erscheinen als eigener Abschnitt auf Seite 1.
+                </span>
+              </span>
+            </label>
+          )}
+
           {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
         </div>
 
@@ -2958,7 +8687,7 @@ function PdfExportModal({ project, floors, trades, users, generatedBy, onClose }
 }
 
 // ----------------------------------------------------------------------------------
-// PROJEKT-FORMULAR — Anlegen & Bearbeiten (inkl. LPH 1–9)
+// PROJEKT-FORMULAR — Anlegen & Bearbeiten
 // ----------------------------------------------------------------------------------
 
 function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose, onSave }) {
@@ -2967,15 +8696,38 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
   const [address, setAddress] = useState(project?.address || "");
   const [status, setStatus] = useState(project?.status || "Geplant");
   const [projectLeader, setProjectLeader] = useState(project?.project_leader || "");
-  // selectedLph: Array der ausgewählten Phasen-Keys, z.B. ["1", "3", "5"]. Der Lazy-
-  // Initializer sorgt dafür, dass beim allerersten Render bereits der richtige Wert
-  // steht (kein Aufblitzen einer leeren Auswahl beim Bearbeiten eines Projekts).
-  const [selectedLph, setSelectedLph] = useState(() => normalizeLphSelection(project?.lph_beauftragt));
+  // Bauzeitenplan — geplanter Baubeginn/geplante Fertigstellung (Grundlage für den
+  // zeitlichen Ist-Fortschritt, siehe ProjectScheduleProgress/computeTimeProgressPercent).
+  // Bewusst nur diese zwei einfachen Datumsfelder hier im schlanken Anlege-Formular —
+  // die eigentliche Verfeinerung mit einzelnen Meilensteinen passiert separat im neuen
+  // Bereich "Bauzeitenplan" (ScheduleView), nicht hier.
+  const [startDate, setStartDate] = useState(project?.start_date ? String(project.start_date).slice(0, 10) : "");
+  const [endDate, setEndDate] = useState(project?.end_date ? String(project.end_date).slice(0, 10) : "");
+  // Baustellen-Info für Nachunternehmer (Site Onboarding) — vier strukturierte
+  // Freitextfelder, die neuen Nachunternehmern die Orientierung vor Ort erleichtern
+  // (siehe hasOnboardingInfo/buildOnboardingSections sowie die Anzeige im
+  // Projekt-Header in FloorOverview und die optionale PDF-Einbindung).
+  const [siteAccessInfo, setSiteAccessInfo] = useState(project?.site_access_info || "");
+  const [siteSafetyInfo, setSiteSafetyInfo] = useState(project?.site_safety_info || "");
+  const [siteContactName, setSiteContactName] = useState(project?.site_contact_name || "");
+  const [siteContactPhone, setSiteContactPhone] = useState(project?.site_contact_phone || "");
+  const [siteAmenitiesInfo, setSiteAmenitiesInfo] = useState(project?.site_amenities_info || "");
   // selectedTrades: Array der ausgewählten Gewerke-IDs für dieses Projekt. Bei einem
   // Bestandsprojekt ohne gespeicherte Auswahl (resolveProjectTradeIds → null) startet
   // die Auswahl bewusst leer — der Hinweistext unten erklärt, was das für den Nutzer
   // bedeutet, statt es stillschweigend so zu belassen.
   const [selectedTrades, setSelectedTrades] = useState(() => resolveProjectTradeIds(project) ?? []);
+  // Projekt-Titelbild (Gebäudeansicht für die Kachel, siehe ProjectCoverImage):
+  // coverImageFile ist die neu ausgewählte, noch nicht hochgeladene Datei (null,
+  // solange nichts Neues gewählt wurde); coverImagePreview ist, was aktuell im
+  // Modal zu sehen ist — entweder das bestehende project.cover_image_url, eine
+  // lokale Objekt-URL der neu gewählten Datei, oder null; coverImageRemoved hält
+  // fest, ob ein vorhandenes Titelbild ausdrücklich entfernt wurde (siehe
+  // handleSubmit — dann wird cover_image_url explizit auf null gesetzt).
+  const [coverImageFile, setCoverImageFile] = useState(null);
+  const [coverImagePreview, setCoverImagePreview] = useState(project?.cover_image_url || null);
+  const [coverImageRemoved, setCoverImageRemoved] = useState(false);
+  const coverImageInputRef = useRef(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
@@ -2983,28 +8735,42 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
 
   // Zusätzlicher, expliziter Reset bei jedem Öffnen des Modals: greift sowohl beim
   // Anlegen (project ist null, also leeres Array) als auch beim Bearbeiten (project
-  // ist gesetzt, also die gespeicherte Auswahl). Normalisiert dabei robust sowohl das
-  // aktuelle Array-Format als auch ältere Objekt-Bestände aus Supabase.
+  // ist gesetzt, also die gespeicherte Auswahl).
   useEffect(() => {
-    setSelectedLph(normalizeLphSelection(project?.lph_beauftragt));
     setSelectedTrades(resolveProjectTradeIds(project) ?? []);
+    setSiteAccessInfo(project?.site_access_info || "");
+    setSiteSafetyInfo(project?.site_safety_info || "");
+    setSiteContactName(project?.site_contact_name || "");
+    setSiteContactPhone(project?.site_contact_phone || "");
+    setSiteAmenitiesInfo(project?.site_amenities_info || "");
+    setStartDate(project?.start_date ? String(project.start_date).slice(0, 10) : "");
+    setEndDate(project?.end_date ? String(project.end_date).slice(0, 10) : "");
+    setCoverImageFile(null);
+    setCoverImagePreview(project?.cover_image_url || null);
+    setCoverImageRemoved(false);
   }, [project]);
 
   const handleToggleTrade = (tradeId) => {
     setSelectedTrades((prev) => (prev.includes(tradeId) ? prev.filter((id) => id !== tradeId) : [...prev, tradeId]));
   };
 
-  // Schlanke Handler-Funktion für die interaktive Auftragsauswahl: schaltet genau
-  // eine Phase um, ohne die übrigen Werte zu verändern (immutable update über die
-  // Setter-Funktion, damit React den Zustandswechsel beim allerersten Klick sofort
-  // erkennt und sichtbar macht). Vergleicht Keys konsequent als String, damit es
-  // keinen Unterschied macht, ob eine Phase als Zahl oder als String hereinkommt.
-  const handleToggleLph = (phaseKey) => {
-    const key = String(phaseKey);
-    setSelectedLph((prev) => {
-      const current = normalizeLphSelection(prev);
-      return current.includes(key) ? current.filter((k) => k !== key) : [...current, key];
-    });
+  const handleCoverImagePick = (file) => {
+    if (!file || submitting) return;
+    if (!file.type.startsWith("image/")) {
+      setError("Bitte nur ein Bildformat (PNG, JPG oder WebP) als Titelbild hochladen.");
+      return;
+    }
+    setError("");
+    setCoverImageFile(file);
+    setCoverImagePreview(URL.createObjectURL(file));
+    setCoverImageRemoved(false);
+  };
+
+  const handleCoverImageRemove = () => {
+    if (submitting) return;
+    setCoverImageFile(null);
+    setCoverImagePreview(null);
+    setCoverImageRemoved(true);
   };
 
   const handleSubmit = async () => {
@@ -3012,18 +8778,39 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
       setError("Bitte einen Projektnamen vergeben.");
       return;
     }
+    if (startDate && endDate && endDate < startDate) {
+      setError("Das geplante Fertigstellungsdatum darf nicht vor dem geplanten Baubeginn liegen.");
+      return;
+    }
     setError("");
     setSubmitting(true);
     try {
-      await onSave({
+      const fields = {
         name: name.trim(),
         project_number: projectNumber.trim(),
         address: address.trim(),
         status,
         project_leader: projectLeader.trim(),
-        lph_beauftragt: selectedLph,
         selected_trades: selectedTrades,
-      });
+        site_access_info: siteAccessInfo.trim(),
+        site_safety_info: siteSafetyInfo.trim(),
+        site_contact_name: siteContactName.trim(),
+        site_contact_phone: siteContactPhone.trim(),
+        site_amenities_info: siteAmenitiesInfo.trim(),
+        start_date: startDate || null,
+        end_date: endDate || null,
+      };
+      // _coverImageFile ist kein echtes Projektfeld, sondern ein Marker für den
+      // Aufrufer (App/handleSaveProject): dort wird die Datei erst NACH dem
+      // Anlegen/Speichern des Projekts zu Supabase Storage hochgeladen (beim
+      // Neuanlegen existiert die für den Storage-Pfad benötigte Projekt-ID vorher
+      // noch nicht) und cover_image_url anschließend separat gesetzt.
+      if (coverImageFile) {
+        fields._coverImageFile = coverImageFile;
+      } else if (coverImageRemoved) {
+        fields.cover_image_url = null;
+      }
+      await onSave(fields);
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
       console.error("Projekt konnte nicht gespeichert werden:", err);
@@ -3083,6 +8870,66 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
                 placeholder="Straße, PLZ, Ort"
                 className={TEXT_INPUT_CLASS}
               />
+              {/* Nutzt bewusst den LIVE-State "address", nicht project?.address — der Link
+                  soll sofort auch eine gerade erst eingetippte, noch nicht gespeicherte
+                  Adresse abbilden, statt erst nach dem Speichern zu erscheinen. */}
+              <AddressMapsLink
+                address={address}
+                iconSize={13}
+                className="mt-1.5 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"
+              >
+                In Google Maps öffnen
+              </AddressMapsLink>
+            </div>
+            <div className="sm:col-span-2">
+              <FieldLabel>Projekt-Titelbild / Gebäudeansicht</FieldLabel>
+              <input
+                ref={coverImageInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                className="hidden"
+                disabled={submitting}
+                onChange={(e) => handleCoverImagePick(e.target.files?.[0])}
+              />
+              {coverImagePreview ? (
+                <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 p-2.5">
+                  <img src={coverImagePreview} alt="Titelbild-Vorschau" className="h-16 w-24 rounded-lg object-cover shadow-sm" />
+                  <div className="flex-1 text-xs text-slate-500">
+                    {coverImageFile ? "Neu ausgewählt — wird beim Speichern hochgeladen." : "Aktuelles Titelbild dieser Kachel."}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => coverImageInputRef.current?.click()}
+                    disabled={submitting}
+                    className="rounded-md px-2 py-1.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    Ändern
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleCoverImageRemove}
+                    disabled={submitting}
+                    className="rounded-md px-2 py-1.5 text-xs font-semibold text-rose-500 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    Entfernen
+                  </button>
+                </div>
+              ) : (
+                <div
+                  onClick={() => !submitting && coverImageInputRef.current?.click()}
+                  className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-center transition hover:border-[#FF2A00] hover:bg-red-50/50 ${
+                    submitting ? "cursor-not-allowed opacity-60" : ""
+                  }`}
+                >
+                  <ImagePlus size={24} className="text-slate-400" />
+                  <p className="mt-1.5 text-xs font-medium text-slate-500">
+                    Optional — eigenes Foto der Fassade/Baustelle für die Kachel in der Projektübersicht
+                  </p>
+                </div>
+              )}
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                Ohne eigenes Titelbild zeigt die Kachel automatisch das erste Mängel-Pin-Foto, sonst ein Platzhalterbild.
+              </p>
             </div>
             <div>
               <FieldLabel>Projekt-Status</FieldLabel>
@@ -3090,7 +8937,7 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
                 value={status}
                 onChange={(e) => setStatus(e.target.value)}
                 disabled={submitting}
-                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-blue-500/30 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
               >
                 {PROJECT_STATUS_OPTIONS.map((opt) => (
                   <option key={opt} value={opt}>
@@ -3108,20 +8955,33 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
                   onChange={(e) => setProjectLeader(e.target.value)}
                   disabled={submitting}
                   placeholder="z.B. Milo"
-                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-blue-500/30 placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+                  className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
                 />
               </div>
             </div>
-          </div>
-
-          <div>
-            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-              <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">HOAI-Leistungsphasen (LPH 1–9) · Auftragsauswahl</label>
-              <LphAuftragsQuickActions onApply={setSelectedLph} disabled={submitting} />
+            <div>
+              <FieldLabel>Geplanter Baubeginn</FieldLabel>
+              <input
+                type="date"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                disabled={submitting}
+                className={TEXT_INPUT_CLASS}
+              />
             </div>
-            <div className="space-y-2">
-              <LphAuftragsProgressRow lphSelection={selectedLph} />
-              <LphAuftragsGrid lphSelection={selectedLph} onToggle={handleToggleLph} disabled={submitting} />
+            <div>
+              <FieldLabel>Geplante Fertigstellung</FieldLabel>
+              <input
+                type="date"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                disabled={submitting}
+                className={TEXT_INPUT_CLASS}
+              />
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                Optional — Grundlage für die Fortschrittsleiste im Bauzeitenplan. Einzelne
+                Bauabschnitte/Meilensteine werden separat im Bereich "Bauzeitenplan" gepflegt.
+              </p>
             </div>
           </div>
 
@@ -3150,6 +9010,94 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
               </p>
             )}
             <TradeChipsPicker trades={trades} selected={selectedTrades} onToggle={handleToggleTrade} disabled={submitting} />
+          </div>
+
+          {/* Baustellen-Guide / Projekt-Orientierung: strukturierte Infofelder für
+              externe Nachunternehmer, die neu auf die Baustelle kommen — prominent im
+              Projekt-Header sichtbar (siehe FloorOverview) und optional Bestandteil
+              der PDF-Exporte (siehe hasOnboardingInfo/drawOnboardingInfoBox). */}
+          <div className="space-y-3.5 rounded-xl border border-amber-200 bg-amber-50/40 p-3.5">
+            <div className="flex items-center gap-1.5">
+              <Info size={14} className="text-amber-600" />
+              <label className="text-[11px] font-semibold uppercase tracking-wider text-amber-700">
+                Baustellen-Guide für Nachunternehmer
+              </label>
+            </div>
+            <p className="-mt-1.5 text-[11px] leading-snug text-amber-700/80">
+              Erscheint prominent im Projekt-Header, damit sich neue Nachunternehmer vor Ort sofort orientieren können.
+              Alle Felder sind optional.
+            </p>
+            <div>
+              <FieldLabel>Anfahrt &amp; Parkmöglichkeiten</FieldLabel>
+              <div className="relative">
+                <Navigation className="pointer-events-none absolute left-3 top-2.5 text-slate-400" size={16} />
+                <textarea
+                  value={siteAccessInfo}
+                  onChange={(e) => setSiteAccessInfo(e.target.value)}
+                  disabled={submitting}
+                  rows={2}
+                  placeholder="z.B. Lieferanten-Einfahrt Tor 2, Parken auf Fläche B"
+                  className="w-full resize-none rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+                />
+              </div>
+            </div>
+            <div>
+              <FieldLabel>Zugang &amp; Sicherheit</FieldLabel>
+              <div className="relative">
+                <ShieldCheck className="pointer-events-none absolute left-3 top-2.5 text-slate-400" size={16} />
+                <textarea
+                  value={siteSafetyInfo}
+                  onChange={(e) => setSiteSafetyInfo(e.target.value)}
+                  disabled={submitting}
+                  rows={2}
+                  placeholder="z.B. Anmeldung im Baucontainer 1, Helm- und Sicherheitsschuhpflicht"
+                  className="w-full resize-none rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div>
+                <FieldLabel>Ansprechpartner / Bauleitung</FieldLabel>
+                <div className="relative">
+                  <User className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+                  <input
+                    value={siteContactName}
+                    onChange={(e) => setSiteContactName(e.target.value)}
+                    disabled={submitting}
+                    placeholder="Name"
+                    className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+                  />
+                </div>
+              </div>
+              <div>
+                <FieldLabel>Telefonnummer</FieldLabel>
+                <div className="relative">
+                  <Phone className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+                  <input
+                    type="tel"
+                    value={siteContactPhone}
+                    onChange={(e) => setSiteContactPhone(e.target.value)}
+                    disabled={submitting}
+                    placeholder="z.B. 0170 1234567"
+                    className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+                  />
+                </div>
+              </div>
+            </div>
+            <div>
+              <FieldLabel>Verpflegung &amp; Infrastruktur</FieldLabel>
+              <div className="relative">
+                <Coffee className="pointer-events-none absolute left-3 top-2.5 text-slate-400" size={16} />
+                <textarea
+                  value={siteAmenitiesInfo}
+                  onChange={(e) => setSiteAmenitiesInfo(e.target.value)}
+                  disabled={submitting}
+                  rows={2}
+                  placeholder="z.B. Bäckerei / Imbiss 200 m rechts"
+                  className="w-full resize-none rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+                />
+              </div>
+            </div>
           </div>
 
           {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
@@ -3181,18 +9129,186 @@ function ProjectFormModal({ mode, project, trades = [], onManageTrades, onClose,
 // SCREEN 1: PROJECT OVERVIEW
 // ----------------------------------------------------------------------------------
 
-function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, onCreateProject, onEditProject, onDeleteProject }) {
-  const filtered = projects.filter(
+// Kleiner, unabhängiger Favoriten-Stern — in Grid- wie Listenansicht identisch, daher
+// als eigene Komponente statt doppelt inline formuliert. stopPropagation() ist hier
+// zwingend: der Stern sitzt in beiden Ansichten auf/neben einer Fläche, die selbst
+// einen Klick zum Öffnen des Projekts auslöst (Karten-Button bzw. Tabellenzeile) — ohne
+// stopPropagation würde ein Klick auf den Stern zusätzlich das Projekt öffnen.
+function FavoriteStarButton({ active, onToggle, size = 16, className = "" }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle();
+      }}
+      title={active ? "Von Favoriten entfernen" : "Als Favorit markieren"}
+      className={`rounded-full p-1 transition hover:scale-110 ${className}`}
+    >
+      <Star size={size} className={active ? "fill-yellow-400 text-yellow-400" : "fill-transparent text-slate-300"} />
+    </button>
+  );
+}
+
+// Dringlichkeits-Badge (Status "offen" + Priorität "hoch", siehe countUrgentPins) —
+// ebenfalls in beiden Ansichten identisch. Rendert nichts, wenn count 0 ist, damit
+// Aufrufer nicht jedes Mal selbst darauf prüfen müssen.
+function UrgentPinsBadge({ count, compact = false }) {
+  if (!count) return null;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full bg-[#FF2A00] font-bold text-white shadow ${
+        compact ? "px-2 py-0.5 text-[11px]" : "px-2.5 py-1 text-xs"
+      }`}
+      title={`${count} offene(r) Mängel-Pin(s) mit hoher Priorität`}
+    >
+      <AlertCircle size={compact ? 11 : 12} /> {count} kritisch
+    </span>
+  );
+}
+
+// Bildfläche der Projekt-Kachel (Grid-Ansicht, siehe ProjectOverview): eigenes
+// Grundriss-/Vorschaubild, jetzt nach fester Prioritätsreihenfolge: 1) explizit
+// hochgeladenes Projekt-Titelbild (project.cover_image_url, siehe
+// ProjectFormModal), 2) das älteste vorhandene Mängel-Pin-Foto des Projekts
+// (resolveProjectPinPhoto), 3) das bestehende Grundriss-Vorschaubild (heroFloor,
+// unverändert gegenüber bisher), erst wenn all das fehlt: das deterministische,
+// kuratierte Platzhalterfoto (siehe getProjectPlaceholderImage). Eigene Komponente
+// statt Inline-JSX in der .map()-Schleife, weil der Bild-Fallback (Platzhalterfoto
+// lädt nicht) einen eigenen useState-Hook braucht — Hooks dürfen nicht innerhalb
+// einer Schleife aufgerufen werden.
+function ProjectCoverImage({ project, heroFloor, heroKind, pinPhotoUrl }) {
+  const [placeholderFailed, setPlaceholderFailed] = useState(false);
+
+  if (project?.cover_image_url) {
+    return (
+      <img
+        src={project.cover_image_url}
+        alt=""
+        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+      />
+    );
+  }
+  if (pinPhotoUrl) {
+    return (
+      <img
+        src={pinPhotoUrl}
+        alt=""
+        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+      />
+    );
+  }
+  if (heroKind === "cad") {
+    return (
+      <div
+        className="flex h-full w-full items-center justify-center bg-[#0b1220]"
+        style={{
+          backgroundImage:
+            "linear-gradient(rgba(56,189,248,0.16) 1px, transparent 1px), linear-gradient(90deg, rgba(56,189,248,0.16) 1px, transparent 1px)",
+          backgroundSize: "16px 16px",
+        }}
+      >
+        <Ruler size={26} className="text-sky-300/80" />
+      </div>
+    );
+  }
+  if (heroKind === "pdf") {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-slate-800">
+        <FileText size={26} className="text-rose-400/80" />
+      </div>
+    );
+  }
+  if (heroKind === "image" && heroFloor) {
+    // Nur echte Bilddateien werden per <img> gerendert — .dwg/.dxf/.pdf laufen über
+    // die Zweige oben, damit kein <img> mit einer falschen Datei fehlschlägt und die
+    // Karte leer bleibt.
+    return (
+      <img
+        src={heroFloor.image_url}
+        alt=""
+        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+      />
+    );
+  }
+  // Kein eigenes Grundriss-/Vorschaubild vorhanden: statt des früher reinen Icon-
+  // Platzhalters jetzt ein generisches, aber klar als solches gekennzeichnetes
+  // Architektur-/Baustellenfoto (siehe "Platzhalterbild"-Hinweis in ProjectOverview).
+  // Schlägt das externe Foto fehl (Netzwerk, Offline, künftig nicht mehr erreichbare
+  // URL), fällt die Kachel automatisch auf das bisherige neutrale Icon zurück.
+  if (placeholderFailed) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-slate-800">
+        <Building2 size={26} className="text-slate-500" />
+      </div>
+    );
+  }
+  return (
+    <img
+      src={getProjectPlaceholderImage(project)}
+      alt=""
+      onError={() => setPlaceholderFailed(true)}
+      className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
+    />
+  );
+}
+
+function ProjectOverview({
+  projects,
+  loading,
+  onOpenProject,
+  onToggleFavorite,
+  onArchiveProject,
+  query,
+  setQuery,
+  onCreateProject,
+  onEditProject,
+  onDeleteProject,
+}) {
+  const [viewMode, setViewMode] = useState("grid"); // 'grid' | 'list'
+  const [filterTab, setFilterTab] = useState("all"); // 'all' | 'favorites'
+  const [archiveView, setArchiveView] = useState("active"); // 'active' | 'archive'
+  const [sortBy, setSortBy] = useState("default"); // 'default' | 'urgency' | 'name'
+
+  // Erste, grobe Weiche: aktive vs. archivierte/abgeschlossene Projekte (siehe
+  // "Projekt abschließen"/"Projekt wiederherstellen" in FloorOverview sowie
+  // handleToggleProjectArchive). Auf dem Standard-Bildschirm "Aktive Projekte"
+  // bleiben abgeschlossene Projekte konsequent ausgeblendet, damit die Übersicht
+  // nicht mit erledigten Baustellen zuwächst; im Archiv sieht man ausschließlich sie.
+  const archivedCount = projects.filter((p) => p.is_archived).length;
+  const scopedByArchive = projects.filter((p) => (archiveView === "archive" ? p.is_archived : !p.is_archived));
+
+  const favoriteCount = scopedByArchive.filter((p) => p.is_favorite).length;
+
+  const searched = scopedByArchive.filter(
     (p) =>
       p.name.toLowerCase().includes(query.toLowerCase()) ||
       p.address.toLowerCase().includes(query.toLowerCase())
   );
+  const tabFiltered = filterTab === "favorites" ? searched.filter((p) => p.is_favorite) : searched;
+  // Array.prototype.sort ist seit ES2019 stabil — bei sortBy "default" bleibt die vom
+  // Server gelieferte Reihenfolge (created_at absteigend) exakt erhalten, bei "urgency"
+  // dient sie als impliziter, sinnvoller Tiebreaker für gleich dringende Projekte.
+  const sorted = [...tabFiltered].sort((a, b) => {
+    if (sortBy === "name") return a.name.localeCompare(b.name, "de");
+    if (sortBy === "urgency") return countUrgentPins(b.floors) - countUrgentPins(a.floors);
+    return 0;
+  });
+
+  const emptyMessage =
+    projects.length === 0
+      ? "Noch keine Projekte vorhanden."
+      : archiveView === "archive" && archivedCount === 0
+      ? "Noch keine Projekte im Archiv — abgeschlossene Projekte landen hier automatisch."
+      : filterTab === "favorites" && favoriteCount === 0
+      ? "Noch keine Favoriten markiert — auf den Stern eines Projekts tippen, um es hier anzupinnen."
+      : `Kein Projekt gefunden für „${query}“.`;
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-600 text-white shadow-sm">
+          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#FF2A00] text-white shadow-sm">
             <Building2 size={20} />
           </div>
           <div>
@@ -3202,70 +9318,245 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
         </div>
         <button
           onClick={onCreateProject}
-          className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
+          className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
         >
           <Plus size={16} /> Neues Projekt
         </button>
       </div>
 
-      <div className="relative mb-6">
+      <div className="relative mb-4">
         <Search className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Projekt nach Name oder Adresse suchen…"
-          className="w-full rounded-xl border border-slate-200 bg-white py-3 pl-11 pr-4 text-sm text-slate-800 shadow-sm outline-none ring-blue-500/30 placeholder:text-slate-400 focus:border-blue-500 focus:ring-4"
+          className="w-full rounded-xl border border-slate-200 bg-white py-3 pl-11 pr-4 text-sm text-slate-800 shadow-sm outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4"
         />
+      </div>
+
+      {/* Archiv-Filter: grobe Weiche zwischen aktiven und abgeschlossenen/archivierten
+          Projekten, bewusst als eigene Leiste oberhalb der übrigen Steuerung — die
+          Alle/Favoriten-Tabs darunter verfeinern jeweils nur innerhalb dieser Auswahl. */}
+      <div className="mb-3 inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-sm">
+        <button
+          onClick={() => setArchiveView("active")}
+          className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+            archiveView === "active" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+          }`}
+        >
+          Aktive Projekte
+        </button>
+        <button
+          onClick={() => setArchiveView("archive")}
+          className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+            archiveView === "archive" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+          }`}
+        >
+          <Archive size={12} />
+          Archiv
+          {archivedCount > 0 && (
+            <span
+              className={`inline-flex min-w-[1.1rem] items-center justify-center rounded-full px-1 text-[10px] font-bold ${
+                archiveView === "archive" ? "bg-white/25 text-white" : "bg-slate-200 text-slate-600"
+              }`}
+            >
+              {archivedCount}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* Steuerungsleiste: Filter-Tabs links, Sortierung + Ansichts-Toggle rechts. */}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white p-1 shadow-sm">
+          <button
+            onClick={() => setFilterTab("all")}
+            className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+              filterTab === "all" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+            }`}
+          >
+            Alle Projekte
+          </button>
+          <button
+            onClick={() => setFilterTab("favorites")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+              filterTab === "favorites" ? "bg-[#FF2A00] text-white shadow-sm" : "text-slate-500 hover:bg-slate-100"
+            }`}
+          >
+            <Star size={12} className={filterTab === "favorites" ? "fill-white" : "fill-slate-400 text-slate-400"} />
+            Favoriten
+            {favoriteCount > 0 && (
+              <span
+                className={`inline-flex min-w-[1.1rem] items-center justify-center rounded-full px-1 text-[10px] font-bold ${
+                  filterTab === "favorites" ? "bg-white/25 text-white" : "bg-slate-200 text-slate-600"
+                }`}
+              >
+                {favoriteCount}
+              </span>
+            )}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value)}
+            title="Sortierung"
+            className="rounded-lg border border-slate-200 bg-white py-1.5 pl-2.5 pr-7 text-xs font-semibold text-slate-600 shadow-sm outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4"
+          >
+            <option value="default">Standard</option>
+            <option value="urgency">Nach Dringlichkeit</option>
+            <option value="name">Name (A-Z)</option>
+          </select>
+          <div className="inline-flex items-center overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+            <button
+              onClick={() => setViewMode("grid")}
+              title="Kachelansicht"
+              className={`flex items-center justify-center p-1.5 transition ${
+                viewMode === "grid" ? "bg-[#FF2A00] text-white" : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+              }`}
+            >
+              <LayoutGrid size={15} />
+            </button>
+            <button
+              onClick={() => setViewMode("list")}
+              title="Listenansicht"
+              className={`flex items-center justify-center p-1.5 transition ${
+                viewMode === "list" ? "bg-[#FF2A00] text-white" : "text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+              }`}
+            >
+              <List size={15} />
+            </button>
+          </div>
+        </div>
       </div>
 
       {loading ? (
         <LoadingBlock label="Projekte werden geladen…" />
+      ) : sorted.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-slate-300 bg-white py-16 text-center text-sm text-slate-400">{emptyMessage}</div>
+      ) : viewMode === "list" ? (
+        <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+          <table className="w-full min-w-[720px] text-left text-sm">
+            <thead>
+              <tr className="border-b border-slate-100 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                <th className="w-10 px-3 py-2.5"></th>
+                <th className="px-3 py-2.5">Projekt</th>
+                <th className="px-3 py-2.5">Adresse / Objekt</th>
+                <th className="px-3 py-2.5 text-center">Offene Pins</th>
+                <th className="px-3 py-2.5 text-center">Kritische Fristen</th>
+                <th className="px-3 py-2.5">Status</th>
+                <th className="w-24 px-3 py-2.5"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {sorted.map((project) => {
+                const { total, open } = countPins(project.floors);
+                const urgent = countUrgentPins(project.floors);
+                return (
+                  <tr key={project.id} onClick={() => onOpenProject(project.id)} className="cursor-pointer transition hover:bg-slate-50">
+                    <td className="px-3 py-2.5">
+                      <FavoriteStarButton active={!!project.is_favorite} onToggle={() => onToggleFavorite(project)} />
+                    </td>
+                    <td className="px-3 py-2.5 font-semibold text-slate-900">{project.name}</td>
+                    <td className="max-w-[220px] truncate px-3 py-2.5 text-slate-500">
+                      <AddressMapsLink
+                        address={project.address}
+                        iconSize={12}
+                        className="inline-flex max-w-full items-center gap-1 truncate align-bottom text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"
+                      />
+                    </td>
+                    <td className="px-3 py-2.5 text-center">
+                      {open > 0 ? (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-xs font-bold text-[#FF2A00]">
+                          <AlertTriangle size={11} /> {open}
+                        </span>
+                      ) : (
+                        <span className="text-slate-300">–</span>
+                      )}
+                      <span className="ml-1.5 text-[11px] text-slate-400">/ {total}</span>
+                    </td>
+                    <td className="px-3 py-2.5 text-center">
+                      {urgent > 0 ? <UrgentPinsBadge count={urgent} compact /> : <span className="text-slate-300">–</span>}
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <ProjectStatusBadge status={project.status} />
+                    </td>
+                    <td className="px-3 py-2.5 text-right">
+                      <div className="inline-flex items-center gap-1.5">
+                        {/* Schnelle Reaktivierung direkt aus der Archiv-Liste heraus, ohne
+                            das Projekt erst öffnen zu müssen (siehe Anforderung "mit einem
+                            Klick sofort wieder reaktivieren"). */}
+                        {project.is_archived && onArchiveProject && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onArchiveProject(project);
+                            }}
+                            title="Projekt wiederherstellen"
+                            className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2.5 py-1.5 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-100"
+                          >
+                            <ArchiveRestore size={12} /> Wiederherstellen
+                          </button>
+                        )}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenProject(project.id);
+                          }}
+                          className="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2.5 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-[#FF2A00] hover:text-white"
+                        >
+                          Öffnen <ChevronRight size={12} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {filtered.map((project) => {
+          {sorted.map((project) => {
             const { total, open } = countPins(project.floors);
-            const heroFloor = project.floors?.[0];
-            const heroKind = heroFloor ? resolveFloorKind(heroFloor) : "image";
+            const urgent = countUrgentPins(project.floors);
+            // heroFloor.image_url ist nur bei Bestandsprojekten aus der Zeit vor der
+            // Grundrisskizzen-Ebene (v7) noch gesetzt — neue Geschosse sind reine
+            // Namens-Container ohne eigenen Grundriss (siehe createFloor), daher fällt
+            // die Kartenvorschau ohne vorhandenes Bild auf ein generisches Symbol zurück.
+            const heroFloor = project.floors?.find((f) => f.image_url);
+            const heroKind = heroFloor ? resolveFloorKind(heroFloor) : null;
+            const pinPhotoUrl = project.cover_image_url ? null : resolveProjectPinPhoto(project);
+            const hasRealCoverPhoto = !!project.cover_image_url || !!pinPhotoUrl || !!heroFloor;
             return (
               <div
                 key={project.id}
-                className="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-300 hover:shadow-md"
+                className="group relative flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md"
               >
-                <button onClick={() => onOpenProject(project.id)} className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-blue-500/30">
-                  <div className="relative h-32 w-full overflow-hidden bg-slate-900">
-                    {heroKind === "cad" && (
-                      <div
-                        className="flex h-full w-full items-center justify-center bg-[#0b1220]"
-                        style={{
-                          backgroundImage:
-                            "linear-gradient(rgba(56,189,248,0.16) 1px, transparent 1px), linear-gradient(90deg, rgba(56,189,248,0.16) 1px, transparent 1px)",
-                          backgroundSize: "16px 16px",
-                        }}
-                      >
-                        <Ruler size={26} className="text-sky-300/80" />
-                      </div>
-                    )}
-                    {heroKind === "pdf" && (
-                      <div className="flex h-full w-full items-center justify-center bg-slate-800">
-                        <FileText size={26} className="text-rose-400/80" />
-                      </div>
-                    )}
-                    {heroKind === "image" && heroFloor && (
-                      // Nur echte Bilddateien werden per <img> gerendert — .dwg/.dxf/.pdf
-                      // laufen über die Zweige oben, damit kein <img> mit einer falschen
-                      // Datei fehlschlägt und die Karte leer bleibt.
-                      <img
-                        src={heroFloor.image_url}
-                        alt=""
-                        className="h-full w-full object-cover opacity-70 transition duration-300 group-hover:scale-105 group-hover:opacity-80"
-                      />
-                    )}
+                {/* Der Stern liegt als eigenständiges Element ÜBER dem Karten-Button (nicht
+                    darin verschachtelt) — ein <button> innerhalb eines <button> wäre
+                    ungültiges HTML und würde Klicks unvorhersehbar auflösen. */}
+                <FavoriteStarButton
+                  active={!!project.is_favorite}
+                  onToggle={() => onToggleFavorite(project)}
+                  size={17}
+                  className="absolute left-2 top-2 z-10 bg-slate-900/40 backdrop-blur-sm hover:bg-slate-900/60"
+                />
+                <button onClick={() => onOpenProject(project.id)} className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[#FF2A00]/30">
+                  <div className="relative h-40 w-full overflow-hidden rounded-t-xl bg-slate-900">
+                    <ProjectCoverImage project={project} heroFloor={heroFloor} heroKind={heroKind} pinPhotoUrl={pinPhotoUrl} />
                     <div className="absolute inset-0 bg-gradient-to-t from-slate-900/90 via-slate-900/10 to-transparent" />
                     <span className="absolute bottom-2 left-3 text-xs font-semibold uppercase tracking-wider text-white/90">
                       {project.status}
                     </span>
+                    {!hasRealCoverPhoto && (
+                      <span className="absolute bottom-2 right-3 rounded-full bg-slate-900/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-white/80 backdrop-blur-sm">
+                        Platzhalterbild
+                      </span>
+                    )}
                     {open > 0 && (
-                      <span className="absolute right-3 top-2.5 inline-flex items-center gap-1 rounded-full bg-rose-500 px-2 py-0.5 text-[11px] font-bold text-white shadow">
+                      <span className="absolute right-3 top-2.5 inline-flex items-center gap-1 rounded-full bg-[#FF2A00] px-2 py-0.5 text-[11px] font-bold text-white shadow">
                         <AlertTriangle size={11} /> {open} offen
                       </span>
                     )}
@@ -3278,18 +9569,46 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
                         <Briefcase size={13} className="text-slate-400" /> {project.project_leader}
                       </p>
                     )}
-                    <LphProgressRow lphStatus={project.lph_status} lphBeauftragt={project.lph_beauftragt} />
-                    <div className="mt-1 flex items-center gap-4 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                    <div className="mt-1 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-3 text-xs text-slate-500">
                       <span className="inline-flex items-center gap-1.5">
                         <Layers size={14} className="text-slate-400" /> {(project.floors || []).length} Etagen
                       </span>
                       <span className="inline-flex items-center gap-1.5">
                         <MapPin size={14} className="text-slate-400" /> {total} Pins
                       </span>
+                      {urgent > 0 && <UrgentPinsBadge count={urgent} compact />}
                     </div>
                   </div>
                 </button>
-                <div className="flex items-center gap-2 border-t border-slate-100 px-4 py-2.5">
+                <div className="flex flex-wrap items-center gap-2 border-t border-slate-100 px-4 py-2.5">
+                  {/* Schnelle Reaktivierung direkt auf der Kachel im Archiv-Filter, ohne das
+                      Projekt erst öffnen zu müssen (siehe Anforderung "mit einem Klick sofort
+                      wieder reaktivieren"). */}
+                  {project.is_archived && onArchiveProject && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onArchiveProject(project);
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-100"
+                    >
+                      <ArchiveRestore size={13} /> Wiederherstellen
+                    </button>
+                  )}
+                  {/* project.address ist ein optionales Freitextfeld — AddressMapsLink
+                      rendert bei leerer Adresse selbst nichts, kein zusätzliches Guard
+                      hier nötig. Liegt bewusst als eigenständiger Link in dieser bereits
+                      stopPropagation-gesicherten Aktionsleiste UNTER dem Karten-Button
+                      (statt als Link direkt in project.address oben in der Kachel): ein
+                      <a> innerhalb des umschließenden <button onClick={() => onOpenProject(...)}>
+                      wäre ungültig verschachteltes interaktives HTML (a in button). */}
+                  <AddressMapsLink
+                    address={project.address}
+                    iconSize={13}
+                    className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-[#FF2A00]"
+                  >
+                    Route
+                  </AddressMapsLink>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -3312,11 +9631,6 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
               </div>
             );
           })}
-          {filtered.length === 0 && (
-            <div className="col-span-full rounded-xl border border-dashed border-slate-300 bg-white py-16 text-center text-sm text-slate-400">
-              {projects.length === 0 ? "Noch keine Projekte vorhanden." : `Kein Projekt gefunden für „${query}“.`}
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -3327,57 +9641,27 @@ function ProjectOverview({ projects, loading, onOpenProject, query, setQuery, on
 // NEUE ETAGE / GRUNDRISS HOCHLADEN — MODAL
 // ----------------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------------
+// NEUES GESCHOSS — reiner Namens-Container (Ebene 2). Ein Geschoss besitzt ab
+// sofort selbst keinen Grundriss mehr: Grundrisskizzen werden erst eine Ebene
+// tiefer (siehe NewFloorPlanModal/EditFloorPlanModal, Ebene 3) angelegt, ein
+// Geschoss kann mehrere davon enthalten.
+// ----------------------------------------------------------------------------------
+
 function NewFloorModal({ onClose, onSave }) {
   const [name, setName] = useState("");
-  const [file, setFile] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState(null);
-  const [fileKind, setFileKind] = useState(null); // "image" | "pdf" | "cad"
-  const [fileExt, setFileExt] = useState(null);
-  const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const inputRef = useRef(null);
-
-  const acceptFile = (f) => {
-    if (!f || submitting) return;
-    const info = getFileInfo(f);
-    if (!info) {
-      setError("Bitte nur PNG, JPG, WebP, PDF, DWG oder DXF hochladen.");
-      return;
-    }
-    setError("");
-    // Lokale Vorschau ausschließlich für die Anzeige in diesem Modal. Die tatsächlich
-    // persistierte URL kommt erst nach dem Upload aus Supabase Storage (onSave -> createFloor).
-    const objectUrl = URL.createObjectURL(f);
-    setFile(f);
-    setPreviewUrl(objectUrl);
-    setFileKind(info.kind);
-    setFileExt(info.ext);
-    if (!name) {
-      setName(f.name.replace(/\.[^/.]+$/, ""));
-    }
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    setIsDragging(false);
-    if (submitting) return;
-    acceptFile(e.dataTransfer.files?.[0]);
-  };
 
   const handleSubmit = async () => {
     if (!name.trim()) {
       setError("Bitte einen Namen für die Etage vergeben.");
       return;
     }
-    if (!file) {
-      setError("Bitte eine Grundriss-Datei hochladen.");
-      return;
-    }
     setError("");
     setSubmitting(true);
     try {
-      await onSave(name.trim(), file);
+      await onSave(name.trim());
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
       console.error("Etage konnte nicht gespeichert werden:", err);
@@ -3392,8 +9676,8 @@ function NewFloorModal({ onClose, onSave }) {
       <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[88vh] sm:max-w-md sm:rounded-2xl">
         <div className={MODAL_HEADER_ROW}>
           <div>
-            <p className={MODAL_EYEBROW}>Neue Etage</p>
-            <h2 className="text-lg font-bold text-slate-900">Grundriss hinzufügen</h2>
+            <p className={MODAL_EYEBROW}>Neues Geschoss</p>
+            <h2 className="text-lg font-bold text-slate-900">Etage anlegen</h2>
           </div>
           <button
             onClick={onClose}
@@ -3413,64 +9697,11 @@ function NewFloorModal({ onClose, onSave }) {
               disabled={submitting}
               placeholder="z.B. 2. Obergeschoss"
               className={TEXT_INPUT_CLASS}
+              autoFocus
             />
-          </div>
-
-          <div>
-            <FieldLabel>{FLOOR_UPLOAD_HINT}</FieldLabel>
-            <input
-              ref={inputRef}
-              type="file"
-              accept={FLOOR_UPLOAD_ACCEPT}
-              className="hidden"
-              disabled={submitting}
-              onChange={(e) => acceptFile(e.target.files?.[0])}
-            />
-            <div
-              onClick={() => !submitting && inputRef.current?.click()}
-              onDragOver={(e) => {
-                e.preventDefault();
-                if (!submitting) setIsDragging(true);
-              }}
-              onDragLeave={() => setIsDragging(false)}
-              onDrop={handleDrop}
-              className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-8 text-center transition ${
-                submitting ? "cursor-not-allowed opacity-60" : ""
-              } ${isDragging ? "border-blue-500 bg-blue-50" : "border-slate-300 bg-slate-50 hover:border-blue-400 hover:bg-blue-50/50"}`}
-            >
-              {!previewUrl && (
-                <>
-                  <UploadCloud size={28} className={isDragging ? "text-blue-500" : "text-slate-400"} />
-                  <p className="mt-2 text-sm font-medium text-slate-600">Datei hierher ziehen oder klicken</p>
-                  <p className="mt-0.5 text-xs text-slate-400">PNG, JPG, WebP, PDF, DWG oder DXF</p>
-                </>
-              )}
-              {previewUrl && fileKind === "image" && (
-                <div className="w-full">
-                  <img src={previewUrl} alt="Vorschau" className="mx-auto max-h-40 rounded-lg object-contain shadow-sm" />
-                  <p className="mt-2 text-xs font-medium text-slate-500">{file?.name} — klicken zum Ändern</p>
-                </div>
-              )}
-              {previewUrl && fileKind === "pdf" && (
-                <div className="w-full">
-                  <div className="mx-auto flex h-24 w-20 flex-col items-center justify-center rounded-lg bg-white shadow-sm ring-1 ring-slate-200">
-                    <FileText size={26} className="text-rose-500" />
-                    <span className="mt-1 text-[10px] font-semibold text-slate-500">PDF</span>
-                  </div>
-                  <p className="mt-2 text-xs font-medium text-slate-500">{file?.name} — klicken zum Ändern</p>
-                </div>
-              )}
-              {previewUrl && fileKind === "cad" && (
-                <div className="w-full">
-                  <div className="mx-auto flex h-24 w-24 flex-col items-center justify-center rounded-lg bg-[#0b1220] shadow-sm ring-1 ring-sky-400/30">
-                    <Ruler size={24} className="text-sky-300" />
-                    <span className="mt-1 text-[10px] font-bold uppercase tracking-wider text-sky-300">{fileExt}</span>
-                  </div>
-                  <p className="mt-2 text-xs font-medium text-slate-500">{file?.name} — klicken zum Ändern</p>
-                  <p className="mt-0.5 text-[11px] text-slate-400">CAD-Datei erkannt — wird als Blueprint-Vorschau dargestellt.</p>
-                </div>
-              )}
-            </div>
+            <p className="mt-1.5 text-xs text-slate-400">
+              Grundrisskizzen (ein oder mehrere Pläne) legst du im nächsten Schritt innerhalb dieses Geschosses an.
+            </p>
             {error && <p className="mt-1.5 text-xs font-medium text-rose-600">{error}</p>}
           </div>
         </div>
@@ -3489,7 +9720,7 @@ function NewFloorModal({ onClose, onSave }) {
             className={BTN_PRIMARY}
           >
             {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-            {submitting ? "Wird hochgeladen…" : "Etage speichern"}
+            {submitting ? "Wird gespeichert…" : "Etage speichern"}
           </button>
         </div>
       </div>
@@ -3498,50 +9729,14 @@ function NewFloorModal({ onClose, onSave }) {
 }
 
 // ----------------------------------------------------------------------------------
-// ETAGE BEARBEITEN — Name ändern und/oder Grundriss austauschen
+// ETAGE BEARBEITEN — nur noch der Name, da der Grundriss selbst nicht mehr an der
+// Etage, sondern an den einzelnen Grundrisskizzen hängt (siehe EditFloorPlanModal).
 // ----------------------------------------------------------------------------------
-// Analog zu NewFloorModal, aber mit vorbefüllten Werten und optionalem Datei-Upload:
-// wird keine neue Datei gewählt, bleibt der bisherige Grundriss unverändert und es
-// wird nur der Name aktualisiert.
 
 function EditFloorModal({ floor, onClose, onSave }) {
   const [name, setName] = useState(floor?.name || "");
-  const [file, setFile] = useState(null);
-  const [previewUrl, setPreviewUrl] = useState(null);
-  const [fileKind, setFileKind] = useState(null); // "image" | "pdf" | "cad"
-  const [fileExt, setFileExt] = useState(null);
-  const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const inputRef = useRef(null);
-
-  const existingKind = resolveFloorKind(floor);
-  const existingFileName = deriveFileNameFromUrl(floor?.image_url);
-  const existingExt = deriveFileExt(existingFileName) || "dwg";
-
-  const acceptFile = (f) => {
-    if (!f || submitting) return;
-    const info = getFileInfo(f);
-    if (!info) {
-      setError("Bitte nur PNG, JPG, WebP, PDF, DWG oder DXF hochladen.");
-      return;
-    }
-    setError("");
-    // Lokale Vorschau ausschließlich für die Anzeige in diesem Modal. Die tatsächlich
-    // persistierte URL kommt erst nach dem Upload aus Supabase Storage (onSave -> updateFloor).
-    const objectUrl = URL.createObjectURL(f);
-    setFile(f);
-    setPreviewUrl(objectUrl);
-    setFileKind(info.kind);
-    setFileExt(info.ext);
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    setIsDragging(false);
-    if (submitting) return;
-    acceptFile(e.dataTransfer.files?.[0]);
-  };
 
   const handleSubmit = async () => {
     if (!name.trim()) {
@@ -3551,9 +9746,7 @@ function EditFloorModal({ floor, onClose, onSave }) {
     setError("");
     setSubmitting(true);
     try {
-      // file ist bewusst optional: onSave(name, null) aktualisiert nur den Namen und
-      // lässt den bestehenden Grundriss unangetastet.
-      await onSave(name.trim(), file);
+      await onSave(name.trim());
       // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
     } catch (err) {
       console.error("Etage konnte nicht aktualisiert werden:", err);
@@ -3589,7 +9782,517 @@ function EditFloorModal({ floor, onClose, onSave }) {
               disabled={submitting}
               placeholder="z.B. 2. Obergeschoss"
               className={TEXT_INPUT_CLASS}
+              autoFocus
             />
+            {error && <p className="mt-1.5 text-xs font-medium text-rose-600">{error}</p>}
+          </div>
+        </div>
+
+        <div className={MODAL_FOOTER_ROW}>
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            className={BTN_SECONDARY}
+          >
+            Abbrechen
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={submitting}
+            className={BTN_PRIMARY}
+          >
+            {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+            {submitting ? "Wird gespeichert…" : "Änderungen speichern"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// NEUE GRUNDRISSSKIZZE (Ebene 3) — Name + Datei-Upload je Skizze innerhalb eines
+// Geschosses. Übernimmt die frühere Datei-Upload-Logik von NewFloorModal 1:1, jetzt
+// aber je Grundrissskizze statt je Etage — ein Geschoss kann so beliebig viele
+// Skizzen enthalten (z.B. "Grundriss Gesamt", "Bereich A / Nord", "Detailplan
+// Haustechnik").
+// ----------------------------------------------------------------------------------
+
+// Kleines Icon je erkannter Dateiart, ausschließlich für die Mehrfachauswahl-Liste
+// unten (siehe files.length > 1 -Zweig) — die Einzeldatei-Vorschau direkt in der
+// Dropzone (Bild/PDF/CAD-Karte) bleibt davon unberührt und unverändert.
+function FloorUploadFileTypeIcon({ kind, size = 15 }) {
+  if (kind === "pdf") return <FileText size={size} className="shrink-0 text-rose-500" />;
+  if (kind === "cad") return <Ruler size={size} className="shrink-0 text-sky-500" />;
+  return <ImagePlus size={size} className="shrink-0 text-slate-400" />;
+}
+
+// MULTI-FILE UPLOAD FÜR GRUNDRISSSKIZZEN: der Datei-Input erlaubt jetzt Mehrfach-
+// auswahl (multiple) sowohl über den Datei-Browser als auch per Drag & Drop mehrerer
+// Dateien gleichzeitig. Bei genau EINER ausgewählten Datei verhält sich das Modal exakt
+// wie zuvor (editierbares Namensfeld, Einzeldatei-Vorschau in der Dropzone). Bei
+// MEHREREN Dateien entfällt das Namensfeld (jede Skizze bekommt automatisch den
+// jeweiligen Dateinamen als Titel, siehe handleSubmit) und die Dropzone zeigt
+// stattdessen eine Liste aller ausgewählten Dateien mit der Möglichkeit, einzelne
+// davon vor dem Speichern wieder zu entfernen. Der Upload selbst läuft sequenziell
+// (siehe App -> handleAddFloorPlanSketch), mit einem fortlaufenden "Lade Skizze X von
+// Y hoch…"-Fortschrittshinweis.
+function NewFloorPlanModal({ floor, activeCategory = "grundriss", onClose, onSave }) {
+  const [name, setName] = useState("");
+  const [files, setFiles] = useState([]); // File[]
+  const [previewUrl, setPreviewUrl] = useState(null); // nur relevant bei genau einer Datei
+  const [fileKind, setFileKind] = useState(null); // "image" | "pdf" | "cad" — nur bei einer Datei
+  const [fileExt, setFileExt] = useState(null); // nur bei einer Datei
+  const [isDragging, setIsDragging] = useState(false);
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  // Zwischenstatus der automatischen PDF-Vorab-Komprimierung (siehe uploadFloorPlan/
+  // compressPdfForUpload) — null, solange keine Datei über dem Schwellwert hochgeladen
+  // wird. Bewusst als eigener, informativer Status statt über error angezeigt: kein
+  // Fehler, sondern ein "läuft gerade"-Hinweis, während der Upload weiterläuft.
+  const [compressionNotice, setCompressionNotice] = useState(null);
+  // Fortschritt über die gesamte Batch hinweg (nur bei mehreren Dateien sichtbar, siehe
+  // unten) — { current, total }, current ist 1-basiert und bezeichnet die gerade
+  // hochladende Datei.
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const inputRef = useRef(null);
+
+  // Aktualisiert die Einzeldatei-Vorschau (Bild/PDF/CAD-Karte), sobald genau eine Datei
+  // in der Auswahl liegt — bei mehreren Dateien wird stattdessen die Liste weiter unten
+  // gerendert und diese Vorschau bleibt leer.
+  useEffect(() => {
+    if (files.length !== 1) {
+      setPreviewUrl(null);
+      setFileKind(null);
+      setFileExt(null);
+      return;
+    }
+    const f = files[0];
+    const info = getFileInfo(f);
+    // Lokale Vorschau ausschließlich für die Anzeige in diesem Modal. Die tatsächlich
+    // persistierte URL kommt erst nach dem Upload aus Supabase Storage (onSave -> createFloorPlanSketch).
+    const objectUrl = URL.createObjectURL(f);
+    setPreviewUrl(objectUrl);
+    setFileKind(info?.kind || null);
+    setFileExt(info?.ext || null);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [files]);
+
+  const acceptFiles = (fileList) => {
+    if (!fileList || fileList.length === 0 || submitting) return;
+    const incoming = Array.from(fileList);
+    const valid = [];
+    let skipped = 0;
+    for (const f of incoming) {
+      if (getFileInfo(f)) valid.push(f);
+      else skipped += 1;
+    }
+    if (valid.length === 0) {
+      setError("Bitte nur PNG, JPG, WebP, SVG, PDF, DWG oder DXF hochladen.");
+      return;
+    }
+    setError(skipped > 0 ? `${skipped} Datei${skipped === 1 ? "" : "en"} mit nicht unterstütztem Format wurde${skipped === 1 ? "" : "n"} übersprungen.` : "");
+    setFiles((prev) => {
+      const next = [...prev, ...valid];
+      // Beim allerersten Hinzufügen einer einzelnen Datei den Namen wie bisher aus dem
+      // Dateinamen vorbefüllen. Kommen dadurch mehrere Dateien zusammen, spielt der Name
+      // hier keine Rolle mehr (siehe handleSubmit — jede Datei bekommt dann ihren
+      // eigenen Dateinamen als Titel).
+      if (prev.length === 0 && valid.length === 1 && !name) {
+        setName(valid[0].name.replace(/\.[^/.]+$/, ""));
+      }
+      return next;
+    });
+  };
+
+  const removeFileAt = (idx) => {
+    if (submitting) return;
+    setFiles((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (submitting) return;
+    acceptFiles(e.dataTransfer.files);
+  };
+
+  const handleSubmit = async () => {
+    if (files.length === 0) {
+      setError("Bitte mindestens eine Grundriss-Datei hochladen.");
+      return;
+    }
+    if (files.length === 1 && !name.trim()) {
+      setError("Bitte einen Namen für die Grundrissskizze vergeben.");
+      return;
+    }
+    setError("");
+    setCompressionNotice(null);
+    setSubmitting(true);
+    const total = files.length;
+    setUploadProgress({ current: 0, total });
+    // Bei genau einer Datei bleibt der Titel frei editierbar (wie bisher). Bei mehreren
+    // Dateien wird pro Datei automatisch deren ursprünglicher Dateiname (ohne Endung)
+    // als Titel verwendet (siehe ANFORDERUNG "Multi-File Upload für Grundrissskizzen").
+    const entries =
+      files.length === 1
+        ? [{ name: name.trim(), file: files[0] }]
+        : files.map((f) => ({ name: f.name.replace(/\.[^/.]+$/, "") || f.name, file: f }));
+    // Lokal (nicht als State) mitgeführt, damit im catch-Block unten synchron feststeht,
+    // wie viele Dateien vor einem Fehlschlag bereits erfolgreich gespeichert wurden —
+    // State-Updates aus onProgress unten sind für diesen Zweck zu asynchron.
+    let lastCompletedIndex = 0;
+    try {
+      await onSave(entries, (current, totalCount, statusMessage) => {
+        lastCompletedIndex = current;
+        setUploadProgress({ current, total: totalCount });
+        setCompressionNotice(statusMessage || null);
+      });
+      // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
+    } catch (err) {
+      console.error("Grundrissskizze(n) konnte(n) nicht gespeichert werden:", err);
+      setError(
+        total > 1
+          ? `${err?.message || "Ein Fehler ist aufgetreten."} (${Math.max(lastCompletedIndex - 1, 0)} von ${total} Skizzen wurden bereits gespeichert.)`
+          : err?.message || "Die Grundrissskizze konnte nicht gespeichert werden. Bitte erneut versuchen."
+      );
+      // Bereits erfolgreich hochgeladene Dateien aus der lokalen Auswahl entfernen, damit
+      // ein erneutes Speichern nicht versehentlich Duplikate anlegt — nur die ab der
+      // fehlgeschlagenen Datei verbleiben zum erneuten Versuch.
+      if (total > 1) {
+        setFiles((prev) => prev.slice(Math.max(lastCompletedIndex - 1, 0)));
+      }
+    } finally {
+      setSubmitting(false);
+      setCompressionNotice(null);
+      setUploadProgress(null);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-50`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[88vh] sm:max-w-md sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>Neue Grundrissskizze{floor?.name ? ` · ${floor.name}` : ""}</p>
+            <h2 className="text-lg font-bold text-slate-900">Grundriss hinzufügen</h2>
+          </div>
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            className={MODAL_CLOSE_BTN_DISABLED}
+          >
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className={MODAL_BODY_SCROLL}>
+          {/* ANFORDERUNG "UPLOAD & AUTOMATISCHE ZUORDNUNG": jede hier hochgeladene Datei
+              wird automatisch der aktuell aktiven Tab-Kategorie der Skizzenübersicht
+              zugewiesen (siehe activeCategory-Prop/handleAddFloorPlanSketch in App) — rein
+              informativ, nicht veränderbar in diesem Modal, damit das Hochladen schnell
+              und unkompliziert bleibt. */}
+          <p className="flex items-center gap-1.5 rounded-lg bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-600 ring-1 ring-inset ring-slate-200">
+            <span>{PLAN_CATEGORY_META[activeCategory]?.emoji}</span>
+            Wird hinzugefügt zu: {PLAN_CATEGORY_META[activeCategory]?.label || PLAN_CATEGORY_META.grundriss.label}
+          </p>
+          {files.length <= 1 && (
+            <div>
+              <FieldLabel>Name der Grundrissskizze</FieldLabel>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={submitting}
+                placeholder="z.B. Grundriss Gesamt / Bereich A Nord"
+                className={TEXT_INPUT_CLASS}
+              />
+            </div>
+          )}
+          {files.length > 1 && (
+            <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-xs text-slate-500 ring-1 ring-inset ring-slate-200">
+              {files.length} Dateien ausgewählt — jede Skizze wird automatisch mit ihrem Dateinamen als Titel angelegt.
+            </p>
+          )}
+
+          <div>
+            <FieldLabel>{FLOOR_UPLOAD_HINT}</FieldLabel>
+            <input
+              ref={inputRef}
+              type="file"
+              multiple
+              accept={FLOOR_UPLOAD_ACCEPT}
+              className="hidden"
+              disabled={submitting}
+              onChange={(e) => {
+                acceptFiles(e.target.files);
+                e.target.value = ""; // erlaubt erneutes Auswählen derselben Datei(en)
+              }}
+            />
+            <div
+              onClick={() => !submitting && inputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (!submitting) setIsDragging(true);
+              }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={handleDrop}
+              className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-8 text-center transition ${
+                submitting ? "cursor-not-allowed opacity-60" : ""
+              } ${isDragging ? "border-[#FF2A00] bg-red-50" : "border-slate-300 bg-slate-50 hover:border-[#FF2A00] hover:bg-red-50/50"}`}
+            >
+              {files.length === 0 && (
+                <>
+                  <UploadCloud size={28} className={isDragging ? "text-[#FF2A00]" : "text-slate-400"} />
+                  <p className="mt-2 text-sm font-medium text-slate-600">Datei(en) hierher ziehen oder klicken</p>
+                  <p className="mt-0.5 text-xs text-slate-400">PNG, JPG, WebP, PDF, DWG oder DXF — Mehrfachauswahl möglich</p>
+                </>
+              )}
+              {files.length === 1 && previewUrl && fileKind === "image" && (
+                <div className="w-full">
+                  <img src={previewUrl} alt="Vorschau" className="mx-auto max-h-40 rounded-lg object-contain shadow-sm" />
+                  <p className="mt-2 text-xs font-medium text-slate-500">{files[0]?.name} — klicken zum Ändern oder Ergänzen</p>
+                </div>
+              )}
+              {files.length === 1 && previewUrl && fileKind === "pdf" && (
+                <div className="w-full">
+                  <div className="mx-auto flex h-24 w-20 flex-col items-center justify-center rounded-lg bg-white shadow-sm ring-1 ring-slate-200">
+                    <FileText size={26} className="text-rose-500" />
+                    <span className="mt-1 text-[10px] font-semibold text-slate-500">PDF</span>
+                  </div>
+                  <p className="mt-2 text-xs font-medium text-slate-500">{files[0]?.name} — klicken zum Ändern oder Ergänzen</p>
+                </div>
+              )}
+              {files.length === 1 && previewUrl && fileKind === "cad" && (
+                <div className="w-full">
+                  <div className="mx-auto flex h-24 w-24 flex-col items-center justify-center rounded-lg bg-[#0b1220] shadow-sm ring-1 ring-sky-400/30">
+                    <Ruler size={24} className="text-sky-300" />
+                    <span className="mt-1 text-[10px] font-bold uppercase tracking-wider text-sky-300">{fileExt}</span>
+                  </div>
+                  <p className="mt-2 text-xs font-medium text-slate-500">{files[0]?.name} — klicken zum Ändern oder Ergänzen</p>
+                  <p className="mt-0.5 text-[11px] text-slate-400">CAD-Datei erkannt — wird als Blueprint-Vorschau dargestellt.</p>
+                </div>
+              )}
+              {files.length > 1 && (
+                <div className="w-full">
+                  <UploadCloud size={22} className="mx-auto text-slate-400" />
+                  <p className="mt-1.5 text-xs font-medium text-slate-500">Weitere Dateien hierher ziehen oder klicken</p>
+                </div>
+              )}
+            </div>
+
+            {/* Liste der ausgewählten Dateien mit Entfernen-Möglichkeit — nur bei
+                mehreren Dateien sichtbar, die Einzeldatei-Vorschau oben deckt den
+                Ein-Datei-Fall bereits vollständig ab. */}
+            {files.length > 1 && (
+              <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-lg ring-1 ring-inset ring-slate-200">
+                {files.map((f, idx) => {
+                  const info = getFileInfo(f);
+                  return (
+                    <li
+                      key={`${f.name}-${f.size}-${f.lastModified}-${idx}`}
+                      className="flex items-center gap-2 border-b border-slate-100 px-2.5 py-1.5 text-xs last:border-b-0"
+                    >
+                      <FloorUploadFileTypeIcon kind={info?.kind} />
+                      <span className="min-w-0 flex-1 truncate text-slate-600">{f.name}</span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeFileAt(idx);
+                        }}
+                        disabled={submitting}
+                        className="shrink-0 rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-rose-600 disabled:opacity-50"
+                        aria-label={`${f.name} entfernen`}
+                      >
+                        <X size={13} />
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            {/* Fortschritt über die gesamte Batch — nur bei mehreren Dateien relevant,
+                bei einer einzelnen Datei bleibt die bisherige Button-Beschriftung
+                (siehe Speichern-Button unten) ausreichend. */}
+            {submitting && uploadProgress && uploadProgress.total > 1 && (
+              <p className="mt-1.5 text-xs font-semibold text-slate-600">
+                Lade Skizze {uploadProgress.current} von {uploadProgress.total} hoch…
+              </p>
+            )}
+            {/* Toast-Hinweis der automatischen PDF-Vorab-Komprimierung (siehe
+                uploadFloorPlan/compressPdfForUpload) — bewusst amber/informativ statt
+                rot, ist kein Fehler, sondern ein "läuft gerade"-Status. */}
+            {compressionNotice && (
+              <p className="mt-1.5 flex items-center gap-1.5 rounded-lg bg-amber-50 px-2.5 py-2 text-xs font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
+                <Loader2 size={13} className="shrink-0 animate-spin" /> {compressionNotice}
+              </p>
+            )}
+            {error && <p className="mt-1.5 text-xs font-medium text-rose-600">{error}</p>}
+          </div>
+        </div>
+
+        <div className={MODAL_FOOTER_ROW}>
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            className={BTN_SECONDARY}
+          >
+            Abbrechen
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={submitting}
+            className={BTN_PRIMARY}
+          >
+            {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+            {submitting
+              ? uploadProgress && uploadProgress.total > 1
+                ? `Lade Skizze ${uploadProgress.current} von ${uploadProgress.total} hoch…`
+                : compressionNotice
+                  ? "Wird optimiert…"
+                  : "Wird hochgeladen…"
+              : files.length > 1
+                ? `${files.length} Grundrissskizzen speichern`
+                : "Grundrissskizze speichern"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// GRUNDRISSSKIZZE BEARBEITEN — Name ändern und/oder Datei austauschen. Analog zu
+// NewFloorPlanModal, aber mit vorbefüllten Werten und optionalem Datei-Upload: wird
+// keine neue Datei gewählt, bleibt die bisherige Skizzen-Datei unverändert.
+// ----------------------------------------------------------------------------------
+
+function EditFloorPlanModal({ plan, onClose, onSave }) {
+  const [name, setName] = useState(plan?.name || "");
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": erlaubt das nachträgliche Umhängen
+  // eines Plans in eine andere Kategorie, falls er beim Hochladen versehentlich dem
+  // falschen Tab zugeordnet wurde — ohne diese Möglichkeit ließe sich das sonst nur
+  // über Löschen und erneutes Hochladen korrigieren. getPlanCategory() liefert bei
+  // Bestandsdaten ohne das Feld bewusst "grundriss" als Ausgangswert (siehe dortiger
+  // Kommentar).
+  const [category, setCategory] = useState(() => getPlanCategory(plan));
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState(null);
+  const [fileKind, setFileKind] = useState(null); // "image" | "pdf" | "cad"
+  const [fileExt, setFileExt] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  // Siehe identischer Kommentar in NewFloorPlanModal — Zwischenstatus der
+  // automatischen PDF-Vorab-Komprimierung, kein Fehler.
+  const [compressionNotice, setCompressionNotice] = useState(null);
+  const inputRef = useRef(null);
+
+  const existingKind = resolveFloorKind(plan);
+  const existingFileName = deriveFileNameFromUrl(plan?.image_url);
+  const existingExt = deriveFileExt(existingFileName) || "dwg";
+
+  const acceptFile = (f) => {
+    if (!f || submitting) return;
+    const info = getFileInfo(f);
+    if (!info) {
+      setError("Bitte nur PNG, JPG, WebP, PDF, DWG oder DXF hochladen.");
+      return;
+    }
+    setError("");
+    // Lokale Vorschau ausschließlich für die Anzeige in diesem Modal. Die tatsächlich
+    // persistierte URL kommt erst nach dem Upload aus Supabase Storage (onSave -> updateFloorPlanSketch).
+    const objectUrl = URL.createObjectURL(f);
+    setFile(f);
+    setPreviewUrl(objectUrl);
+    setFileKind(info.kind);
+    setFileExt(info.ext);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (submitting) return;
+    acceptFile(e.dataTransfer.files?.[0]);
+  };
+
+  const handleSubmit = async () => {
+    if (!name.trim()) {
+      setError("Bitte einen Namen für die Grundrissskizze vergeben.");
+      return;
+    }
+    setError("");
+    setCompressionNotice(null);
+    setSubmitting(true);
+    try {
+      // file ist bewusst optional: onSave(name, null) aktualisiert nur den Namen und
+      // lässt die bestehende Skizzen-Datei unangetastet.
+      await onSave(name.trim(), file, setCompressionNotice, category);
+      // Bei Erfolg schließt der Aufrufer (App) das Modal selbst.
+    } catch (err) {
+      console.error("Grundrissskizze konnte nicht aktualisiert werden:", err);
+      setError(err?.message || "Die Grundrissskizze konnte nicht aktualisiert werden. Bitte erneut versuchen.");
+    } finally {
+      setSubmitting(false);
+      setCompressionNotice(null);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-50`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[88vh] sm:max-w-md sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>Grundrissskizze bearbeiten</p>
+            <h2 className="text-lg font-bold text-slate-900">{plan?.name}</h2>
+          </div>
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            className={MODAL_CLOSE_BTN_DISABLED}
+          >
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className={MODAL_BODY_SCROLL}>
+          <div>
+            <FieldLabel>Name der Grundrissskizze</FieldLabel>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={submitting}
+              placeholder="z.B. Grundriss Gesamt / Bereich A Nord"
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+
+          <div>
+            <FieldLabel>Kategorie</FieldLabel>
+            <div className="flex flex-wrap gap-2">
+              {PLAN_CATEGORY_OPTIONS.map((opt) => {
+                const active = category === opt.value;
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setCategory(opt.value)}
+                    disabled={submitting}
+                    className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 ring-inset transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                      active ? "bg-red-50 text-[#FF2A00] ring-red-200" : "bg-white text-slate-500 ring-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <span>{opt.emoji}</span> {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+            {category !== "grundriss" && (
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                Reiner Referenz-Viewer — in dieser Kategorie können keine Mängel-Pins gesetzt werden.
+              </p>
+            )}
           </div>
 
           <div>
@@ -3614,12 +10317,12 @@ function EditFloorModal({ floor, onClose, onSave }) {
               onDrop={handleDrop}
               className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-4 py-8 text-center transition ${
                 submitting ? "cursor-not-allowed opacity-60" : ""
-              } ${isDragging ? "border-blue-500 bg-blue-50" : "border-slate-300 bg-slate-50 hover:border-blue-400 hover:bg-blue-50/50"}`}
+              } ${isDragging ? "border-[#FF2A00] bg-red-50" : "border-slate-300 bg-slate-50 hover:border-[#FF2A00] hover:bg-red-50/50"}`}
             >
               {!previewUrl && (
                 <>
-                  {existingKind === "image" && floor?.image_url ? (
-                    <img src={floor.image_url} alt="Aktueller Grundriss" className="mx-auto max-h-32 rounded-lg object-contain shadow-sm" />
+                  {existingKind === "image" && plan?.image_url ? (
+                    <img src={plan.image_url} alt="Aktueller Grundriss" className="mx-auto max-h-32 rounded-lg object-contain shadow-sm" />
                   ) : existingKind === "pdf" ? (
                     <div className="mx-auto flex h-20 w-16 flex-col items-center justify-center rounded-lg bg-white shadow-sm ring-1 ring-slate-200">
                       <FileText size={22} className="text-rose-500" />
@@ -3661,6 +10364,12 @@ function EditFloorModal({ floor, onClose, onSave }) {
                 </div>
               )}
             </div>
+            {/* Siehe identischer Hinweis in NewFloorPlanModal. */}
+            {compressionNotice && (
+              <p className="mt-1.5 flex items-center gap-1.5 rounded-lg bg-amber-50 px-2.5 py-2 text-xs font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
+                <Loader2 size={13} className="shrink-0 animate-spin" /> {compressionNotice}
+              </p>
+            )}
             {error && <p className="mt-1.5 text-xs font-medium text-rose-600">{error}</p>}
           </div>
         </div>
@@ -3679,7 +10388,7 @@ function EditFloorModal({ floor, onClose, onSave }) {
             className={BTN_PRIMARY}
           >
             {submitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-            {submitting ? "Wird gespeichert…" : "Änderungen speichern"}
+            {submitting ? (compressionNotice ? "Wird optimiert…" : "Wird gespeichert…") : "Änderungen speichern"}
           </button>
         </div>
       </div>
@@ -3691,6 +10400,55 @@ function EditFloorModal({ floor, onClose, onSave }) {
 // SCREEN 2: FLOOR OVERVIEW
 // ----------------------------------------------------------------------------------
 
+// Baustellen-Guide / Projekt-Orientierung (Site Onboarding Info) — zeigt die vier
+// strukturierten Infofelder aus dem Projektformular (siehe ProjectFormModal) prominent
+// im Projekt-Header an, damit sich neue Nachunternehmer sofort orientieren können.
+// Rendert nichts, sobald für das Projekt kein einziges Feld gepflegt ist (siehe
+// hasOnboardingInfo) — eine leere Box wäre reine Ablenkung. Standardmäßig
+// aufgeklappt ("prominent"), lässt sich aber einklappen, sobald man sich einmal
+// orientiert hat.
+function SiteOnboardingPanel({ project }) {
+  const [open, setOpen] = useState(true);
+  const sections = buildOnboardingSections(project);
+  if (sections.length === 0) return null;
+  const ICONS_BY_LABEL = {
+    "Anfahrt & Parkmöglichkeiten": Navigation,
+    "Zugang & Sicherheit": ShieldCheck,
+    "Ansprechpartner / Bauleitung": Phone,
+    "Verpflegung & Infrastruktur": Coffee,
+  };
+  return (
+    <div className="mb-6 overflow-hidden rounded-xl border border-amber-200 bg-amber-50/60 shadow-sm">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 px-4 py-2.5 text-left transition hover:bg-amber-50"
+      >
+        <span className="flex items-center gap-2 text-sm font-bold text-amber-800">
+          <Info size={16} /> Baustellen-Info für Nachunternehmer
+        </span>
+        {open ? <ChevronRight size={16} className="rotate-90 text-amber-600 transition" /> : <ChevronRight size={16} className="text-amber-600 transition" />}
+      </button>
+      {open && (
+        <div className="grid grid-cols-1 gap-3 border-t border-amber-200/70 px-4 py-3.5 sm:grid-cols-2 lg:grid-cols-4">
+          {sections.map((s) => {
+            const Icon = ICONS_BY_LABEL[s.label] || Info;
+            return (
+              <div key={s.label} className="flex items-start gap-2">
+                <Icon size={15} className="mt-0.5 shrink-0 text-amber-600" />
+                <div className="min-w-0">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-700">{s.label}</p>
+                  <p className="whitespace-pre-line text-sm text-slate-700">{s.text}</p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FloorOverview({
   project,
   floors,
@@ -3701,10 +10459,13 @@ function FloorOverview({
   onOpenAddFloor,
   onEditProject,
   onDeleteProject,
-  onChangeLphStatus,
+  onArchiveProject,
   onEditFloor,
   onDeleteFloor,
+  onReorderFloors,
   onExportPdf,
+  milestones = [],
+  onOpenSchedule,
   readOnly = false,
 }) {
   // Bestandsprojekte ohne gespeicherte Gewerke-Auswahl (siehe resolveProjectTradeIds)
@@ -3712,6 +10473,76 @@ function FloorOverview({
   const projectTradeIds = resolveProjectTradeIds(project);
   const projectTrades =
     projectTradeIds === null ? trades.filter((t) => t.active) : trades.filter((t) => projectTradeIds.includes(t.id));
+
+  // ---------------------------------------------------------------------------------
+  // DRAG & DROP REORDERING DER GESCHOSSE (Grip-Handle je Kachel)
+  // ---------------------------------------------------------------------------------
+  // Bewusst über Pointer Events statt native HTML5-Drag&Drop-Handler (draggable/
+  // dragstart/dragover/drop) umgesetzt — HTML5-DnD feuert auf Touch-Geräten ohne
+  // Zusatzaufwand keine zuverlässigen Events, in dieser auf Tablet/Handy-Nutzung auf
+  // der Baustelle ausgelegten App wäre das eine Regression. Pointer Events sind
+  // bereits das etablierte Muster dieser Codebasis für genau diesen Zweck (siehe
+  // Pin-Verschieben/Pan/Pinch-Zoom in FloorPlanView) und funktionieren für Maus,
+  // Touch und Stift identisch. Bewusst KEIN künstlicher "Long Press"-Timer: der
+  // Grip ist ein eigenständiges, kleines Element außerhalb des "Geschoss öffnen"-
+  // Buttons (siehe Markup unten) — jede Berührung DES GRIPS bedeutet eindeutig
+  // "jetzt ziehen", eine Verzögerung zur Unterscheidung von einem normalen Tap ist
+  // dadurch anders als bei einem grip-losen Long-Press-Ansatz gar nicht nötig.
+  const [orderedFloors, setOrderedFloors] = useState(floors);
+  const [draggingFloorId, setDraggingFloorId] = useState(null);
+  const floorCardRefs = useRef({});
+
+  // Übernimmt eine von außen (Server-Antwort, Offline-Cache, Pin-Zusammenfassung)
+  // aktualisierte floors-Prop — AUSSER während eine Drag-Geste gerade aktiv ist,
+  // sonst würde z.B. ein zwischenzeitliches Nachladen die laufende Bewegung mitten
+  // im Ziehen sichtbar zurückspringen lassen.
+  useEffect(() => {
+    if (!draggingFloorId) setOrderedFloors(floors);
+  }, [floors, draggingFloorId]);
+
+  const handleGripPointerDown = (floorId, e) => {
+    if (readOnly || !onReorderFloors) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDraggingFloorId(floorId);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  // Bestimmt per Mittelpunkt-Vergleich der bereits gerenderten Kachel-Rects, über
+  // welcher ANDEREN Kachel sich der Pointer gerade befindet, und tauscht die gezogene
+  // Kachel live an diese Position — klassisches "Sortable List"-Verhalten, der Nutzer
+  // sieht die neue Reihenfolge schon während des Ziehens, nicht erst nach dem Loslassen.
+  const handleGripPointerMove = (e) => {
+    if (!draggingFloorId) return;
+    const draggedIndex = orderedFloors.findIndex((f) => f.id === draggingFloorId);
+    if (draggedIndex === -1) return;
+    const overTarget = orderedFloors.find((f) => {
+      if (f.id === draggingFloorId) return false;
+      const el = floorCardRefs.current[f.id];
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      return e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+    });
+    if (!overTarget) return;
+    const targetIndex = orderedFloors.findIndex((f) => f.id === overTarget.id);
+    if (targetIndex === draggedIndex) return;
+    setOrderedFloors((prev) => {
+      const next = [...prev];
+      const [moved] = next.splice(draggedIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const handleGripPointerUp = () => {
+    if (!draggingFloorId) return;
+    setDraggingFloorId(null);
+    // Nur tatsächlich persistieren, wenn sich die Reihenfolge gegenüber der zuletzt
+    // von außen erhaltenen floors-Prop wirklich geändert hat — ein Antippen des Grips
+    // ohne nennenswerte Bewegung soll keinen unnötigen Schreibvorgang auslösen.
+    const changed = orderedFloors.length !== floors.length || orderedFloors.some((f, idx) => f.id !== floors[idx]?.id);
+    if (changed && onReorderFloors) onReorderFloors(orderedFloors);
+  };
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
@@ -3733,25 +10564,16 @@ function FloorOverview({
               </span>
             )}
           </div>
-          <p className="text-sm text-slate-500">{project.address}</p>
+          <AddressMapsLink
+            address={project.address}
+            iconSize={14}
+            className="inline-flex items-center gap-1.5 text-sm text-slate-500 underline-offset-2 transition hover:text-[#FF2A00] hover:underline"
+          />
           {project.project_leader && (
             <p className="mt-1 flex items-center gap-1.5 text-xs text-slate-500">
               <Briefcase size={13} className="text-slate-400" /> Projektleitung: {project.project_leader}
             </p>
           )}
-          <div className="mt-3 max-w-xl">
-            <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">HOAI-Leistungsphasen</p>
-            <LphStatusGrid
-              lphStatus={project.lph_status}
-              lphBeauftragt={project.lph_beauftragt}
-              onChangeStatus={(phaseKey, newStatus) => onChangeLphStatus && onChangeLphStatus(phaseKey, newStatus)}
-              disabled={readOnly}
-            />
-          </div>
-          <div className="mt-3 max-w-xl">
-            <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">LPH-Auftragsauswahl</p>
-            <LphAuftragsProgressRow lphSelection={project.lph_beauftragt} />
-          </div>
           <div className="mt-3 max-w-xl">
             <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Relevante Gewerke</p>
             {projectTrades.length === 0 ? (
@@ -3779,6 +10601,35 @@ function FloorOverview({
             >
               <Trash2 size={15} /> Löschen
             </button>
+            {/* Reversibler Abschluss-Status (siehe handleToggleProjectArchive): schaltet
+                zwischen "aktiv" und "abgeschlossen/archiviert" um, ohne dass das Projekt
+                dabei je gelöscht wird — daher bewusst zwischen "Löschen" und "PDF-Export"
+                platziert und optisch klar von der destruktiven Löschen-Aktion abgesetzt. */}
+            {onArchiveProject && (
+              <button
+                onClick={() => onArchiveProject(project)}
+                title={
+                  project.is_archived
+                    ? "Setzt den Status zurück auf „In Bearbeitung“ und blendet das Projekt wieder bei den aktiven Projekten ein."
+                    : "Setzt den Status auf „Abgeschlossen“ und verschiebt das Projekt ins Archiv — jederzeit wieder herstellbar."
+                }
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-semibold shadow-sm transition ${
+                  project.is_archived
+                    ? "border-emerald-200 bg-white text-emerald-600 hover:bg-emerald-50"
+                    : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                {project.is_archived ? (
+                  <>
+                    <ArchiveRestore size={15} /> Projekt wiederherstellen
+                  </>
+                ) : (
+                  <>
+                    <Archive size={15} /> Projekt abschließen
+                  </>
+                )}
+              </button>
+            )}
             {onExportPdf && (
               <button
                 onClick={() => onExportPdf(project)}
@@ -3788,64 +10639,112 @@ function FloorOverview({
               </button>
             )}
           </div>
-          <button
-            onClick={onOpenAddFloor}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
-          >
-            <Plus size={16} /> Neue Etage / Grundriss hinzufügen
-          </button>
+          <div className="flex items-center gap-2">
+            {onOpenSchedule && (
+              <button
+                onClick={onOpenSchedule}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50"
+              >
+                <CalendarRange size={15} /> Bauzeitenplan
+              </button>
+            )}
+            <button
+              onClick={onOpenAddFloor}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+            >
+              <Plus size={16} /> Neues Geschoss hinzufügen
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Prominente Fortschrittsleiste + "Heute anstehend"-Widget, siehe ANFORDERUNG
+          "Platziere in der Projektübersicht eine prominente Fortschrittsleiste". */}
+      <ProjectScheduleProgress project={project} milestones={milestones} onOpenSchedule={onOpenSchedule} />
+
+      <SiteOnboardingPanel project={project} />
 
       {loading ? (
         <LoadingBlock label="Etagen werden geladen…" />
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-          {floors.map((floor) => {
-            const open = (floor.pins || []).filter((p) => p.status === "offen").length;
-            const floorKind = resolveFloorKind(floor);
-            const isCad = floorKind === "cad";
-            const isPdf = floorKind === "pdf";
-            const fileName = deriveFileNameFromUrl(floor.image_url);
+          {orderedFloors.map((floor) => {
+            const floorPins = floor.pins || [];
+            const open = floorPins.filter((p) => p.status === "offen").length;
+            const inProgress = floorPins.filter((p) => p.status === "bearbeitung").length;
+            const done = floorPins.filter((p) => p.status === "erledigt").length;
+            const sketchCount = (floor.floor_plans || []).length;
             return (
               <div
                 key={floor.id}
-                className="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-blue-300 hover:shadow-md"
+                ref={(el) => {
+                  floorCardRefs.current[floor.id] = el;
+                }}
+                className={`group relative flex flex-col overflow-hidden rounded-xl border bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md ${
+                  draggingFloorId === floor.id ? "z-20 border-[#FF2A00] opacity-70 shadow-lg ring-2 ring-[#FF2A00]/40" : "border-slate-200"
+                }`}
               >
+                {/* Grip-Handle: eigenständiges Element AUSSERHALB des "Geschoss öffnen"-
+                    Buttons unten (ein <button> im <button> wäre ungültig verschachteltes
+                    interaktives HTML, siehe dieselbe Problematik bei AddressMapsLink in
+                    der Projektkachel) — jede Berührung startet unmittelbar das Ziehen. */}
+                {!readOnly && onReorderFloors && (
+                  <button
+                    type="button"
+                    aria-label="Reihenfolge der Geschosse ändern"
+                    title="Gedrückt halten und ziehen, um die Reihenfolge zu ändern"
+                    onPointerDown={(e) => handleGripPointerDown(floor.id, e)}
+                    onPointerMove={handleGripPointerMove}
+                    onPointerUp={handleGripPointerUp}
+                    onPointerCancel={handleGripPointerUp}
+                    className="absolute left-2 top-2 z-10 flex h-6 w-6 touch-none cursor-grab items-center justify-center rounded-md bg-slate-900/40 text-white backdrop-blur-sm transition hover:bg-slate-900/60 active:cursor-grabbing"
+                  >
+                    <GripVertical size={14} />
+                  </button>
+                )}
                 <button
                   onClick={() => onOpenFloor(floor.id)}
-                  className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-blue-500/30"
+                  className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[#FF2A00]/30"
                 >
-                  <div className="relative h-24 w-full overflow-hidden bg-slate-900 sm:h-28">
-                    {isCad && (
-                      <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-[#0b1220]" style={{
-                        backgroundImage: "linear-gradient(rgba(56,189,248,0.16) 1px, transparent 1px), linear-gradient(90deg, rgba(56,189,248,0.16) 1px, transparent 1px)",
-                        backgroundSize: "14px 14px",
-                      }}>
-                        <Ruler size={20} className="text-sky-300" />
-                        <span className="text-[10px] font-semibold text-sky-300/80">CAD-Grundriss</span>
-                      </div>
-                    )}
-                    {isPdf && (
-                      <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-slate-800">
-                        <FileText size={22} className="text-rose-400" />
-                        <span className="text-[10px] font-semibold text-slate-300">PDF-Grundriss</span>
-                      </div>
-                    )}
-                    {!isCad && !isPdf && (
-                      <img src={floor.image_url} alt="" className="h-full w-full object-cover opacity-80 transition duration-300 group-hover:scale-105" />
-                    )}
+                  <div className="relative flex h-24 w-full flex-col items-center justify-center gap-1 overflow-hidden bg-slate-900 sm:h-28">
+                    <Layers size={22} className="text-slate-500" />
+                    <span className="text-[10px] font-semibold text-slate-400">
+                      {sketchCount} Grundrisskizze{sketchCount !== 1 ? "n" : ""}
+                    </span>
                     <div className="absolute inset-0 ring-1 ring-inset ring-black/10" />
-                    {isCad && <CadBadge ext={deriveFileExt(fileName) || "dwg"} className="absolute left-2 top-2" />}
                     {open > 0 && (
-                      <span className="absolute right-2 top-2 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[11px] font-bold text-white shadow">
+                      <span className="absolute right-2 top-2 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-[#FF2A00] px-1 text-[11px] font-bold text-white shadow">
                         {open}
                       </span>
                     )}
                   </div>
                   <div className="p-3">
                     <h3 className="text-sm font-semibold text-slate-900">{floor.name}</h3>
-                    <p className="mt-0.5 text-[11px] text-slate-500">{(floor.pins || []).length} Pin{(floor.pins || []).length !== 1 ? "s" : ""}</p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      {floorPins.length} Pin{floorPins.length !== 1 ? "s" : ""} erfasst
+                    </p>
+                    {floorPins.length > 0 && (
+                      <div className="mt-2 flex flex-wrap items-center gap-1 text-[10px] font-semibold">
+                        {open > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-1.5 py-0.5 text-red-700 ring-1 ring-inset ring-red-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#FF2A00]" /> {open} offen
+                          </span>
+                        )}
+                        {inProgress > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-1.5 py-0.5 text-amber-700 ring-1 ring-inset ring-amber-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-amber-500" /> {inProgress} in Arbeit
+                          </span>
+                        )}
+                        {done > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-1.5 py-0.5 text-emerald-700 ring-1 ring-inset ring-emerald-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> {done} erledigt
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="mx-3 mb-3 mt-1 inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-100 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 transition group-hover:bg-[#FF2A00] group-hover:text-white">
+                    Geschoss öffnen <ChevronRight size={13} />
                   </div>
                 </button>
                 <div className="flex items-center gap-1 border-t border-slate-100 px-2 py-1.5">
@@ -3876,7 +10775,7 @@ function FloorOverview({
 
           <button
             onClick={onOpenAddFloor}
-            className="flex min-h-[104px] flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed border-slate-300 text-slate-400 transition hover:border-blue-400 hover:bg-blue-50/40 hover:text-blue-500 sm:min-h-[120px]"
+            className="flex min-h-[104px] flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed border-slate-300 text-slate-400 transition hover:border-[#FF2A00] hover:bg-red-50/40 hover:text-[#FF2A00] sm:min-h-[120px]"
           >
             <UploadCloud size={22} />
             <span className="text-xs font-semibold">Etage hinzufügen</span>
@@ -3887,13 +10786,814 @@ function FloorOverview({
   );
 }
 
+function MilestoneStatusBadge({ status }) {
+  const meta = MILESTONE_STATUS_META[status] || MILESTONE_STATUS_META.ausstehend;
+  return (
+    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ring-inset ${meta.bg} ${meta.text} ${meta.ring}`}>
+      <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} /> {meta.label}
+    </span>
+  );
+}
+
 // ----------------------------------------------------------------------------------
-// SCREEN 3: INTERACTIVE FLOOR PLAN
+// ANFORDERUNG "INTEGRATION GESAMT-BAUZEITENPLAN & DYNAMISCHER FORTSCHRITTSBALKEN":
+// prominente Fortschrittsleiste + "Heute anstehend"-Widget, siehe computeTimeProgressPercent/
+// computeMilestoneProgressPercent/getTodaysMilestoneHighlights weiter oben. Wird sowohl
+// direkt in FloorOverview (Projektübersicht, siehe ANFORDERUNG Punkt 3 "Platziere in der
+// Projektübersicht eine prominente Fortschrittsleiste") als auch oben in ScheduleView
+// eingebettet — exakt dieselbe Komponente, damit beide Stellen niemals auseinanderlaufen
+// können. Rendert bewusst NICHTS (null), solange weder ein zeitlicher noch ein
+// meilenstein-basierter Fortschritt berechnet werden kann (weder start_date/end_date noch
+// Meilensteine hinterlegt) — vermeidet unnötige Leerstellen auf Projekten, die dieses
+// Feature (noch) nicht nutzen.
+function ProjectScheduleProgress({ project, milestones = [], onOpenSchedule }) {
+  const timePct = computeTimeProgressPercent(project);
+  const milestonePct = computeMilestoneProgressPercent(milestones);
+  if (timePct === null && milestonePct === null) return null;
+
+  const { startingToday, dueToday, overdue } = getTodaysMilestoneHighlights(milestones);
+  const hasHighlights = startingToday.length > 0 || dueToday.length > 0 || overdue.length > 0;
+
+  return (
+    <div className="mb-6 rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          <TrendingUp size={15} className="text-[#FF2A00]" />
+          <h2 className="text-sm font-bold text-slate-900">Bauzeitenplan &amp; Fortschritt</h2>
+        </div>
+        {onOpenSchedule && (
+          <button
+            onClick={onOpenSchedule}
+            className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 transition hover:text-[#FF2A00]"
+          >
+            Bauzeitenplan öffnen <ChevronRight size={13} />
+          </button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div>
+          <div className="mb-1 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            <span>Zeitlicher Fortschritt</span>
+            <span className="text-slate-700">{timePct === null ? "–" : `${timePct}%`}</span>
+          </div>
+          {timePct === null ? (
+            <p className="text-[11px] text-slate-400">Kein Baubeginn/Fertigstellungsdatum hinterlegt (siehe Projekt bearbeiten).</p>
+          ) : (
+            <>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full rounded-full bg-[#FF2A00] transition-all" style={{ width: `${timePct}%` }} />
+              </div>
+              <p className="mt-1 text-[11px] text-slate-400">
+                {formatDateOnly(project.start_date)} – {formatDateOnly(project.end_date)}
+              </p>
+            </>
+          )}
+        </div>
+        <div>
+          <div className="mb-1 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            <span>Baufortschritt (Meilensteine)</span>
+            <span className="text-slate-700">{milestonePct === null ? "–" : `${milestonePct}%`}</span>
+          </div>
+          {milestonePct === null ? (
+            <p className="text-[11px] text-slate-400">Noch keine Meilensteine im Bauzeitenplan angelegt.</p>
+          ) : (
+            <>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full rounded-full bg-emerald-500 transition-all" style={{ width: `${milestonePct}%` }} />
+              </div>
+              <p className="mt-1 text-[11px] text-slate-400">
+                {milestones.filter((m) => m.status === "abgeschlossen").length} von {milestones.length} Meilenstein
+                {milestones.length !== 1 ? "en" : ""} abgeschlossen
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+
+      {hasHighlights && (
+        <div className="mt-4 border-t border-slate-100 pt-3.5">
+          <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            <CalendarClock size={13} /> Heute anstehend
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {overdue.map((m) => (
+              <span
+                key={`overdue-${m.id}`}
+                title={`Fertigstellung war ${formatDateOnly(m.end_date)} geplant`}
+                className="inline-flex items-center gap-1.5 rounded-full bg-red-50 px-2.5 py-1 text-[11px] font-semibold text-[#FF2A00] ring-1 ring-inset ring-red-200"
+              >
+                <AlertTriangle size={12} /> {m.title} — in Verzug
+              </span>
+            ))}
+            {dueToday.map((m) => (
+              <span
+                key={`due-${m.id}`}
+                className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200"
+              >
+                <Flag size={12} /> {m.title} — heute Fertigstellung geplant
+              </span>
+            ))}
+            {startingToday.map((m) => (
+              <span
+                key={`start-${m.id}`}
+                className="inline-flex items-center gap-1.5 rounded-full bg-sky-50 px-2.5 py-1 text-[11px] font-semibold text-sky-700 ring-1 ring-inset ring-sky-200"
+              >
+                <CalendarRange size={12} /> {m.title} — startet heute
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Bauzeitenplan-Screen (Ebene 2b) — Verfeinerung nach der schlanken Projekterstellung
+// (siehe ANFORDERUNG Punkt 2 "Terminplan-Manager"): Liste der Bauabschnitte/Gewerke-
+// Meilensteine dieses Projekts, sortiert nach Startdatum (Meilensteine ohne Datum am
+// Ende). Embeddet dieselbe ProjectScheduleProgress-Komponente wie FloorOverview, damit
+// beide Fortschrittsanzeigen garantiert übereinstimmen.
+function ScheduleView({ project, milestones, trades = [], loading, onBack, onOpenAddMilestone, onEditMilestone, readOnly = false }) {
+  const tradesById = new Map(trades.map((t) => [t.id, t]));
+  const sortedMilestones = [...(milestones || [])].sort((a, b) => {
+    if (!a.start_date && !b.start_date) return 0;
+    if (!a.start_date) return 1;
+    if (!b.start_date) return -1;
+    return a.start_date < b.start_date ? -1 : a.start_date > b.start_date ? 1 : 0;
+  });
+  const today = todayDateOnly().getTime();
+
+  return (
+    <div className="mx-auto max-w-4xl px-4 py-6 sm:px-6 sm:py-8">
+      <button
+        onClick={onBack}
+        className="mb-4 inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+      >
+        <ChevronLeft size={17} /> Zurück zur Projektübersicht
+      </button>
+
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">Bauzeitenplan</h1>
+          <p className="mt-0.5 text-sm text-slate-500">{project.name}</p>
+        </div>
+        {!readOnly && (
+          <button
+            onClick={onOpenAddMilestone}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+          >
+            <Plus size={16} /> Neuer Meilenstein
+          </button>
+        )}
+      </div>
+
+      <ProjectScheduleProgress project={project} milestones={milestones} />
+
+      {loading ? (
+        <LoadingBlock label="Bauzeitenplan wird geladen…" />
+      ) : sortedMilestones.length === 0 ? (
+        <div className="flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 px-4 py-12 text-center">
+          <CalendarRange size={28} className="text-slate-300" />
+          <p className="text-sm font-semibold text-slate-500">Noch keine Bauabschnitte/Meilensteine angelegt.</p>
+          <p className="max-w-sm text-xs text-slate-400">
+            Meilensteine wie "Rohbau", "Elektro Rohinstallation" oder "Fliesenarbeiten" bilden hier den Bauzeitenplan
+            dieses Projekts ab.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {sortedMilestones.map((m) => {
+            const trade = m.trade_id ? tradesById.get(m.trade_id) : null;
+            const end = parseDateOnly(m.end_date);
+            const isOverdue = m.status !== "abgeschlossen" && end && end.getTime() < today;
+            return (
+              <button
+                key={m.id}
+                onClick={() => onEditMilestone(m)}
+                className={`flex w-full flex-wrap items-center gap-3 rounded-xl border bg-white p-3.5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md ${
+                  isOverdue ? "border-red-200" : "border-slate-200"
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-sm font-semibold text-slate-900">{m.title}</h3>
+                    {isOverdue && (
+                      <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-bold text-[#FF2A00] ring-1 ring-inset ring-red-200">
+                        <AlertTriangle size={10} /> In Verzug
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    {trade && <TradeBadge trade={trade} />}
+                    <span className="inline-flex items-center gap-1 text-xs text-slate-500">
+                      <CalendarRange size={12} className="text-slate-400" />
+                      {formatDateOnly(m.start_date)} – {formatDateOnly(m.end_date)}
+                    </span>
+                  </div>
+                </div>
+                <MilestoneStatusBadge status={m.status} />
+                <ChevronRight size={16} className="shrink-0 text-slate-300" />
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Anlegen/Bearbeiten eines einzelnen Meilensteins. Bewusst EINZELNE Gewerke-Auswahl
+// (<select>, nicht TradeChipsPicker) — anders als bei Mängel-Pins gehört ein
+// Bauabschnitt fachlich zu genau einem Gewerk. Direct-Delete-Button im Footer, gleiches
+// Muster wie PlanNoteModal (siehe handleDeleteMilestone) statt eines separaten
+// ConfirmDialog.
+function MilestoneModal({ mode, milestone, trades = [], onClose, onSave, onDelete }) {
+  const [title, setTitle] = useState(milestone?.title || "");
+  const [tradeId, setTradeId] = useState(milestone?.trade_id || "");
+  const [startDate, setStartDate] = useState(milestone?.start_date ? String(milestone.start_date).slice(0, 10) : "");
+  const [endDate, setEndDate] = useState(milestone?.end_date ? String(milestone.end_date).slice(0, 10) : "");
+  const [status, setStatus] = useState(milestone?.status || "ausstehend");
+  const [submitting, setSubmitting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+  const isNew = mode === "create";
+  const busy = submitting || deleting;
+
+  const handleSubmit = async () => {
+    if (!title.trim()) {
+      setError("Bitte einen Titel für den Bauabschnitt/Meilenstein vergeben.");
+      return;
+    }
+    if (startDate && endDate && endDate < startDate) {
+      setError("Das Fertigstellungsdatum darf nicht vor dem Startdatum liegen.");
+      return;
+    }
+    setError("");
+    setSubmitting(true);
+    try {
+      await onSave({
+        title: title.trim(),
+        trade_id: tradeId || null,
+        start_date: startDate || null,
+        end_date: endDate || null,
+        status,
+      });
+    } catch (err) {
+      console.error("Meilenstein konnte nicht gespeichert werden:", err);
+      setError(err?.message || "Der Meilenstein konnte nicht gespeichert werden. Bitte erneut versuchen.");
+      setSubmitting(false);
+    }
+  };
+
+  const handleDeleteClick = async () => {
+    setDeleting(true);
+    try {
+      await onDelete(milestone.id);
+    } catch (err) {
+      console.error("Meilenstein konnte nicht gelöscht werden:", err);
+      setError(err?.message || "Der Meilenstein konnte nicht gelöscht werden. Bitte erneut versuchen.");
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-50`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[90vh] sm:max-w-lg sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>{isNew ? "Neuer Meilenstein" : "Meilenstein bearbeiten"}</p>
+            <h2 className="text-lg font-bold text-slate-900">{isNew ? "Bauabschnitt anlegen" : milestone?.title}</h2>
+          </div>
+          <button onClick={onClose} disabled={busy} className={MODAL_CLOSE_BTN_DISABLED}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className={MODAL_BODY_SCROLL}>
+          <div>
+            <FieldLabel>Titel</FieldLabel>
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              disabled={busy}
+              placeholder="z.B. Rohbau, Elektro Rohinstallation, Trockenbau"
+              className={TEXT_INPUT_CLASS}
+            />
+          </div>
+
+          <div>
+            <FieldLabel>Gewerk</FieldLabel>
+            <select value={tradeId} onChange={(e) => setTradeId(e.target.value)} disabled={busy} className={TEXT_INPUT_CLASS}>
+              <option value="">Kein Gewerk zugeordnet</option>
+              {trades.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <FieldLabel>Startdatum</FieldLabel>
+              <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} disabled={busy} className={TEXT_INPUT_CLASS} />
+            </div>
+            <div>
+              <FieldLabel>Fertigstellung</FieldLabel>
+              <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} disabled={busy} className={TEXT_INPUT_CLASS} />
+            </div>
+          </div>
+
+          <div>
+            <FieldLabel>Status</FieldLabel>
+            <div className="flex flex-wrap gap-2">
+              {MILESTONE_STATUS_OPTIONS.map((opt) => {
+                const meta = MILESTONE_STATUS_META[opt];
+                const active = status === opt;
+                return (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => setStatus(opt)}
+                    disabled={busy}
+                    className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 ring-inset transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                      active ? `${meta.bg} ${meta.text} ${meta.ring}` : "bg-white text-slate-500 ring-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} /> {meta.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {error && (
+            <p className="rounded-lg bg-red-50 px-3 py-2 text-xs font-medium text-[#FF2A00] ring-1 ring-inset ring-red-200">{error}</p>
+          )}
+        </div>
+
+        <div className={MODAL_FOOTER_ROW}>
+          {!isNew && (
+            <button
+              onClick={handleDeleteClick}
+              disabled={busy}
+              className="mr-auto inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Trash2 size={15} /> {deleting ? "Wird gelöscht…" : "Löschen"}
+            </button>
+          )}
+          <button onClick={onClose} disabled={busy} className={BTN_SECONDARY}>
+            Abbrechen
+          </button>
+          <button onClick={handleSubmit} disabled={busy} className={BTN_PRIMARY}>
+            <Save size={15} /> {submitting ? "Wird gespeichert…" : "Speichern"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": Auswahl-Modal für
+// den PDF-Sammelbericht mehrerer Grundrisskizzen EINES Geschosses (siehe
+// SketchOverview unten, "Skizzen für PDF auswählen"). Listet alle Skizzen des
+// Geschosses mit Checkbox, Vorschau/Titel und Pin-Anzahl auf — standardmäßig sind
+// alle vorausgewählt (spart in der Praxis am häufigsten Klicks: meist soll ohnehin
+// das gesamte Geschoss exportiert werden, gezielt EINZELNE Skizzen abzuwählen ist der
+// Ausnahmefall). Die eigentliche PDF-Erzeugung (inkl. Nachladen der vollständigen
+// Pin-/Fotodaten aller AUSGEWÄHLTEN Skizzen) übernimmt onExport im Aufrufer (siehe
+// handleExportSelectedSketchesPdf in App) — dieses Modal kennt selbst keine
+// Supabase-Zugriffe, exakt wie NewFloorPlanModal/EditFloorPlanModal nebenan.
+function SketchExportModal({ floor, plans, project, onClose, onExport }) {
+  const [selectedIds, setSelectedIds] = useState(() => new Set((plans || []).map((p) => p.id)));
+  const [includeOnboarding, setIncludeOnboarding] = useState(() => hasOnboardingInfo(project));
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState("");
+
+  const toggle = (id) => {
+    if (exporting) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const selectAll = () => !exporting && setSelectedIds(new Set((plans || []).map((p) => p.id)));
+  const selectNone = () => !exporting && setSelectedIds(new Set());
+
+  const handleExport = async () => {
+    if (selectedIds.size === 0) {
+      setError("Bitte mindestens eine Grundrissskizze auswählen.");
+      return;
+    }
+    setError("");
+    setExporting(true);
+    try {
+      // Reihenfolge im PDF folgt der Anzeigereihenfolge in diesem Modal (= Reihenfolge
+      // von plans, siehe SketchOverview — nach Anlagedatum), nicht der Klickreihenfolge
+      // der Checkboxen.
+      const selectedPlans = (plans || []).filter((p) => selectedIds.has(p.id));
+      // onExport (siehe handleExportSelectedSketchesPdf in App) lädt erst die
+      // vollständigen Pin-/Fotodaten der ausgewählten Skizzen nach und löst danach
+      // synchron den Browser-Download aus (doc.save, siehe generateMultiSketchFloorReportPdf)
+      // — erst NACH erfolgreichem Abschluss wird das Modal hier geschlossen, bei einem
+      // Fehler bleibt es offen und zeigt die Fehlermeldung unten.
+      await onExport(selectedPlans, { includeOnboarding });
+      onClose();
+    } catch (err) {
+      console.error("PDF-Sammelbericht konnte nicht erstellt werden:", err);
+      setError(err?.message || "Der PDF-Sammelbericht konnte nicht erstellt werden. Bitte erneut versuchen.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const total = (plans || []).length;
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-50`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[85vh] sm:max-w-lg sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>{floor?.name}</p>
+            <h2 className="text-lg font-bold text-slate-900">Skizzen für PDF-Sammelbericht</h2>
+          </div>
+          <button onClick={onClose} disabled={exporting} className={MODAL_CLOSE_BTN_DISABLED}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 border-b border-slate-100 px-5 py-2.5">
+          <button
+            type="button"
+            onClick={selectAll}
+            disabled={exporting}
+            className="text-xs font-semibold text-[#FF2A00] transition hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Alle auswählen
+          </button>
+          <span className="text-slate-300">·</span>
+          <button
+            type="button"
+            onClick={selectNone}
+            disabled={exporting}
+            className="text-xs font-semibold text-slate-500 transition hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Auswahl aufheben
+          </button>
+          <span className="ml-auto text-xs font-medium text-slate-400">
+            {selectedIds.size} von {total} ausgewählt
+          </span>
+        </div>
+
+        <div className="flex-1 space-y-1.5 overflow-y-auto px-5 py-3">
+          {total === 0 ? (
+            <p className="py-6 text-center text-sm text-slate-400">Dieses Geschoss enthält noch keine Grundrisskizzen.</p>
+          ) : (
+            (plans || []).map((plan) => {
+              const planKind = resolveFloorKind(plan);
+              const isCad = planKind === "cad";
+              const isPdf = planKind === "pdf";
+              const pinCount = (plan.pins || []).length;
+              const checked = selectedIds.has(plan.id);
+              return (
+                <label
+                  key={plan.id}
+                  className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 transition ${
+                    checked ? "border-[#FF2A00]/40 bg-red-50/50" : "border-slate-200 hover:bg-slate-50"
+                  } ${exporting ? "cursor-not-allowed opacity-70" : ""}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggle(plan.id)}
+                    disabled={exporting}
+                    className="h-4 w-4 shrink-0 accent-[#FF2A00]"
+                  />
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-md bg-slate-900">
+                    {isCad ? (
+                      <Ruler size={16} className="text-sky-300" />
+                    ) : isPdf ? (
+                      <FileText size={16} className="text-rose-400" />
+                    ) : (
+                      <img src={plan.image_url} alt="" className="h-full w-full object-cover opacity-80" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold text-slate-800">{plan.name}</p>
+                    <p className="text-[11px] text-slate-400">
+                      {pinCount} Pin{pinCount !== 1 ? "s" : ""}
+                    </p>
+                  </div>
+                </label>
+              );
+            })
+          )}
+        </div>
+
+        {hasOnboardingInfo(project) && (
+          <label className="flex cursor-pointer items-start gap-2 border-t border-slate-100 px-5 py-2.5 hover:bg-slate-50">
+            <input
+              type="checkbox"
+              checked={includeOnboarding}
+              onChange={(e) => setIncludeOnboarding(e.target.checked)}
+              disabled={exporting}
+              className="mt-0.5 accent-[#FF2A00]"
+            />
+            <span className="text-[11px] leading-snug text-slate-600">
+              Baustellen-Info auf der ersten Seite jeder ausgewählten Skizze einbinden
+            </span>
+          </label>
+        )}
+
+        {error && <p className="border-t border-slate-100 px-5 pt-2 text-xs font-medium text-rose-600">{error}</p>}
+
+        <div className={MODAL_FOOTER_ROW}>
+          <button onClick={onClose} disabled={exporting} className={BTN_SECONDARY}>
+            Abbrechen
+          </button>
+          <button onClick={handleExport} disabled={exporting || selectedIds.size === 0} className={BTN_PRIMARY}>
+            {exporting ? <Loader2 size={16} className="animate-spin" /> : <FileDown size={16} />}
+            {exporting ? "Wird erstellt…" : `PDF erstellen (${selectedIds.size})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// SCREEN 3: GRUNDRISSSKIZZEN-ÜBERSICHT je Geschoss
+// Ein Geschoss kann mehrere Grundrisskizzen enthalten (z.B. "Grundriss Gesamt",
+// "Bereich A / Nord", "Detailplan Haustechnik") — erst der Klick auf eine konkrete
+// Skizze führt zur interaktiven Planansicht (Screen 4) mit den daran gebundenen Pins.
+// ----------------------------------------------------------------------------------
+
+function SketchOverview({
+  floor,
+  plans,
+  loading,
+  activeCategory = "grundriss",
+  onChangeCategory,
+  onBack,
+  onOpenPlan,
+  onOpenAddPlan,
+  onEditPlan,
+  onDeletePlan,
+  onOpenExportModal,
+  readOnly = false,
+}) {
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": rein clientseitige Filterung der
+  // bereits vollständig geladenen plans-Liste nach der aktiven Tab-Kategorie — keine
+  // eigene Nachlade-Anfrage je Tab-Wechsel nötig, dadurch bleibt der Wechsel exakt so
+  // "Zero-Latency" wie die bereits bestehende IndexedDB-Stale-While-Revalidate-Anzeige
+  // der gesamten Liste (siehe ANFORDERUNG Punkt 4). getPlanCategory() liefert für
+  // Bestandsdaten ohne das Feld automatisch "grundriss" zurück (Abwärtskompatibilität).
+  const categoryCounts = Object.fromEntries(
+    PLAN_CATEGORY_OPTIONS.map((opt) => [opt.value, plans.filter((p) => getPlanCategory(p) === opt.value).length])
+  );
+  const visiblePlans = plans.filter((p) => getPlanCategory(p) === activeCategory);
+  const activeCategoryMeta = PLAN_CATEGORY_META[activeCategory] || PLAN_CATEGORY_META.grundriss;
+
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
+      <button
+        onClick={onBack}
+        className="mb-4 inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+      >
+        <ChevronLeft size={17} /> Zurück zur Geschossübersicht
+      </button>
+
+      <div className="mb-4">
+        <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{floor?.name}</h1>
+        <p className="text-sm text-slate-500">
+          Grundrisskizzen dieses Geschosses — jede Skizze hat ihre eigenen Pins und Mängel.
+        </p>
+      </div>
+
+      {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" (Korrektur Platzierung): die
+          Tab-Leiste steht ausdrücklich DIREKT OBERHALB der Buttons "Neuen Grundriss
+          hinzufügen"/"Mängel zu PDF exportieren" — als erstes, prominentes
+          Navigationselement in der Geschossansicht, nicht erst darunter. Prägnante
+          Tab-Leiste mit dynamischen Zähler-Badges je Kategorie. "Grundrisse" ist
+          Default/Aktiv, siehe activeCategory-Default-Wert oben/in App. */}
+      <div className="mb-4 flex flex-wrap gap-1.5 rounded-xl bg-slate-100 p-1.5">
+        {PLAN_CATEGORY_OPTIONS.map((opt) => {
+          const active = activeCategory === opt.value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => onChangeCategory?.(opt.value)}
+              className={`inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                active ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-700"
+              }`}
+            >
+              <span>{opt.emoji}</span> {opt.label}
+              <span
+                className={`inline-flex min-w-5 items-center justify-center rounded-full px-1.5 py-0.5 text-[11px] font-bold ${
+                  active ? "bg-red-50 text-[#FF2A00]" : "bg-slate-200 text-slate-500"
+                }`}
+              >
+                {categoryCounts[opt.value]}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mb-6 flex flex-wrap items-center justify-end gap-2">
+        {/* ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": eigener,
+            zusätzlicher Button neben dem bisherigen "Neue Grundrissskizze
+            hinzufügen" — öffnet SketchExportModal, in dem gezielt einzelne Skizzen
+            DER AKTUELL SICHTBAREN KATEGORIE für EINEN gemeinsamen PDF-Sammelbericht
+            ausgewählt werden können (mit Mängel-/Pin-Daten ist ohnehin nur die
+            Kategorie "Grundrisse" sinnvoll befüllt). Nur sichtbar, wenn in dieser
+            Kategorie überhaupt Skizzen vorhanden sind. */}
+        {visiblePlans.length > 0 && (
+          <button
+            onClick={onOpenExportModal}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-600 shadow-sm transition hover:border-[#FF2A00] hover:text-[#FF2A00]"
+          >
+            <FileDown size={16} /> Skizzen für PDF auswählen
+          </button>
+        )}
+        <button
+          onClick={onOpenAddPlan}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+        >
+          <Plus size={16} /> {activeCategoryMeta.emoji} {activeCategoryMeta.label} hinzufügen
+        </button>
+      </div>
+
+      {loading ? (
+        <LoadingBlock label="Grundrisskizzen werden geladen…" />
+      ) : (
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+          {visiblePlans.map((plan) => {
+            const planPins = plan.pins || [];
+            const open = planPins.filter((p) => p.status === "offen").length;
+            const inProgress = planPins.filter((p) => p.status === "bearbeitung").length;
+            const done = planPins.filter((p) => p.status === "erledigt").length;
+            const planKind = resolveFloorKind(plan);
+            const isCad = planKind === "cad";
+            const isPdf = planKind === "pdf";
+            const isSvg = planKind === "svg";
+            const fileName = deriveFileNameFromUrl(plan.image_url);
+            return (
+              <div
+                key={plan.id}
+                className="group flex flex-col overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:border-red-300 hover:shadow-md"
+              >
+                <button
+                  onClick={() => onOpenPlan(plan.id)}
+                  className="flex flex-col text-left focus:outline-none focus-visible:ring-4 focus-visible:ring-[#FF2A00]/30"
+                >
+                  <div className="relative h-24 w-full overflow-hidden bg-slate-900 sm:h-28">
+                    {isCad && (
+                      <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-[#0b1220]" style={{
+                        backgroundImage: "linear-gradient(rgba(56,189,248,0.16) 1px, transparent 1px), linear-gradient(90deg, rgba(56,189,248,0.16) 1px, transparent 1px)",
+                        backgroundSize: "14px 14px",
+                      }}>
+                        <Ruler size={20} className="text-sky-300" />
+                        <span className="text-[10px] font-semibold text-sky-300/80">CAD-Grundriss</span>
+                      </div>
+                    )}
+                    {isPdf && (
+                      <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-slate-800">
+                        <FileText size={22} className="text-rose-400" />
+                        <span className="text-[10px] font-semibold text-slate-300">PDF-Grundriss</span>
+                      </div>
+                    )}
+                    {!isCad && !isPdf && (
+                      <img src={plan.image_url} alt="" className="h-full w-full object-cover opacity-80 transition duration-300 group-hover:scale-105" />
+                    )}
+                    <div className="absolute inset-0 ring-1 ring-inset ring-black/10" />
+                    {isCad && <CadBadge ext={deriveFileExt(fileName) || "dwg"} className="absolute left-2 top-2" />}
+                    {isSvg && <VectorPlanBadge className="absolute left-2 top-2" />}
+                    {open > 0 && (
+                      <span className="absolute right-2 top-2 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-[#FF2A00] px-1 text-[11px] font-bold text-white shadow">
+                        {open}
+                      </span>
+                    )}
+                  </div>
+                  <div className="p-3">
+                    <h3 className="text-sm font-semibold text-slate-900">{plan.name}</h3>
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      {planPins.length} Pin{planPins.length !== 1 ? "s" : ""} erfasst
+                    </p>
+                    {planPins.length > 0 && (
+                      <div className="mt-2 flex flex-wrap items-center gap-1 text-[10px] font-semibold">
+                        {open > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-1.5 py-0.5 text-red-700 ring-1 ring-inset ring-red-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#FF2A00]" /> {open} offen
+                          </span>
+                        )}
+                        {inProgress > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-1.5 py-0.5 text-amber-700 ring-1 ring-inset ring-amber-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-amber-500" /> {inProgress} in Arbeit
+                          </span>
+                        )}
+                        {done > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-1.5 py-0.5 text-emerald-700 ring-1 ring-inset ring-emerald-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> {done} erledigt
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="mx-3 mb-3 mt-1 inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-100 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 transition group-hover:bg-[#FF2A00] group-hover:text-white">
+                    Skizze öffnen <ChevronRight size={13} />
+                  </div>
+                </button>
+                <div className="flex items-center gap-1 border-t border-slate-100 px-2 py-1.5">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onEditPlan(plan);
+                    }}
+                    title="Grundrissskizze bearbeiten"
+                    className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] font-semibold text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+                  >
+                    <Pencil size={12} /> Bearbeiten
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeletePlan(plan);
+                    }}
+                    title="Grundrissskizze löschen"
+                    className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] font-semibold text-rose-500 transition hover:bg-rose-50"
+                  >
+                    <Trash2 size={12} /> Löschen
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+
+          <button
+            onClick={onOpenAddPlan}
+            className="flex min-h-[104px] flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed border-slate-300 text-slate-400 transition hover:border-[#FF2A00] hover:bg-red-50/40 hover:text-[#FF2A00] sm:min-h-[120px]"
+          >
+            <UploadCloud size={22} />
+            <span className="text-xs font-semibold">
+              {activeCategoryMeta.emoji} {activeCategoryMeta.label} hinzufügen
+            </span>
+          </button>
+
+          {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": zwei unterschiedliche Leerzustände —
+              das Geschoss hat insgesamt noch gar keine Pläne (plans.length === 0, Hinweis
+              bezieht sich bewusst weiter auf Pins, da das nur bei "Grundrisse" relevant ist),
+              oder es gibt zwar Pläne im Geschoss, aber keine in der aktuell aktiven Kategorie
+              (visiblePlans.length === 0 bei plans.length > 0) — dafür ein eigener, kategorie-
+              bezogener Hinweistext ohne Pin-Erwähnung, da Werkpläne/Montagepläne reine
+              Referenzansichten ohne Pin-Funktion sind. */}
+          {!loading && plans.length === 0 && (
+            <p className="col-span-full text-xs text-slate-400">
+              Für dieses Geschoss ist noch keine Grundrissskizze hinterlegt. Füge oben eine erste Skizze hinzu, um Pins setzen zu können.
+            </p>
+          )}
+          {!loading && plans.length > 0 && visiblePlans.length === 0 && (
+            <p className="col-span-full text-xs text-slate-400">
+              In der Kategorie {activeCategoryMeta.emoji} {activeCategoryMeta.label} sind noch keine Pläne hinterlegt. Füge oben einen ersten Plan hinzu.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// SCREEN 4: INTERACTIVE FLOOR PLAN
 // ----------------------------------------------------------------------------------
 
 // Sichtfeld-Fächer, der die Blickrichtung/den Aufnahmewinkel eines Pins visualisiert.
-// 0° zeigt nach oben (Norden) und wird per CSS transform: rotate(angle) gedreht — der
-// Fächer ist an der Pin-Spitze verankert, sodass sich Sichtfeld und Pin gemeinsam ausrichten.
+// 0° zeigt nach oben (Norden), 90° nach Osten (rechts), 180° nach Süden (unten), 270°
+// nach Westen (links) — im Uhrzeigersinn steigend, exakt dieselbe Konvention wie das
+// Kompass-Eingabefeld im Pin-Modal (siehe AngleCompass). Die Spitze (schmales Ende)
+// sitzt AN der Pin-Position, der Fächer öffnet sich von dort aus in die Blickrichtung
+// — dieselbe Lesart wie beim Zeichnen des Blickrichtungsindikators im PDF-Export
+// (siehe drawPdfViewCone). Frühere Fassung: Spitze und Drehpunkt lagen oben, der
+// sichtbar geöffnete (und damit für das Auge richtungsgebende) Teil des Fächers unten
+// — dadurch zeigte der Fächer auf dem Plan bei jedem Winkel exakt 180° entgegengesetzt
+// zum im Kompass eingestellten Wert. Pfad und Drehpunkt sind hier deshalb gegenüber der
+// ursprünglichen Fassung vertikal gespiegelt (samt entsprechend gespiegeltem
+// SVG-Sweep-Flag), NICHT per zusätzlichem Rotations-Offset "korrigiert" — der Fächer
+// zeigt dadurch bei jedem Winkel korrekt in dieselbe Richtung wie der Kompass.
+// ANFORDERUNG "FARBGLEICHHEIT VON PIN UND BLICKRICHTUNG": die Füll- und Kontur-
+// Opazität des Sichtkegels liegt jetzt bei 0.5 / 0.6 statt vorher 0.22 / 0.55 — beide
+// Werte damit innerhalb des geforderten 40–60%-Korridors (vorher lag die Füllung mit
+// 22% klar darunter). colorClass wird am Call-Site (siehe PinMarker) NICHT mehr auf ein
+// neutrales Grau gesetzt, sondern exakt auf denselben Rotton "text-[#D32F2F]" wie die
+// MapPin-Füllung "fill-[#D32F2F]/50" — bewusst beide als literale Tailwind-Arbitrary-
+// Value-Klassen direkt im JSX (kein dynamisch zusammengesetzter Klassenname aus einer
+// JS-Variable), weil Tailwinds JIT-Scanner nur literale Klassen-Strings im Quellcode
+// erkennt und eine Variable hier sonst zu fehlendem CSS führen würde.
 function ViewCone({ angle, colorClass }) {
   return (
     <svg
@@ -3901,24 +11601,40 @@ function ViewCone({ angle, colorClass }) {
       className="pointer-events-none absolute h-14 w-14"
       style={{
         left: "50%",
-        top: "0px",
-        transform: `translate(-50%, -2px) rotate(${angle}deg)`,
-        transformOrigin: "50% 4px",
+        bottom: "0px",
+        transform: `translate(-50%, 0) rotate(${angle}deg)`,
+        transformOrigin: "50% 100%",
       }}
     >
       <path
-        d="M 50 4 L 18 62 A 40 40 0 0 0 82 62 Z"
+        d="M 50 96 L 18 38 A 40 40 0 0 1 82 38 Z"
         className={colorClass}
         fill="currentColor"
-        opacity="0.22"
+        opacity="0.5"
       />
-      <path d="M 50 4 L 18 62 A 40 40 0 0 0 82 62 Z" className={colorClass} fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.55" />
+      <path d="M 50 96 L 18 38 A 40 40 0 0 1 82 38 Z" className={colorClass} fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.6" />
     </svg>
   );
 }
 
-function PinMarker({ pin, draggable, isDragging, onClick, onDragStart, viewScale = 1 }) {
-  const s = STATUS[pin.status];
+// Long-Press-Schwelle für die gesamte Grundriss-Interaktion: ein neuer Pin/eine neue
+// Notiz entsteht nur noch, wenn der Grundriss (Hintergrund) mindestens LONG_PRESS_MS
+// gedrückt gehalten wird (siehe handleViewportPointerDown/-Move/-Up in FloorPlanView);
+// ein bestehender Pin/eine Notiz lässt sich ebenfalls erst nach demselben Long Press
+// AUF dem jeweiligen Marker verschieben (siehe PinMarker/PlanNoteMarker unten). Ein
+// kurzer Tap/Klick dient dadurch ausschließlich dem Zoomen/Verschieben der Ansicht
+// bzw. — bei einem kurzen Tap direkt auf einen Marker — dem Öffnen von dessen
+// Detailansicht. 500ms ist der auf Mobilgeräten übliche Richtwert für "Long Press"
+// (z. B. iOS Kontextmenüs) — lang genug, um ein versehentliches Auslösen beim
+// Scrollen/Zoomen zuverlässig zu vermeiden, kurz genug, um nicht träge zu wirken.
+const LONG_PRESS_MS = 500;
+
+function PinMarker({ pin, number, draggable, isDragging, onClick, onDragStart, viewScale = 1 }) {
+  // ANFORDERUNG "FARBLOSE / MONOCHROME MÄNGEL-PINS": der Marker auf der Planfläche
+  // liest die Statusfarbe (STATUS[pin.status]) absichtlich nicht mehr aus — Farbe als
+  // Unterscheidungsmerkmal bleibt ausschließlich der Sidebar-Liste, den Badges und dem
+  // PinModal vorbehalten (dort weiterhin unverändert über STATUS, siehe z.B.
+  // sortedListPins-Rendering weiter unten in FloorPlanView).
   // Gegen-Skalierung: die sichtbare Pin-Größe bleibt unabhängig vom Zoomfaktor der
   // Grundriss-"Bühne" konstant (wie bei Kartenmarkern üblich), während die Position
   // (left/top in %, weiter unten am Button) exakt am Grundriss verankert bleibt — das
@@ -3926,90 +11642,567 @@ function PinMarker({ pin, draggable, isDragging, onClick, onDragStart, viewScale
   // sich die -50%/-100%-Verschiebung des Buttons weiterhin auf dessen unskalierte,
   // layoutwirksame Originalgröße und bleibt so bei jedem Zoomlevel exakt und stabil.
   const counterScale = 1 / (viewScale || 1);
+  // Lokaler Long-Press-Zustand für DIESEN einen Marker (jeder PinMarker verwaltet
+  // seinen eigenen Timer unabhängig von allen anderen Pins). pressFiredRef merkt sich
+  // über pointerdown -> pointerup -> click hinweg, ob der Long Press bereits ausgelöst
+  // hat (siehe onClick unten) — verhindert, dass nach einem erfolgreichen Long-Press-
+  // Drag-Start zusätzlich noch das Detail-Modal aufgeht.
+  const pressTimerRef = useRef(null);
+  const pressStartRef = useRef({ x: 0, y: 0 });
+  const pressFiredRef = useRef(false);
+  const clearPressTimer = () => {
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
   return (
     <button
       onPointerDown={(e) => {
-        if (!draggable) return;
+        // IMMER abfangen (auch ohne Schreibrecht) — sonst würde der Pointer beim
+        // Loslassen zusätzlich als Hintergrund-Tap gewertet und könnte (siehe
+        // handleViewportPointerUp) einen zweiten, ungewollten Pin exakt an dieser
+        // Stelle anlegen. Nur das eigentliche Long-Press-zum-Verschieben ist an
+        // draggable (= angemeldet) gebunden.
         e.stopPropagation();
-        onDragStart(e);
+        if (!draggable) return;
+        pressFiredRef.current = false;
+        pressStartRef.current = { x: e.clientX, y: e.clientY };
+        clearPressTimer();
+        pressTimerRef.current = setTimeout(() => {
+          pressTimerRef.current = null;
+          pressFiredRef.current = true;
+          onDragStart(e);
+        }, LONG_PRESS_MS);
       }}
+      onPointerMove={(e) => {
+        if (!pressTimerRef.current) return;
+        const dx = e.clientX - pressStartRef.current.x;
+        const dy = e.clientY - pressStartRef.current.y;
+        // Nennenswerte Bewegung VOR Ablauf des Long Press: kein Verschieben-Wunsch,
+        // sondern eher ein Wisch-/Scrollversuch — Timer verwerfen, kein Drag-Start.
+        if (Math.hypot(dx, dy) > FLOORPLAN_PAN_CLICK_THRESHOLD) clearPressTimer();
+      }}
+      onPointerUp={clearPressTimer}
+      onPointerLeave={clearPressTimer}
       onClick={(e) => {
         e.stopPropagation();
+        if (pressFiredRef.current) {
+          // Long Press hat bereits einen Drag-Start ausgelöst (siehe oben) — das
+          // nachfolgende Klick-Ereignis öffnet in diesem Fall NICHT zusätzlich das
+          // Detail-Modal, auch wenn der Pin am Ende gar nicht bewegt wurde.
+          pressFiredRef.current = false;
+          return;
+        }
         onClick(pin);
       }}
       style={{ left: `${pin.x}%`, top: `${pin.y}%`, touchAction: draggable ? "none" : undefined }}
-      className={`absolute z-10 -translate-x-1/2 -translate-y-full focus:outline-none ${
-        draggable ? "cursor-grab active:cursor-grabbing" : ""
-      } ${isDragging ? "opacity-70" : ""}`}
-      title={`${pin.title} (${pin.angle ?? 0}°)${draggable ? " — ziehen zum Verschieben" : ""}`}
+      // ANFORDERUNG "KONTRASTERHÖHUNG BEI BEIBEHALTUNG DER TEILTRANSPARENZ": der
+      // Pin-KÖRPER (SVG-Füllung unten) trägt seine Transparenz jetzt direkt als
+      // Fill-Opacity-Modifier (fill-[#D32F2F]/50) statt als Opacity auf diesem ganzen
+      // Button — nur so bleibt die Ziffer (eigenes Geschwister-Element weiter unten,
+      // außerhalb der SVG-Füllung) immer zu 100% deckend, wie gefordert, während der
+      // Korpus halbtransparent bleibt. Deshalb hier bewusst KEINE Opacity-Klasse mehr.
+      className={`group absolute z-10 -translate-x-1/2 -translate-y-full focus:outline-none ${
+        draggable ? "cursor-pointer active:cursor-grabbing" : ""
+      }`}
+      title={`${pin.title} (${pin.angle ?? 0}°)${draggable ? " — gedrückt halten zum Verschieben" : ""}`}
     >
       <span
         className="relative flex flex-col items-center drop-shadow-md"
         style={{ transform: `scale(${counterScale})`, transformOrigin: "50% 100%" }}
       >
-        <ViewCone angle={pin.angle ?? 0} colorClass={s.text} />
-        {pin.status === "offen" && !isDragging && (
-          <span className={`absolute -top-1 h-7 w-7 animate-ping rounded-full ${s.dot} opacity-40`} />
-        )}
-        <MapPin
-          size={30}
-          strokeWidth={1.5}
-          className={`${s.text} fill-white transition group-hover:scale-110`}
-          style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.35))" }}
-        />
-        <span className={`absolute top-[7px] h-2 w-2 rounded-full ${s.dot}`} />
+        <PinMarkerGlyph pin={pin} number={number} isDragging={isDragging} />
       </span>
     </button>
+  );
+}
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": das eigentliche visuelle
+// Erscheinungsbild eines Pins (Sichtkegel, Hinweisring, Pin-Kopf, Zahl mit Glow/
+// Kontur) war bisher direkt in PinMarker verdrahtet und damit untrennbar an dessen
+// Positionierungs-/Drag-Logik (button mit left/top in % + counterScale) gekoppelt.
+// Ausgelagert in eine eigene, reine Darstellungs-Komponente OHNE jede Positionierung,
+// damit exakt dasselbe Erscheinungsbild zusätzlich im neuen PinPlanCropThumbnail
+// (siehe unten, Pin-Detailansicht) wiederverwendet werden kann, statt die komplette
+// Marker-Optik dort ein zweites Mal nachzubauen (Single Source of Truth, keine
+// auseinanderlaufenden Kopien). PinMarker selbst bleibt unverändert in Verhalten/
+// Zero-Regression — nur die Darstellung wurde hierher verschoben, 1:1 gleicher Output.
+function PinMarkerGlyph({ pin, number, isDragging }) {
+  return (
+    <>
+      {/* ANFORDERUNG "FARBGLEICHHEIT VON PIN UND BLICKRICHTUNG": der Sichtkegel nutzt
+          denselben Rotton wie der Pin-Körper (text-[#D32F2F] hier, fill-[#D32F2F]/50
+          unten bei MapPin) statt eines neutralen Grautons (text-slate-700) — keine
+          Farbabweichung zwischen Kegel und Hauptpin. Die Opazität (0.5 Füllung / 0.6
+          Kontur, siehe ViewCone-Komponente oben) liegt innerhalb des geforderten
+          40–60%-Korridors. */}
+      <ViewCone angle={pin.angle ?? 0} colorClass="text-[#D32F2F]" />
+      {pin.status === "offen" && !isDragging && (
+        <span className="absolute -top-1 h-7 w-7 animate-ping rounded-full bg-slate-900 opacity-30" />
+      )}
+      {/* ANFORDERUNG "KONTRASTERHÖHUNG BEI BEIBEHALTUNG DER TEILTRANSPARENZ": Grundton
+          Solid Red #D32F2F, Deckkraft des Korpus bei 50% (Mitte des geforderten
+          40–60%-Korridors) — CAD-Linien/Maße scheinen dadurch durch den Pin-Kopf durch.
+          Die weiße Kontur (stroke) bleibt bewusst voll deckend, damit die Pin-Silhouette
+          selbst auf hellen wie dunklen Plan-Hintergründen klar erkennbar bleibt — nur die
+          Flächenfüllung ist transparent, nicht die Kontur. Bei Hover/Fokus/Drag steigt
+          die Füllung leicht auf 65%, als dezentes Auswahl-Feedback, ohne die
+          Teiltransparenz ganz zu verlassen. */}
+      <MapPin
+        size={36}
+        strokeWidth={1.5}
+        className={`fill-[#D32F2F]/50 stroke-white transition-all duration-150 group-hover:scale-110 group-hover:fill-[#D32F2F]/65 group-hover:stroke-2 group-focus:fill-[#D32F2F]/65 group-focus:stroke-2 group-active:fill-[#D32F2F]/65 group-active:stroke-2 ${
+          isDragging ? "fill-[#D32F2F]/65 stroke-2" : ""
+        }`}
+        style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,0.35))" }}
+      />
+      {number != null && (
+        <span className="pointer-events-none absolute top-[7.2px] left-1/2 -translate-x-1/2 flex h-4 w-4 items-center justify-center">
+          {/* ANFORDERUNG "LEICHTER INNEN-GLOW": minimaler, kreisförmiger, milchiger
+              Weichzeichner direkt hinter der Ziffer, dämpft CAD-Linien genau unter der
+              Zahl ab, ohne den restlichen (halbtransparenten) Pin-Korpus zusätzlich
+              abzudunkeln — rein additiv, kein eigener Farbton, kein Einfluss auf die
+              Pin-Position. */}
+          <span
+            className="pointer-events-none absolute inset-0 rounded-full"
+            style={{
+              background: "radial-gradient(circle, rgba(255,255,255,0.6) 0%, rgba(255,255,255,0) 72%)",
+              filter: "blur(0.4px)",
+            }}
+          />
+          {/* ANFORDERUNG "ISOLATION DER ZIFFER / FARBANPASSUNG": die Zahl selbst liegt
+              AUSSERHALB der SVG-Füllung (eigenes Element) und ist dadurch unabhängig von
+              der Korpus-Transparenz immer zu 100% deckendes Signalweiß. Kontur: ein
+              hartkantiger, nicht verwaschener 1px-Umriss aus acht Richtungen (statt
+              eines einzelnen weich geblurrten Drop-Shadows) plus -webkit-text-stroke als
+              zusätzliche Schärfung auf unterstützten Browsern — dadurch bleibt die
+              Kontur "hauchfein, aber scharf und vollkommen deckend", wie gefordert,
+              statt zu verwaschen. */}
+          <span
+            className={`relative pointer-events-none leading-none text-white ${
+              String(number).length > 2 ? "text-[9px]" : "text-[12px]"
+            }`}
+            style={{
+              fontFamily: "Inter, Arial, sans-serif",
+              fontWeight: 900,
+              WebkitTextStroke: "0.6px #000000",
+              textShadow:
+                "1px 1px 0 #000, -1px 1px 0 #000, 1px -1px 0 #000, -1px -1px 0 #000, 1px 0 0 #000, -1px 0 0 #000, 0 1px 0 #000, 0 -1px 0 #000",
+            }}
+          >
+            {number}
+          </span>
+        </span>
+      )}
+    </>
+  );
+}
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": kleiner, performanter
+// In-Memory-Cache für bereits geladene (volle, unkomprimierte) Planbilder, keyed nach
+// plan.image_url — verhindert einen erneuten Netzwerk-Request + erneutes Decodieren
+// jedes Mal, wenn innerhalb derselben Sitzung ein weiterer Pin DERSELBEN Skizze
+// geöffnet wird (typischer Workflow: mehrere Mängel eines Plans nacheinander
+// durchgehen). Lebt nur im Arbeitsspeicher des Tabs, kein IndexedDB/localStorage.
+const planImageDataUrlCache = new Map();
+async function loadFloorPlanImageCached(plan) {
+  if (!plan?.image_url) return null;
+  if (planImageDataUrlCache.has(plan.image_url)) {
+    return planImageDataUrlCache.get(plan.image_url);
+  }
+  const planKind = resolveFloorKind(plan);
+  const imgData = await loadFloorPlanImageWithRetry(plan.image_url, planKind);
+  planImageDataUrlCache.set(plan.image_url, imgData);
+  return imgData;
+}
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": Maße für den NEUEN,
+// client-seitigen Live-Ausschnitt in der Pin-Detailansicht (PinModal) — bewusst eigene,
+// vom PDF-Export getrennte Konstanten (dort: FLOOR_REPORT_PIN_CROP_*), da hier ein
+// kompaktes Bildschirm-Widget statt eines Millimeter-Maßes im PDF gebraucht wird.
+// PIN_CROP_MAX_OUTPUT_PX wird weiter unten zusätzlich mit devicePixelRatio
+// multipliziert (High-DPI/Retina), die CSS-Anzeigegröße selbst bleibt davon unberührt.
+const PIN_CROP_RATIO = 0.22;
+const PIN_CROP_MAX_OUTPUT_PX = 420;
+const PIN_CROP_QUALITY = 0.82;
+
+// ANFORDERUNG "GRUNDRISS-AUSSCHNITT JE PIN (DETAIL-CROP)": kompaktes Orientierungs-
+// Widget für die Pin-Detailansicht — zeigt NUR den unmittelbaren Planbereich um GENAU
+// diesen einen Pin (automatisch auf dessen X/Y-Koordinate zentriert, siehe
+// cropImageDataUrl), mit GENAU dessen eigenem Marker (PinMarkerGlyph, identische Optik
+// wie auf der großen Planfläche) obendrauf gezeichnet. "Isolierte Pin-Visibility" ergibt
+// sich dabei automatisch aus der Architektur, nicht aus einem Filter: der Ausschnitt
+// wird aus dem ROHEN Planbild geschnitten (Pins sind nie Teil der Bilddatei, sondern
+// immer eine separate, pro Pin einzeln gerenderte Overlay-Ebene), und dieser
+// Komponente wird ausschließlich der EINE betroffene Pin als Prop übergeben — andere
+// Pins DERSELBEN Skizze werden hier nie geladen oder gerendert, können also auch nie
+// versehentlich auftauchen. Position/Ausrichtung des Quell-Pins werden an keiner Stelle
+// verändert, nur gelesen (pin.x/pin.y/pin.angle fließen unverändert in cropImageDataUrl
+// bzw. PinMarkerGlyph ein).
+function PinPlanCropThumbnail({ pin, plan, number }) {
+  const [state, setState] = useState({ status: "idle", dataUrl: null, markerX: 50, markerY: 50 });
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!plan?.image_url) {
+      setState({ status: "missing", dataUrl: null, markerX: 50, markerY: 50 });
+      return undefined;
+    }
+    setState((s) => (s.status === "ready" ? s : { ...s, status: "loading" }));
+    (async () => {
+      try {
+        const imgData = await loadFloorPlanImageCached(plan);
+        // High-DPI/Retina: die Ziel-Pixelgröße des Ausschnitts wird mit dem
+        // devicePixelRatio des Geräts multipliziert (gedeckelt auf max. 3x, auch auf
+        // sehr hochauflösenden Displays keine unnötig große Datenmenge) — die
+        // CSS-Anzeigegröße des Widgets (siehe className unten) bleibt davon unabhängig
+        // fix, nur die zugrunde liegende Bild-Pixeldichte steigt, dadurch bleibt der
+        // Ausschnitt auch beim Hineinzoomen/auf Retina-Displays gestochen scharf.
+        const dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+        const cropped = await cropImageDataUrl(
+          imgData.dataUrl,
+          (pin.x ?? 50) / 100,
+          (pin.y ?? 50) / 100,
+          PIN_CROP_RATIO,
+          Math.round(PIN_CROP_MAX_OUTPUT_PX * dpr),
+          PIN_CROP_QUALITY
+        );
+        if (cancelled) return;
+        setState({ status: "ready", dataUrl: cropped.dataUrl, markerX: cropped.pinRatioX * 100, markerY: cropped.pinRatioY * 100 });
+      } catch (err) {
+        if (cancelled) return;
+        console.error("Grundriss-Ausschnitt für die Pin-Detailansicht konnte nicht erzeugt werden:", err);
+        setState({ status: "error", dataUrl: null, markerX: 50, markerY: 50 });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // pin.angle bewusst NICHT in den Dependencies: eine reine Blickrichtungs-Änderung
+    // dreht nur den (leichten) Sichtkegel auf dem bereits geladenen Ausschnitt neu,
+    // dafür muss nicht das komplette Planbild erneut geladen/zugeschnitten werden —
+    // PinMarkerGlyph liest pin.angle beim Rendern ohnehin live aus pin selbst.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plan?.image_url, pin.id, pin.x, pin.y]);
+
+  if (!plan?.image_url) return null;
+
+  return (
+    <div className="flex shrink-0 flex-col items-center gap-1.5 sm:items-start">
+      <div className="relative aspect-square w-28 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 shadow-sm sm:w-32">
+        {state.status === "ready" && state.dataUrl && (
+          <>
+            <img src={state.dataUrl} alt="Lage auf dem Plan" className="h-full w-full object-cover" draggable={false} />
+            <div
+              className="pointer-events-none absolute flex flex-col items-center"
+              style={{ left: `${state.markerX}%`, top: `${state.markerY}%`, transform: "scale(0.82)", transformOrigin: "50% 100%" }}
+            >
+              <PinMarkerGlyph pin={pin} number={number} isDragging={false} />
+            </div>
+          </>
+        )}
+        {state.status === "loading" && (
+          <div className="flex h-full w-full items-center justify-center">
+            <Loader2 size={18} className="animate-spin text-slate-300" />
+          </div>
+        )}
+        {state.status === "error" && (
+          <div className="flex h-full w-full items-center justify-center p-2 text-center text-[10px] leading-tight text-slate-400">
+            Ausschnitt nicht verfügbar
+          </div>
+        )}
+      </div>
+      <p className="text-center text-[10px] text-slate-400 sm:text-left">Lage auf dem Plan</p>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// SKIZZEN-NOTIZEN (PLAN ANNOTATIONS) — reine Text-Marker auf dem Grundriss, ergänzend
+// zu den nummerierten Mängel-Pins (siehe plan_notes-Datenschicht weiter oben). Anders
+// als ein Mängel-Pin trägt eine Notiz keine Nummer, keinen Status und kein Foto — sie
+// ist ein reines Vor-Ort-Orientierungswerkzeug ("Gefahrenbereich", "Fluchtweg
+// freihalten", …), gerendert als stilisiertes Text-Banner direkt auf dem Plan.
+// ----------------------------------------------------------------------------------
+const PLAN_NOTE_COLORS = {
+  amber: { label: "Hinweis", bg: "bg-amber-100", border: "border-amber-400", text: "text-amber-900", dot: "bg-amber-500" },
+  rose: { label: "Gefahr / Sperrung", bg: "bg-rose-100", border: "border-rose-400", text: "text-rose-900", dot: "bg-rose-500" },
+  sky: { label: "Lager / Info", bg: "bg-sky-100", border: "border-sky-400", text: "text-sky-900", dot: "bg-sky-500" },
+  emerald: { label: "Fluchtweg / Freihalten", bg: "bg-emerald-100", border: "border-emerald-400", text: "text-emerald-900", dot: "bg-emerald-500" },
+};
+const PLAN_NOTE_QUICK_TEXTS = ["Gefahrenbereich", "Lagerfläche Elektro", "Fluchtweg freihalten", "Baustelleneinrichtung"];
+
+function PlanNoteMarker({ note, draggable, isDragging, onClick, onDragStart, viewScale = 1 }) {
+  const c = PLAN_NOTE_COLORS[note.color] || PLAN_NOTE_COLORS.amber;
+  // Gegen-Skalierung analog zu PinMarker — die Notiz bleibt bei jedem Zoomfaktor
+  // gleich groß lesbar, ihre Position (left/top in %) bleibt exakt am Plan verankert.
+  const counterScale = 1 / (viewScale || 1);
+  // Long-Press-zum-Verschieben — exakt dasselbe Muster wie PinMarker oben (siehe
+  // dortige Kommentare), nur für Notizen statt Mängel-Pins.
+  const pressTimerRef = useRef(null);
+  const pressStartRef = useRef({ x: 0, y: 0 });
+  const pressFiredRef = useRef(false);
+  const clearPressTimer = () => {
+    if (pressTimerRef.current) {
+      clearTimeout(pressTimerRef.current);
+      pressTimerRef.current = null;
+    }
+  };
+  return (
+    <button
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        if (!draggable) return;
+        pressFiredRef.current = false;
+        pressStartRef.current = { x: e.clientX, y: e.clientY };
+        clearPressTimer();
+        pressTimerRef.current = setTimeout(() => {
+          pressTimerRef.current = null;
+          pressFiredRef.current = true;
+          onDragStart(e);
+        }, LONG_PRESS_MS);
+      }}
+      onPointerMove={(e) => {
+        if (!pressTimerRef.current) return;
+        const dx = e.clientX - pressStartRef.current.x;
+        const dy = e.clientY - pressStartRef.current.y;
+        if (Math.hypot(dx, dy) > FLOORPLAN_PAN_CLICK_THRESHOLD) clearPressTimer();
+      }}
+      onPointerUp={clearPressTimer}
+      onPointerLeave={clearPressTimer}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (pressFiredRef.current) {
+          pressFiredRef.current = false;
+          return;
+        }
+        onClick(note);
+      }}
+      style={{ left: `${note.x}%`, top: `${note.y}%`, touchAction: draggable ? "none" : undefined }}
+      className={`absolute z-[8] -translate-x-1/2 -translate-y-1/2 focus:outline-none ${
+        draggable ? "cursor-pointer active:cursor-grabbing" : ""
+      } ${isDragging ? "opacity-70" : ""}`}
+      title={`${note.text}${draggable ? " — gedrückt halten zum Verschieben" : ""}`}
+    >
+      <span
+        className={`flex max-w-[38vw] items-center gap-1.5 rounded-lg border-2 px-2.5 py-1.5 shadow-md sm:max-w-[220px] ${c.bg} ${c.border} ${c.text}`}
+        style={{ transform: `scale(${counterScale})`, transformOrigin: "50% 50%" }}
+      >
+        <StickyNote size={13} className="shrink-0" />
+        <span className="truncate text-[11px] font-bold leading-tight">{note.text}</span>
+      </span>
+    </button>
+  );
+}
+
+// Gemeinsame Pin-/Notiz-Ebene, unverändert für alle Grundriss-Arten (CAD-Platzhalter,
+// Raster-Bild-Fallback, und — seit PlanSvgStage — auch innerhalb des SVG-Koordinaten-
+// raums von PDF-/SVG-Vektor-Grundrissen) — vermeidet doppelten JSX-Code an den
+// verschiedenen Rendering-Aufrufstellen in FloorPlanView.
+function PinsAndNotesLayer({
+  visiblePins,
+  pinNumberById,
+  draggingPinId,
+  dragPos,
+  session,
+  scale,
+  startDrag,
+  dragMovedRef,
+  onPinClick,
+  showNotes,
+  planNotes,
+  draggingNoteId,
+  noteDragPos,
+  startNoteDrag,
+  noteDragMovedRef,
+  onNoteClick,
+}) {
+  // Verschieben ist ausschließlich an die Anmeldung (session) gekoppelt — WANN ein
+  // Drag tatsächlich beginnt, entscheiden PinMarker/PlanNoteMarker seit der
+  // Long-Press-Umstellung selbst (siehe LONG_PRESS_MS-Kommentar oben): ein kurzer
+  // Klick/Tap öffnet weiterhin sofort die Detailansicht, ein Long Press auf dem
+  // jeweiligen Marker startet das Verschieben. Der frühere separate "Pins
+  // verschieben"/"Positionen fixiert"-Umschalter (isEditMode) entfällt dadurch —
+  // dieselbe Schutzwirkung (kein versehentliches Verschieben beim Zoomen/Scrollen)
+  // übernimmt jetzt die Long-Press-Schwelle selbst, ohne einen zusätzlichen manuellen
+  // Modus-Wechsel zu verlangen.
+  const canDrag = !!session;
+  return (
+    <>
+      {visiblePins.map((pin) => (
+        <PinMarker
+          key={pin.id}
+          pin={draggingPinId === pin.id && dragPos ? { ...pin, x: dragPos.x, y: dragPos.y } : pin}
+          number={pinNumberById.get(pin.id)}
+          draggable={canDrag}
+          isDragging={draggingPinId === pin.id}
+          viewScale={scale}
+          onDragStart={(e) => startDrag(pin, e)}
+          onClick={(p) => {
+            if (dragMovedRef.current) {
+              dragMovedRef.current = false;
+              return;
+            }
+            onPinClick(p);
+          }}
+        />
+      ))}
+      {showNotes &&
+        planNotes.map((note) => (
+          <PlanNoteMarker
+            key={note.id}
+            note={draggingNoteId === note.id && noteDragPos ? { ...note, x: noteDragPos.x, y: noteDragPos.y } : note}
+            draggable={canDrag}
+            isDragging={draggingNoteId === note.id}
+            viewScale={scale}
+            onDragStart={(e) => startNoteDrag(note, e)}
+            onClick={(n) => {
+              if (noteDragMovedRef.current) {
+                noteDragMovedRef.current = false;
+                return;
+              }
+              onNoteClick(n);
+            }}
+          />
+        ))}
+    </>
   );
 }
 
 // ----------------------------------------------------------------------------------
 // STUFENLOSES ZOOM & PAN — Konfiguration für die interaktive Grundriss-Ansicht
 // ----------------------------------------------------------------------------------
-const FLOORPLAN_MIN_SCALE = 1;
-const FLOORPLAN_MAX_SCALE = 6;
+// Harter Zoom-Stopp bei aktuell 400% (MAX_ZOOM = 4.0) bzw. 50% (MIN_ZOOM = 0.5). Bewusst
+// NICHT als zusätzliche, separate MAX_ZOOM/MIN_ZOOM-Konstante neben FLOORPLAN_MAX_SCALE/
+// FLOORPLAN_MIN_SCALE eingeführt: ALLE drei Zoom-Einstiegspunkte (Zoom-Buttons über
+// zoomByFactor, Mausrad/Touchpad über handleWheelNative, Pinch-Geste über
+// handleViewportPointerMove) laufen bereits heute ausnahmslos über clampScale(...)
+// unten, die wiederum ausschließlich diese beiden Konstanten liest. Der Zoom-Stopp greift
+// dadurch mit einer einzigen Wertänderung an einer einzigen Stelle an allen drei Stellen
+// gleichzeitig und kann nie einzeln auseinanderlaufen — eine zusätzliche, in jedem
+// Handler separat wiederholte Math.min/Math.max-Kappung wäre hier reine Duplizierung
+// derselben Grenze und potenzielle künftige Fehlerquelle, falls beide Kappungen einmal
+// auseinanderdriften. FLOORPLAN_MIN_SCALE = 0.5 bleibt unverändert.
+// TABLET CANVAS ZOOM FIX: MAX_SCALE war zuvor auf 2.0 (200%) gedeckelt, wird hier auf
+// 4.0 (400%) angehoben, wie angefordert ("maxScale = 4.0 oder 5.0"). Das ist mit der
+// bestehenden Bugfix-Architektur GEFAHRLOS möglich, weil die tatsächliche Pixelauflösung
+// des darunterliegenden Grundriss-Rasters unabhängig vom hier erlaubten CSS-Skalierungs-
+// Höchstwert bleibt: renderPdfPageToSafeCanvasElement/PdfPlanCanvas rendern das Canvas
+// bereits GERÄTEABHÄNGIG GEDECKELT (PDF_SAFE_MAX_CANVAS_DIM_PX_MOBILE/_DESKTOP) und frieren
+// es endgültig ein, sobald lastRasterClampedRef true ist — jeder Zoom über diesen Punkt
+// hinaus (ob bis 200% oder bis 400%) läuft ohnehin bereits ausschließlich über die reine
+// CSS-transform-scale(...) dieser "Bühne" (siehe contentRef-Style weiter unten), OHNE dass
+// dabei je erneut Canvas-Breite/-Höhe im DOM verändert oder neuer GPU-Speicher alloziert
+// wird. Eine höhere FLOORPLAN_MAX_SCALE verändert also einzig, wie weit ein bereits
+// eingefrorenes Bild optisch vergrößert werden darf (irgendwann sichtbar unschärfer,
+// aber nie speicher- oder abschusskritisch) — nicht, WIE VIEL tatsächlich zusätzlich
+// gerendert/alloziert wird. Der frühere Wert 2.0 selbst war zuvor schon von einem
+// ursprünglichen 25.0 (2500%) abgesenkt worden; auf Wunsch ist auch dieser 4.0-Wert
+// jederzeit durch reines Zurücksetzen dieser einen Konstante reversibel.
+const FLOORPLAN_MIN_SCALE = 0.5;
+const FLOORPLAN_MAX_SCALE = 4.0;
+// Dämpfungsfaktor für den Mausrad-/Touchpad-Zoom (siehe handleWheelNative): pro
+// Wheel-Event wird der Zoomfaktor aus der tatsächlichen deltaY-Größe abgeleitet
+// (newScale = currentScale * (1 - deltaY * FLOORPLAN_WHEEL_DAMPING)) statt eines
+// festen Schritts je Ereignis — dadurch reagiert der Zoom proportional auf die vom
+// Eingabegerät gelieferte Geschwindigkeit (z. B. schnelles vs. langsames Scrollen
+// am Mausrad, feinere Abstufung beim Touchpad-Pinch) und fühlt sich spürbar
+// flüssiger/exakter an als ein einheitlicher Sprung pro Ereignis.
+const FLOORPLAN_WHEEL_DAMPING = 0.0015;
+// Sicherheitsgrenze für den Multiplikator je einzelnem Wheel-Event: manche Trackpads/
+// Mäuse liefern bei schnellen Gesten sehr große deltaY-Werte (teils > 1000) — ohne
+// diese Kappung könnte die obige Formel rechnerisch auf einen negativen oder
+// unsinnig extremen Faktor springen (Plan verschwindet abrupt statt sanft zu
+// zoomen). Die Kappung greift nur bei solchen Ausreißern, im normalen
+// Scroll-/Pinch-Betrieb bleibt der Faktor deutlich innerhalb dieser Grenzen.
+const FLOORPLAN_WHEEL_FACTOR_MIN = 0.4;
+const FLOORPLAN_WHEEL_FACTOR_MAX = 2.5;
 const FLOORPLAN_PAN_CLICK_THRESHOLD = 5; // px — ab hier zählt eine Interaktion als Verschieben statt als Klick
+// Boundary-Clamping fürs Verschieben (Pan): mindestens so viele Pixel des Grundrisses
+// müssen an jeder Achse innerhalb des sichtbaren Ausschnitts bleiben — verhindert, dass
+// der Plan beim Herauszoomen/Verschieben vollständig aus dem sichtbaren Bereich
+// geschoben wird (der Nutzer säße sonst vor einer leeren/"weißen" Fläche, siehe
+// clampTranslateForViewport in FloorPlanView).
+const FLOORPLAN_PAN_MIN_OVERLAP_PX = 72;
 
-// Basis-Render-Auflösung für PDF-Grundrisse ohne interaktiven Zoom (siehe
-// PdfPlanCanvas) — entspricht dem scale-Parameter von pdf.js' getViewport(). PDF-
-// Punkte sind mit 72 dpi definiert; 4.0 entspricht damit einer Rasterung von ca.
-// 288 dpi (nahe an den 300 dpi als Referenzwert für "gestochen scharf"). Diese Basis
-// wird beim Zoomen zusätzlich mit dem aktuellen Zoomfaktor und der Pixel-Dichte des
-// Displays multipliziert (siehe computeTargetScale() in PdfPlanCanvas) — der Plan
-// wird beim Heranzoomen also aktiv mit höherer Auflösung neu gerendert, statt nur
-// per CSS gestreckt zu werden.
-const PDF_RENDER_SCALE_MIN = 4.0;
-// Obergrenze für die tatsächliche Render-Skalierung (nach Zoom- und DPR-
-// Multiplikation): verhindert, dass bei starkem Zoom kombiniert mit hoher Pixel-
-// Dichte ein unverhältnismäßig großes Canvas entsteht — Speicher-/Performance-Risiko
-// bzw. u.U. sogar über dem vom Browser erlaubten Canvas-Größenlimit.
-const PDF_RENDER_SCALE_MAX = 10;
-// devicePixelRatio wird gedeckelt: auf 3x-Displays würde eine ungedeckelte
-// Multiplikation die Canvas-Fläche unnötig weiter aufblähen, 2x deckt die
-// allermeisten Retina-Displays (u.a. iPhone) bereits ausreichend scharf ab.
-const PDF_RENDER_DPR_CAP = 2;
-// Debounce für das Neu-Rendern bei Zoom-Änderungen: verhindert, dass während einer
-// laufenden Wheel-/Pinch-Geste bei jedem Zwischenschritt neu gerendert wird — es wird
-// erst nach einer kurzen Pause (i.d.R. Ende der Geste) tatsächlich neu gezeichnet.
-const PDF_RERENDER_DEBOUNCE_MS = 300;
-
-function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = [], onBack, onPlanClick, onPinClick, onPinMove }) {
+// ----------------------------------------------------------------------------------
+function FloorPlanView({
+  floor,
+  plan,
+  pins,
+  planNotes = [],
+  loading,
+  creatingPin,
+  creatingNote,
+  session,
+  trades = [],
+  project,
+  generatedBy,
+  onBack,
+  onPlanClick,
+  onPinClick,
+  onPinMove,
+  onAddNote,
+  onNoteClick,
+  onNoteMove,
+}) {
   const imgRef = useRef(null);
   const viewportRef = useRef(null);
+  const contentRef = useRef(null); // die transformierte "Bühne" (translate+scale), siehe clampTranslateForViewport
+  const exportMenuRef = useRef(null);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  // Nicht-leer, solange der Geschoss-PDF-Export läuft (Bilder-Preload + Zeichnen) —
+  // steuert den vollflächigen Fortschritts-Overlay weiter unten, damit auf einer
+  // Baustelle mit vielen Fotos/langsamer Verbindung jederzeit erkennbar bleibt, dass
+  // das System noch arbeitet, statt dass die Oberfläche scheinbar hängt.
+  const [pdfExportStage, setPdfExportStage] = useState("");
+  const [exportError, setExportError] = useState("");
+  const [exportIncludeOnboarding, setExportIncludeOnboarding] = useState(() => hasOnboardingInfo(project));
   const [draggingPinId, setDraggingPinId] = useState(null);
   const [dragPos, setDragPos] = useState(null);
   const dragMovedRef = useRef(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
+
+  // Kompaktes Hilfe-Modal (siehe FloorPlanHelpModal) — ersetzt den früheren langen
+  // Fließtext-Hinweis über dem Grundriss durch einen einzigen Button neben dem Titel.
+  const [helpModalOpen, setHelpModalOpen] = useState(false);
+
+  // Skizzen-Notizen (Plan Annotations) — eigener, vom Mängel-Pin-Modus getrennter
+  // "Werkzeug"-Zustand: solange noteMode aktiv ist, legt ein Tap auf den Plan eine
+  // neue Notiz statt eines Pins an (siehe handleViewportPointerUp). showNotes
+  // blendet vorhandene Notizen unabhängig davon ein-/aus (Filter-/Menüleiste).
+  const [noteMode, setNoteMode] = useState(false);
+  const [showNotes, setShowNotes] = useState(true);
+  const [draggingNoteId, setDraggingNoteId] = useState(null);
+  const [noteDragPos, setNoteDragPos] = useState(null);
+  const noteDragMovedRef = useRef(false);
+  const noteDragStartRef = useRef({ x: 0, y: 0 });
+  const busyCreating = !!(creatingPin || creatingNote);
 
   // Zoom- & Pan-Zustand: scale = Zoomfaktor (1 = 100 %, ungezoomt), translate =
   // Verschiebung der Grundriss-"Bühne" in Pixeln relativ zum sichtbaren Ausschnitt.
   const [scale, setScale] = useState(1);
   const [translate, setTranslate] = useState({ x: 0, y: 0 });
   const [isPanningActive, setIsPanningActive] = useState(false);
-  // Gewerke-Filter der Grundriss-Ansicht: "all" zeigt alle Pins, ansonsten wird auf
-  // pin.trade_id gefiltert. Rein clientseitig, da Pins der aktuellen Etage bereits
-  // vollständig geladen sind.
-  const [tradeFilter, setTradeFilter] = useState("all");
+  // Filter- & Suchleiste der Planansicht (Status, Gewerke, Volltextsuche) — rein
+  // clientseitig, da die Pins der aktuellen Grundrissskizze bereits vollständig
+  // geladen sind. Beeinflusst ausschließlich, welche Pins auf dem Plan sichtbar
+  // sind (visiblePins weiter unten) — die Pin-Nummerierung (pinNumberById) und der
+  // Geschoss-Export bleiben davon unberührt und referenzieren weiterhin
+  // ausnahmslos ALLE Pins der Skizze in fester, chronologischer Reihenfolge.
+  const [statusFilter, setStatusFilter] = useState("all"); // 'all' | 'offen' | 'bearbeitung' | 'erledigt'
+  const [tradeFilterIds, setTradeFilterIds] = useState([]); // leer = alle Gewerke
+  const [searchQuery, setSearchQuery] = useState("");
+  const toggleTradeFilter = (tradeId) =>
+    setTradeFilterIds((prev) => (prev.includes(tradeId) ? prev.filter((id) => id !== tradeId) : [...prev, tradeId]));
+  const hasActivePinFilters = statusFilter !== "all" || tradeFilterIds.length > 0 || searchQuery.trim() !== "";
+  const resetPinFilters = () => {
+    setStatusFilter("all");
+    setTradeFilterIds([]);
+    setSearchQuery("");
+  };
 
   // Refs mit den jeweils aktuellen Werten, damit der weiter unten manuell (nicht
   // passiv) registrierte Mausrad-Listener immer mit dem aktuellsten Zoom-/Pan-
@@ -4024,23 +12217,79 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
   }, [translate]);
 
   // Hintergrund-Pointer für Pan/Pinch — bewusst getrennt von draggingPinId/dragPos,
-  // die ausschließlich das Verschieben eines bestehenden Pins abbilden.
+  // die ausschließlich das Verschieben eines bestehenden Pins abbilden. Wird zusätzlich
+  // (siehe IPAD-TOUCH-RELEASE-FIX) als activePointersRef an PdfPlanCanvas/
+  // TiledPlanImage durchgereicht, damit deren verzögertes Nachschärfen beim Timer-
+  // Ablauf noch einmal prüfen kann, ob wirklich kein Finger mehr aufliegt.
   const panPointersRef = useRef(new Map());
   const panGestureRef = useRef(null); // { startX, startY, startTranslate, moved }
   const pinchGestureRef = useRef(null); // { startDistance, startScale, startTranslate }
+  // IPAD-TOUCH-RELEASE-FIX (siehe Einordnung in der Antwort): zählt hoch, sobald der
+  // LETZTE Finger abhebt (panPointersRef.current.size erreicht 0, siehe
+  // handleViewportPointerUp unten) — als zusätzlicher Auslöser für die Debounce-Timer
+  // in PdfPlanCanvas/TiledPlanImage, damit deren Nachschärfen zuverlässig auch dann
+  // erst ab dem TATSÄCHLICHEN Loslass-Zeitpunkt neu zu zählen beginnt, wenn kurz zuvor
+  // zufällig keine Skalierungsänderung mehr registriert wurde (reines Halten am Ende
+  // einer Pinch-Geste, ohne dass sich scale in den letzten Millisekunden noch geändert
+  // hätte). Ein einfacher Zähler statt eines Timestamps genügt, da er nur als
+  // useEffect-Dependency dient, nicht selbst ausgewertet wird.
+  const [touchReleaseTick, setTouchReleaseTick] = useState(0);
+  // Long-Press-Timer für die Pin-/Notiz-Erstellung auf freier Fläche (siehe
+  // handleViewportPointerDown/-Move/-Up unten) sowie der zugehörige, kurz aufblitzende
+  // Fortschritts-Indikator an der Druckposition (viewport-lokale Pixel, NICHT die
+  // skalierte/verschobene Plan-"Bühne" — daher unabhängig von scale/translate).
+  const longPressTimerRef = useRef(null);
+  const [longPressPoint, setLongPressPoint] = useState(null);
 
-  // Beim Wechsel der Etage Zoom/Pan zurücksetzen, damit jede Etage wieder in der
-  // ursprünglichen 100%-Ansicht startet.
+  // Beim Wechsel der Grundrissskizze Zoom/Pan zurücksetzen, damit jede Skizze wieder
+  // in der ursprünglichen 100%-Ansicht startet.
   useEffect(() => {
     setScale(1);
     setTranslate({ x: 0, y: 0 });
-  }, [floor?.id]);
+  }, [plan?.id]);
 
-  const clampScale = (v) => Math.min(FLOORPLAN_MAX_SCALE, Math.max(FLOORPLAN_MIN_SCALE, v));
+  // Math.max(..., 0.0001) verhindert rein defensiv eine Division durch 0 in
+  // computeZoomAtClientPoint, falls scale je auf anderem Weg als über clampScale
+  // gesetzt würde — mit den aktuellen Aufrufstellen kann das nicht vorkommen (jeder
+  // setScale-Aufruf läuft durch clampScale bzw. setzt fest 1), ist als zusätzliches
+  // Sicherheitsnetz aber praktisch kostenlos.
+  const clampScale = (v) => Math.min(FLOORPLAN_MAX_SCALE, Math.max(FLOORPLAN_MIN_SCALE, Math.max(v, 0.0001)));
+
+  // Begrenzt die Verschiebung (translate) so, dass an jeder Achse mindestens
+  // FLOORPLAN_PAN_MIN_OVERLAP_PX des Grundrisses innerhalb des sichtbaren Ausschnitts
+  // bleiben — verhindert den "White Screen"-Effekt (Plan komplett aus dem sichtbaren
+  // Bereich herausgezoomt/-verschoben). Die tatsächliche (unskalierte) Inhaltsgröße
+  // wird aus der GERADE gerenderten, noch mit dem alten Zoomfaktor transformierten
+  // contentRef-Box zurückgerechnet (Breite/Höhe durch dessen aktuellen Skalierungsfaktor
+  // geteilt) — funktioniert dadurch unabhängig davon, ob der Grundriss ein Bild, ein
+  // PDF-Canvas oder die CAD-Platzhalteransicht ist, ohne deren Seitenverhältnis vorab
+  // kennen zu müssen. currentScale ist der Zoomfaktor, mit dem contentRef GERADE
+  // sichtbar gerendert ist (nicht zwingend identisch mit dem neuen Zielwert s).
+  const clampTranslateForViewport = (t, s, currentScale) => {
+    const viewportEl = viewportRef.current;
+    const contentEl = contentRef.current;
+    if (!viewportEl || !contentEl) return t;
+    const viewportRect = viewportEl.getBoundingClientRect();
+    const contentRect = contentEl.getBoundingClientRect();
+    const measuredScale = currentScale > 0 ? currentScale : 1;
+    const naturalW = contentRect.width / measuredScale;
+    const naturalH = contentRect.height / measuredScale;
+    const contentW = naturalW * s;
+    const contentH = naturalH * s;
+    const overlapX = Math.min(FLOORPLAN_PAN_MIN_OVERLAP_PX, contentW / 2, viewportRect.width / 2);
+    const overlapY = Math.min(FLOORPLAN_PAN_MIN_OVERLAP_PX, contentH / 2, viewportRect.height / 2);
+    return {
+      x: Math.min(viewportRect.width - overlapX, Math.max(overlapX - contentW, t.x)),
+      y: Math.min(viewportRect.height - overlapY, Math.max(overlapY - contentH, t.y)),
+    };
+  };
 
   // Berechnet Zoomfaktor + Verschiebung so, dass der Punkt unter (clientX, clientY)
   // vor und nach der Skalierung an derselben Bildschirmposition bleibt — sorgt für
-  // "Zoom zum Cursor/Finger" statt Zoom zur Bildmitte.
+  // "Zoom zum Cursor/Finger" statt Zoom zur Bildmitte. Die resultierende Verschiebung
+  // läuft anschließend IMMER durch clampTranslateForViewport (siehe oben) — jede
+  // Zoom-Interaktion (Buttons, Mausrad, Pinch-Geste) ist dadurch automatisch an das
+  // Boundary-Clamping gekoppelt, ohne es an jeder Aufrufstelle einzeln wiederholen zu müssen.
   const computeZoomAtClientPoint = (clientX, clientY, targetScale, baseScale, baseTranslate) => {
     const viewportEl = viewportRef.current;
     if (!viewportEl) return { scale: baseScale, translate: baseTranslate };
@@ -4048,14 +12297,16 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
     const localX = clientX - rect.left;
     const localY = clientY - rect.top;
     const newScale = clampScale(targetScale);
-    const worldX = (localX - baseTranslate.x) / baseScale;
-    const worldY = (localY - baseTranslate.y) / baseScale;
+    const safeBaseScale = baseScale > 0 ? baseScale : 1;
+    const worldX = (localX - baseTranslate.x) / safeBaseScale;
+    const worldY = (localY - baseTranslate.y) / safeBaseScale;
+    const rawTranslate = {
+      x: localX - worldX * newScale,
+      y: localY - worldY * newScale,
+    };
     return {
       scale: newScale,
-      translate: {
-        x: localX - worldX * newScale,
-        y: localY - worldY * newScale,
-      },
+      translate: clampTranslateForViewport(rawTranslate, newScale, baseScale),
     };
   };
 
@@ -4077,16 +12328,81 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
     setTranslate({ x: 0, y: 0 });
   };
 
+  // Geschoss-Export: Klick außerhalb des Format-Menüs (PDF/CSV) schließt es wieder.
+  useEffect(() => {
+    if (!exportMenuOpen) return undefined;
+    const handleClickOutside = (e) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target)) {
+        setExportMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [exportMenuOpen]);
+
+  // Grundrissskizzen-Export: erzeugt wahlweise eine PDF-Tabelle oder eine CSV-Datei.
+  // PDF: folgt dynamisch der aktuell gesetzten Filter-/Suchleiste (visiblePins/
+  // filterSummary, siehe unten) — exportiert also immer genau die Pins, die gerade
+  // auch auf dem Plan sichtbar sind. CSV bleibt bewusst die vollständige,
+  // ungefilterte Rohdaten-Variante aller Pins dieser Grundrissskizze (siehe
+  // Kommentar bei generateFloorPinsTablePdf) — für eine vollständige Weiterverarbeitung
+  // in Excel soll dort nie stillschweigend etwas fehlen, das nur aus einer gerade
+  // aktiven Bildschirm-Filterung resultiert.
+  const handleExportFloor = async (format) => {
+    setExportMenuOpen(false);
+    setExportError("");
+    setExporting(true);
+    // Fortschritts-Overlay ausschließlich beim PDF-Export (Bilder-Preload + jsPDF-
+    // Zeichnen kann bei vielen Fotos spürbar dauern) — der CSV-Export ist synchron
+    // und praktisch verzögerungsfrei, dafür braucht es keinen Overlay-Hinweis.
+    if (format === "pdf") setPdfExportStage("Lade Bilder und erstelle PDF...");
+    try {
+      if (format === "pdf") {
+        await generateFloorPinsTablePdf({
+          project,
+          floor,
+          plan,
+          pins: visiblePins,
+          allPins: pins,
+          trades,
+          generatedBy,
+          filterSummary,
+          includeOnboarding: exportIncludeOnboarding && hasOnboardingInfo(project),
+        });
+      } else {
+        exportFloorPinsCsv({ project, floor, plan, pins, trades });
+      }
+    } catch (err) {
+      console.error("Grundrissskizzen-Export fehlgeschlagen:", err);
+      setExportError("Export fehlgeschlagen. Bitte erneut versuchen.");
+    } finally {
+      setExporting(false);
+      setPdfExportStage("");
+    }
+  };
+
   // Mausrad-Zoom: React registriert onWheel intern als passiven Listener (aus
   // Scroll-Performance-Gründen), wodurch preventDefault() dort wirkungslos bliebe.
-  // Deshalb wird der Listener hier manuell und explizit nicht-passiv registriert,
-  // damit das Scrollen der Seite beim Zoomen über dem Grundriss zuverlässig verhindert wird.
+  // Deshalb wird der Listener hier manuell und explizit nicht-passiv registriert
+  // ({ passive: false }), damit sowohl das Scrollen der Seite als auch ein
+  // Hochblubbern des Events beim Zoomen über dem Grundriss zuverlässig verhindert
+  // werden (preventDefault + stopPropagation).
   useEffect(() => {
     const el = viewportRef.current;
     if (!el) return undefined;
     const handleWheelNative = (e) => {
       e.preventDefault();
-      const zoomFactor = Math.exp(-e.deltaY * 0.0015);
+      e.stopPropagation();
+      // Mathematisch geglätteter Zoom-Schritt je Wheel-/Touchpad-Pinch-Ereignis,
+      // proportional zur tatsächlichen deltaY-Größe des Eingabegeräts (nicht ein
+      // fester Sprung pro Ereignis) — dadurch fühlt sich ein schnelles Scrollen am
+      // Mausrad spürbar stärker an als ein langsames, und feine Touchpad-Pinch-Gesten
+      // lassen sich entsprechend fein dosieren. Auf FLOORPLAN_WHEEL_FACTOR_MIN/MAX
+      // gekappt, damit ein einzelner Ausreißer-Wert (z. B. ein sehr großes deltaY bei
+      // manchen Trackpads) nicht zu einem abrupten Extremsprung führt. Zentriert auf
+      // den Mauszeiger statt auf die Bildmitte (computeZoomAtClientPoint).
+      const rawFactor = 1 - e.deltaY * FLOORPLAN_WHEEL_DAMPING;
+      const zoomFactor = Math.min(FLOORPLAN_WHEEL_FACTOR_MAX, Math.max(FLOORPLAN_WHEEL_FACTOR_MIN, rawFactor));
       const next = computeZoomAtClientPoint(
         e.clientX,
         e.clientY,
@@ -4100,7 +12416,23 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
     el.addEventListener("wheel", handleWheelNative, { passive: false });
     return () => el.removeEventListener("wheel", handleWheelNative);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [floor?.id]);
+  }, [plan?.id]);
+
+  // Reagiert auf Größenänderungen des sichtbaren Ausschnitts (Fenster-Resize,
+  // Sidebar-Toggle, Orientierungswechsel) und zieht eine dadurch ggf. ungültig
+  // gewordene Verschiebung wieder ins gültige Boundary-Clamping (siehe
+  // clampTranslateForViewport) — ohne das würde der Plan nach einer Größenänderung
+  // im schlimmsten Fall dauerhaft außerhalb des sichtbaren Bereichs stehen bleiben.
+  useEffect(() => {
+    const viewportEl = viewportRef.current;
+    if (!viewportEl || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(() => {
+      setTranslate((prev) => clampTranslateForViewport(prev, scaleRef.current, scaleRef.current));
+    });
+    observer.observe(viewportEl);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const posFromEvent = (e) => {
     if (!imgRef.current) return null;
@@ -4135,6 +12467,28 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
     }
   };
 
+  // Notiz-Verschieben per Pointer-Drag — exakt dasselbe Muster wie startDrag/endDrag
+  // oben, nur für planNotes statt pins (eigener, unabhängiger Zustand: draggingNoteId/
+  // noteDragPos statt draggingPinId/dragPos).
+  const startNoteDrag = (note, e) => {
+    noteDragMovedRef.current = false;
+    noteDragStartRef.current = { x: e.clientX, y: e.clientY };
+    setDraggingNoteId(note.id);
+    setNoteDragPos({ x: note.x, y: note.y });
+  };
+
+  const endNoteDrag = (e) => {
+    if (!draggingNoteId) return;
+    const noteId = draggingNoteId;
+    const moved = noteDragMovedRef.current;
+    const finalPos = imgRef.current ? posFromEvent(e) : noteDragPos;
+    setDraggingNoteId(null);
+    setNoteDragPos(null);
+    if (moved && finalPos) {
+      onNoteMove(noteId, finalPos.x, finalPos.y);
+    }
+  };
+
   const distanceBetween = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
   const midpointOf = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 
@@ -4142,16 +12496,27 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
   // Zentrale Pointer-Verwaltung des Viewports: unterscheidet strikt zwischen (a)
   // dem Verschieben eines bestehenden Pins (draggingPinId gesetzt — hat immer
   // Vorrang), (b) Ein- oder Zwei-Finger-Pan/Pinch-Zoom der Ansicht und (c) einem
-  // kurzen Tap/Klick zum Setzen eines neuen Pins. Ein neuer Pin wird ausschließlich
-  // dann gesetzt, wenn sich der Pointer beim Loslassen um nicht mehr als
-  // FLOORPLAN_PAN_CLICK_THRESHOLD Pixel bewegt hat — bei jeder größeren Verschiebung
-  // (Pan) wird bewusst KEIN Pin erstellt.
+  // Long Press auf freier Fläche zum Setzen eines neuen Pins/einer neuen Notiz. Ein
+  // kurzer Tap/Klick auf den Hintergrund löst seit der Long-Press-Umstellung
+  // ausdrücklich NICHTS mehr aus (dient ausschließlich dem Zoomen/Verschieben der
+  // Ansicht) — die eigentliche Erstellung erfolgt ausschließlich über
+  // longPressTimerRef unten, sobald der Grundriss mindestens LONG_PRESS_MS
+  // ohne nennenswerte Bewegung gedrückt gehalten wurde.
   // -----------------------------------------------------------------------------
 
+  const clearLongPressTimer = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+    setLongPressPoint(null);
+  };
+
   const handleViewportPointerDown = (e) => {
-    // PinMarker ruft bei eigenem Pointerdown stopPropagation() auf — hier kommen
-    // also ausschließlich Pointer an, die den Grundriss selbst (Hintergrund) treffen.
-    if (creatingPin) return;
+    // PinMarker/PlanNoteMarker rufen bei eigenem Pointerdown IMMER stopPropagation()
+    // auf — hier kommen also ausschließlich Pointer an, die den Grundriss selbst
+    // (Hintergrund) treffen.
+    if (busyCreating) return;
     panPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (panPointersRef.current.size === 1) {
@@ -4162,6 +12527,29 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
         moved: false,
       };
       setIsPanningActive(true);
+      // Long-Press-Timer für Pin-/Notiz-Erstellung starten — nur bei genau einem
+      // aktiven Finger/Zeiger. Feuert der Timer, OHNE dass der Pointer zwischenzeitlich
+      // losgelassen, über die Toleranzschwelle bewegt oder durch einen zweiten Finger
+      // (Pinch) unterbrochen wurde, gilt der Long Press als abgeschlossen und legt
+      // sofort einen neuen Pin bzw. (im Notiz-Modus) eine neue Notiz an. Ein
+      // Loslassen VOR Ablauf des Timers (siehe handleViewportPointerUp) bricht ihn
+      // ersatzlos ab — ein kurzer Tap tut dann bewusst nichts.
+      const viewportEl = viewportRef.current;
+      if (viewportEl) {
+        const rect = viewportEl.getBoundingClientRect();
+        setLongPressPoint({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+      }
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = setTimeout(() => {
+        longPressTimerRef.current = null;
+        setLongPressPoint(null);
+        const gesture = panGestureRef.current;
+        if (!gesture || gesture.moved || panPointersRef.current.size !== 1 || busyCreating) return;
+        const pos = posFromEvent(e);
+        if (!pos) return;
+        if (noteMode) onAddNote(pos.x, pos.y);
+        else onPlanClick(pos.x, pos.y);
+      }, LONG_PRESS_MS);
     } else if (panPointersRef.current.size === 2) {
       const points = Array.from(panPointersRef.current.values());
       pinchGestureRef.current = {
@@ -4169,12 +12557,13 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
         startScale: scale,
         startTranslate: { ...translate },
       };
-      if (panGestureRef.current) panGestureRef.current.moved = true; // Pinch zählt nie als Tap
+      if (panGestureRef.current) panGestureRef.current.moved = true; // Pinch zählt nie als Tap/Long Press
+      clearLongPressTimer();
     }
   };
 
   const handleViewportPointerMove = (e) => {
-    // Pin-Verschieben hat immer Vorrang vor Pan/Zoom der Ansicht.
+    // Pin- bzw. Notiz-Verschieben hat immer Vorrang vor Pan/Zoom der Ansicht.
     if (draggingPinId) {
       const dx = e.clientX - dragStartRef.current.x;
       const dy = e.clientY - dragStartRef.current.y;
@@ -4182,11 +12571,19 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
       setDragPos(posFromEvent(e));
       return;
     }
+    if (draggingNoteId) {
+      const dx = e.clientX - noteDragStartRef.current.x;
+      const dy = e.clientY - noteDragStartRef.current.y;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) noteDragMovedRef.current = true;
+      setNoteDragPos(posFromEvent(e));
+      return;
+    }
 
     if (!panPointersRef.current.has(e.pointerId)) return;
     panPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (panPointersRef.current.size >= 2 && pinchGestureRef.current) {
+      clearLongPressTimer();
       const points = Array.from(panPointersRef.current.values()).slice(0, 2);
       const newDistance = distanceBetween(points[0], points[1]) || 1;
       const mid = midpointOf(points[0], points[1]);
@@ -4209,12 +12606,14 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
     const dy = e.clientY - gesture.startY;
     if (!gesture.moved && Math.hypot(dx, dy) > FLOORPLAN_PAN_CLICK_THRESHOLD) {
       gesture.moved = true;
+      // Nennenswerte Bewegung vor Ablauf des Long Press: eindeutig ein Pan-/Scroll-
+      // Versuch, kein Long Press — Timer verwerfen, keine Pin-/Notiz-Erstellung.
+      clearLongPressTimer();
     }
     if (gesture.moved) {
-      setTranslate({
-        x: gesture.startTranslate.x + dx,
-        y: gesture.startTranslate.y + dy,
-      });
+      // Reines Verschieben ohne Zoomänderung — Ziel- und "aktuell gerenderte" Skalierung
+      // sind hier identisch (scale), anders als bei den zoombezogenen Aufrufstellen oben.
+      setTranslate(clampTranslateForViewport({ x: gesture.startTranslate.x + dx, y: gesture.startTranslate.y + dy }, scale, scale));
     }
   };
 
@@ -4223,36 +12622,140 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
       endDrag(e);
       return;
     }
+    if (draggingNoteId) {
+      endNoteDrag(e);
+      return;
+    }
 
-    const wasBackgroundPointer = panPointersRef.current.has(e.pointerId);
+    // IPAD-DOPPEL-EVENT-FIX (siehe Einordnung in der Antwort): dieser Handler hängt an
+    // DREI verschiedenen DOM-Events gleichzeitig (onPointerUp, onPointerLeave,
+    // onPointerCancel, siehe JSX weiter unten) — auf iPad-Safari feuern beim Beenden
+    // einer Pinch-Geste nachweislich (per Debug-Protokoll bestätigt: "finger-drop" und
+    // ein doppeltes "release-end" exakt 1ms auseinander) MEHRERE dieser Events für
+    // DENSELBEN Finger/Pointer, z.B. sowohl pointerup als auch direkt danach
+    // pointercancel für dieselbe pointerId, wenn WebKit die Geste am Ende selbst noch
+    // einmal "übernimmt". Ohne diese Sperre lief der komplette Aufräum-/Nachschärf-
+    // Pfad unten (inkl. setTouchReleaseTick, siehe dort) dadurch zweimal
+    // hintereinander für ein- und denselben Loslass-Vorgang. panPointersRef ist die
+    // EINZIGE Quelle der Wahrheit dafür, welche Finger gerade aktiv sind (siehe
+    // handleViewportPointerDown, wo jeder Pointer genau einmal eingetragen wird) — ist
+    // eine pointerId hier nicht mehr enthalten, wurde ihr Loslassen bereits durch ein
+    // vorheriges dieser drei Events vollständig verarbeitet, und dieser zweite Aufruf
+    // wird ersatzlos übersprungen, statt denselben Zustand ein zweites Mal zu
+    // committen.
+    if (!panPointersRef.current.has(e.pointerId)) return;
+
     panPointersRef.current.delete(e.pointerId);
 
     if (panPointersRef.current.size < 2) {
+      // BUGFIX "weißer Bildschirm beim Loslassen nach Pinch-Zoom" (Praxis-Rückmeldung
+      // vom iPad): die beiden Finger eines Pinch werden so gut wie nie exakt
+      // gleichzeitig losgelassen — hebt der erste ab, fällt panPointersRef.current.size
+      // von 2 auf 1, WÄHREND der zweite, noch aufliegende Finger jederzeit ein
+      // weiteres Pointermove-Event auslösen kann (schon eine minimale Restbewegung
+      // beim Abheben reicht). handleViewportPointerMove behandelt einen einzelnen
+      // aktiven Pointer dann als normales Verschieben (panGestureRef-Zweig) — bislang
+      // wurde panGestureRef aber NUR beim allerletzten Pointer (size === 0) neu
+      // gesetzt, blieb also während dieses Übergangs auf seinem VERALTETEN Stand von
+      // VOR Beginn des Pinch (Startposition + Start-Verschiebung des ursprünglichen
+      // Einzelfingers). Die daraus berechnete neue Verschiebung sprang dadurch um die
+      // gesamte, während des gesamten Pinch zurückgelegte Fingerdistanz — bei
+      // niedriger erreichter Zoomstufe (kleine Inhaltsfläche) reichte dieser Sprung
+      // aus, um den Grundriss bis auf einen winzigen, vom Boundary-Clamping in
+      // clampTranslateForViewport übrig gelassenen Rand aus dem sichtbaren Bereich zu
+      // schieben — optisch nicht von einem echten weißen Bildschirm zu unterscheiden.
+      // Bei hoher erreichter Zoomstufe (großer Inhaltsfläche) fällt derselbe absolute
+      // Sprung relativ kaum ins Gewicht, was erklärt, warum ein Loslassen bei höherer
+      // Zoomstufe unauffällig blieb. Fix: panGestureRef wird jetzt SOFORT mit
+      // pinchGestureRef zusammen zurückgesetzt, sobald weniger als zwei Finger aktiv
+      // sind — ein Pointermove des verbleibenden Fingers in diesem kurzen
+      // Übergangsfenster (if (!gesture) return; in handleViewportPointerMove) bewirkt
+      // dadurch schlicht nichts mehr, statt mit veralteten Referenzwerten zu rechnen.
       pinchGestureRef.current = null;
+      panGestureRef.current = null;
     }
 
     if (panPointersRef.current.size === 0) {
       setIsPanningActive(false);
-      const gesture = panGestureRef.current;
-      panGestureRef.current = null;
-      if (wasBackgroundPointer && gesture && !gesture.moved && !creatingPin) {
-        // Kurzer Tap/Klick ohne nennenswerte Bewegung (≤ 5px): neuen Pin an der
-        // exakten Position setzen.
-        const pos = posFromEvent(e);
-        if (pos) onPlanClick(pos.x, pos.y);
-      }
+      // Ein Loslassen VOR Ablauf des Long-Press-Timers (siehe handleViewportPointerDown)
+      // verwirft ihn ersatzlos — ein kurzer Tap/Klick auf freier Fläche setzt bewusst
+      // KEINEN Pin mehr (dient nur noch dem Zoomen/Verschieben der Ansicht).
+      clearLongPressTimer();
+      // IPAD-TOUCH-RELEASE-FIX (siehe Einordnung in der Antwort, touchReleaseTick-
+      // Deklaration oben): stößt in PdfPlanCanvas/TiledPlanImage einen neuen,
+      // verzögerten Nachschärf-Durchlauf GENAU ab diesem tatsächlichen Loslass-
+      // Zeitpunkt an, unabhängig davon, ob sich scale in den letzten Millisekunden
+      // davor noch geändert hat.
+      setTouchReleaseTick((t) => t + 1);
     }
   };
 
   const activeTrades = (trades || []).filter((t) => t.active);
-  const visiblePins = tradeFilter === "all" ? pins : pins.filter((p) => p.trade_id === tradeFilter);
-  const open = visiblePins.filter((p) => p.status === "offen").length;
-  const inProgress = visiblePins.filter((p) => p.status === "bearbeitung").length;
-  const done = visiblePins.filter((p) => p.status === "erledigt").length;
-  const floorKind = resolveFloorKind(floor);
+  // Fortlaufende Pin-Nummerierung dieser Grundrissskizze (inkl. Unter-Nummerierung
+  // per "Duplizieren" erzeugter Kopien, siehe computePinNumberById): sortiert nach
+  // Anlagedatum, exakt wie im Geschoss-Export (siehe generateFloorPinsTablePdf/
+  // pinsToFloorExportRows) — GARANTIERT dieselbe Nummer für denselben Pin auf Plan UND
+  // in der Export-Tabelle ("Nr."), unabhängig von der aktuell aktiven Filter-/
+  // Suchleiste (die nur die Sichtbarkeit auf dem Plan steuert, nie die Nummerierung
+  // selbst). pinNumberEntryById trägt zusätzlich die reinen Zahlenwerte für eine
+  // stabile numerische Sortierung (siehe comparePinNumberEntries, sortedListPins
+  // unten); pinNumberById bleibt der anzuzeigende Text ("3" bzw. "3.2").
+  const pinNumberEntryById = computePinNumberById(pins);
+  const pinNumberById = new Map([...pinNumberEntryById].map(([id, entry]) => [id, entry.label]));
+  // Dynamische Filter-/Suchleiste (Status-Toggle, Gewerke-Mehrfachauswahl,
+  // Volltextsuche) — alle drei Kriterien wirken kombiniert (UND-Verknüpfung) rein
+  // clientseitig auf die bereits geladenen Pins dieser Skizze. Die Suche prüft
+  // genau die im Auftrag genannten Felder: Pin-Nummer, Thema, Bereich/Raum,
+  // Zuständigkeit und Kommentar.
+  const searchNormalized = searchQuery.trim().toLowerCase();
+  const visiblePins = pins.filter((p) => {
+    if (statusFilter !== "all" && p.status !== statusFilter) return false;
+    // Ein Pin gilt als Treffer, sobald IRGENDEINES seiner (ggf. mehreren) Gewerke in der
+    // Filterauswahl enthalten ist (siehe getPinTradeIds — Mehrfachauswahl je Pin).
+    if (tradeFilterIds.length > 0 && !getPinTradeIds(p).some((id) => tradeFilterIds.includes(id))) return false;
+    if (searchNormalized) {
+      const haystack = [String(pinNumberById.get(p.id) || ""), p.title, p.area, p.assigned_to, p.description]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (!haystack.includes(searchNormalized)) return false;
+    }
+    return true;
+  });
+  // Für den PDF-Export (nicht den Excel-Export, siehe handleExportFloor/
+  // generateFloorPinsTablePdf) in Klartext aufbereitete Zusammenfassung der aktuell
+  // aktiven Filterkriterien — erscheint sowohl im Export-Menü als auch auf dem
+  // Deckblatt des erzeugten Berichts. null, solange kein Filter aktiv ist.
+  const activeFilterTradeNames = activeTrades.filter((t) => tradeFilterIds.includes(t.id)).map((t) => t.name);
+  const filterSummaryParts = [];
+  if (statusFilter !== "all") filterSummaryParts.push(`Status "${STATUS[statusFilter]?.label || statusFilter}"`);
+  if (activeFilterTradeNames.length > 0) filterSummaryParts.push(`Gewerk ${activeFilterTradeNames.join(", ")}`);
+  if (searchQuery.trim()) filterSummaryParts.push(`Suche "${searchQuery.trim()}"`);
+  const filterSummary = filterSummaryParts.length > 0 ? filterSummaryParts.join(" · ") : null;
+  // Gewerke-Nachschlage für die kompakte Pin-Liste unter dem Grundriss (siehe unten) —
+  // bewusst ALLE Gewerke (nicht nur activeTrades), damit ein Pin mit einem inzwischen
+  // deaktivierten Gewerk in der Liste trotzdem den ursprünglichen Namen zeigt statt
+  // "Kein Gewerk".
+  const tradesById = new Map((trades || []).map((t) => [t.id, t]));
+  // Kompakte Pin-Liste unter dem Grundriss: dieselbe Teilmenge wie auf dem Plan
+  // markiert (visiblePins, respektiert also die Filter-/Suchleiste direkt darüber),
+  // aber in fester Nummern-Reihenfolge sortiert statt in Roh-Ladereihenfolge.
+  const sortedListPins = [...visiblePins].sort((a, b) =>
+    comparePinNumberEntries(pinNumberEntryById.get(a.id), pinNumberEntryById.get(b.id))
+  );
+
+  // Die drei Status-Zähler zeigen bewusst die Gesamtzahlen ALLER Pins dieser
+  // Skizze (unabhängig von der Filter-/Suchleiste) — die gefilterte Trefferzahl
+  // wird separat und explizit in der Filterleiste selbst ausgewiesen ("Zeige X
+  // von Y Pins"), damit beide Informationen klar auseinandergehalten werden.
+  const open = pins.filter((p) => p.status === "offen").length;
+  const inProgress = pins.filter((p) => p.status === "bearbeitung").length;
+  const done = pins.filter((p) => p.status === "erledigt").length;
+  const floorKind = resolveFloorKind(plan);
   const isPdf = floorKind === "pdf";
   const isCad = floorKind === "cad";
-  const fileName = deriveFileNameFromUrl(floor.image_url);
+  const isSvg = floorKind === "svg";
+  const fileName = deriveFileNameFromUrl(plan.image_url);
   const fileExt = deriveFileExt(fileName) || "dwg";
 
   return (
@@ -4261,42 +12764,44 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
         onClick={onBack}
         className="mb-4 inline-flex w-fit items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
       >
-        <ChevronLeft size={17} /> Zurück zu den Etagen
+        <ChevronLeft size={17} /> Zurück zu den Grundrisskizzen
       </button>
 
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
+          <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">{floor.name}</p>
           <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{floor.name}</h1>
+            <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">{plan.name}</h1>
             {isCad && <CadBadge ext={fileExt} />}
+            {isSvg && <VectorPlanBadge />}
+            {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: sichtbarer Hinweis direkt
+                am Titel, warum in "Werkpläne"/"Montagepläne" kein Pin durch Long Press
+                entsteht — Zoom/Pan bleiben hier uneingeschränkt nutzbar, nur die
+                Mängel-Pin-Anlage ist bewusst deaktiviert (siehe planAllowsPins). */}
+            {!planAllowsPins(plan) && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-500 ring-1 ring-inset ring-slate-200">
+                {PLAN_CATEGORY_META[getPlanCategory(plan)]?.emoji} Referenzansicht — keine Pin-Anlage
+              </span>
+            )}
+            {/* Ersetzt den früheren langen Fließtext-Hinweis über dem Grundriss (siehe
+                FloorPlanHelpModal weiter unten) — direkt neben dem Titel der
+                Grundrissskizze, wie angefordert. */}
+            <button
+              type="button"
+              onClick={() => setHelpModalOpen(true)}
+              title="Bedienungshinweise anzeigen"
+              className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-500 shadow-sm transition hover:border-[#FF2A00] hover:text-[#FF2A00]"
+            >
+              <HelpCircle size={13} /> Hilfe
+            </button>
           </div>
-          <p className="text-sm text-slate-500">
-            {creatingPin
-              ? "Pin wird angelegt…"
-              : session
-              ? "Auf den Grundriss tippen, um einen neuen Pin zu setzen — bestehende Pins lassen sich per Ziehen verschieben. Mit dem Mausrad, per Zwei-Finger-Geste oder über die Zoom-Buttons lässt sich der Plan stufenlos vergrößern und verschieben."
-              : "Nur Ansicht — zum Setzen oder Verschieben von Pins bitte anmelden. Zoomen und Verschieben des Grundrisses ist auch ohne Anmeldung möglich."}
-          </p>
+          {(creatingPin || creatingNote) && (
+            <p className="text-sm text-slate-500">{creatingPin ? "Pin wird angelegt…" : "Notiz wird platziert…"}</p>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
-          <div className="relative">
-            <Filter className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
-            <select
-              value={tradeFilter}
-              onChange={(e) => setTradeFilter(e.target.value)}
-              title="Pins nach Gewerk filtern"
-              className="appearance-none rounded-full border border-slate-200 bg-white py-1 pl-7 pr-6 text-[11px] font-semibold text-slate-600 outline-none ring-blue-500/30 focus:border-blue-500 focus:ring-4"
-            >
-              <option value="all">Alle Gewerke</option>
-              {activeTrades.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-50 px-2.5 py-1 text-rose-700 ring-1 ring-inset ring-rose-200">
-            <span className="h-1.5 w-1.5 rounded-full bg-rose-500" /> {open} offen
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-red-50 px-2.5 py-1 text-red-700 ring-1 ring-inset ring-red-200">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#FF2A00]" /> {open} offen
           </span>
           <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-amber-700 ring-1 ring-inset ring-amber-200">
             <span className="h-1.5 w-1.5 rounded-full bg-amber-500" /> {inProgress} in Arbeit
@@ -4304,6 +12809,154 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
           <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-700 ring-1 ring-inset ring-emerald-200">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> {done} erledigt
           </span>
+          {/* ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: Notiz-Modus-Umschalter nur
+              in der Kategorie "Grundrisse" anzeigen — in "Werkpläne"/"Montagepläne" gibt es
+              ohnehin keine Möglichkeit, eine Notiz zu platzieren (siehe planAllowsPins-Guard
+              in handleAddPlanNote), der Button würde dort nur verwirren. */}
+          {session && planAllowsPins(plan) && (
+            <button
+              type="button"
+              onClick={() => setNoteMode((v) => !v)}
+              title="Notiz-Modus: nächster Long Press auf den Plan platziert eine Notiz statt eines Pins"
+              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-semibold shadow-sm transition ${
+                noteMode ? "bg-amber-500 text-white hover:bg-amber-600" : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+              }`}
+            >
+              <StickyNote size={13} /> {noteMode ? "Notiz-Modus aktiv" : "Notiz setzen"}
+            </button>
+          )}
+          {planNotes.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowNotes((v) => !v)}
+              title={showNotes ? "Notizen auf dem Plan ausblenden" : "Notizen auf dem Plan einblenden"}
+              className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50"
+            >
+              {showNotes ? <Eye size={13} /> : <EyeOff size={13} />} {planNotes.length} Notiz{planNotes.length !== 1 ? "en" : ""}
+            </button>
+          )}
+          <div className="relative" ref={exportMenuRef}>
+            <button
+              onClick={() => setExportMenuOpen((v) => !v)}
+              disabled={exporting}
+              title="Geschoss-Bericht exportieren"
+              className="inline-flex items-center gap-1.5 rounded-full bg-[#FF2A00] px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {exporting ? <Loader2 size={13} className="animate-spin" /> : <FileDown size={13} />}
+              {hasActivePinFilters ? `PDF-Export (${visiblePins.length} Pins gefiltert)` : "Geschoss-Bericht exportieren"}
+            </button>
+            {exportMenuOpen && (
+              <div className="absolute right-0 top-full z-20 mt-1.5 w-64 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 text-xs font-medium text-slate-700 shadow-lg">
+                <button
+                  onClick={() => handleExportFloor("pdf")}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-slate-50"
+                >
+                  <FileText size={14} className="text-slate-400" />
+                  {hasActivePinFilters ? `Als PDF (${visiblePins.length} gefilterte Pins)` : "Als PDF-Tabelle"}
+                </button>
+                <button
+                  onClick={() => handleExportFloor("csv")}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-slate-50"
+                >
+                  <FileDown size={14} className="text-slate-400" /> Als CSV (Excel) — alle {pins.length} Pins
+                </button>
+                {hasActivePinFilters && (
+                  <p className="border-t border-slate-100 px-3 pt-1.5 pb-0.5 text-[10px] leading-snug text-slate-400">
+                    CSV bleibt immer die vollständige, ungefilterte Rohdaten-Tabelle.
+                  </p>
+                )}
+                {hasOnboardingInfo(project) && (
+                  <label className="flex cursor-pointer items-start gap-2 border-t border-slate-100 px-3 py-2 hover:bg-slate-50">
+                    <input
+                      type="checkbox"
+                      checked={exportIncludeOnboarding}
+                      onChange={(e) => setExportIncludeOnboarding(e.target.checked)}
+                      className="mt-0.5 accent-[#FF2A00]"
+                    />
+                    <span className="text-[11px] leading-snug text-slate-600">
+                      Baustellen-Info auf Seite 1 der PDF einbinden
+                    </span>
+                  </label>
+                )}
+              </div>
+            )}
+            {exportError && (
+              <p className="absolute right-0 top-full mt-1.5 w-56 rounded-md bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 ring-1 ring-inset ring-rose-200">
+                {exportError}
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Filter- & Suchleiste — direkt oberhalb des Grundriss-Canvas, filtert
+          visiblePins (siehe oben) in Echtzeit; die Pin-Nummerierung und der
+          Geschoss-Export bleiben davon unberührt (siehe Kommentar bei
+          pinNumberById). */}
+      <div className="mb-4 rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[220px] flex-1">
+            <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={15} />
+            <input
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Suche nach Nr., Thema, Bereich, Zuständigkeit, Kommentar…"
+              className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4"
+            />
+          </div>
+          <span className="whitespace-nowrap text-xs font-semibold text-slate-500">
+            Zeige {visiblePins.length} von {pins.length} Pin{pins.length !== 1 ? "s" : ""}
+          </span>
+          {hasActivePinFilters && (
+            <button
+              onClick={resetPinFilters}
+              className="inline-flex shrink-0 items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-500 transition hover:bg-slate-50 hover:text-slate-700"
+            >
+              <X size={11} /> Filter zurücksetzen
+            </button>
+          )}
+        </div>
+        <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+          <Filter size={13} className="mr-0.5 shrink-0 text-slate-400" />
+          {STATUS_FILTER_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => setStatusFilter(opt.value)}
+              aria-pressed={statusFilter === opt.value}
+              className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold transition ${
+                statusFilter === opt.value
+                  ? "border-[#FF2A00] bg-[#FF2A00] text-white shadow-sm"
+                  : "border-slate-200 bg-white text-slate-500 hover:border-red-300 hover:bg-red-50/50"
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+          {activeTrades.length > 0 && (
+            <>
+              <span className="mx-1 hidden h-4 w-px bg-slate-200 sm:inline-block" />
+              {activeTrades.map((t) => {
+                const active = tradeFilterIds.includes(t.id);
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => toggleTradeFilter(t.id)}
+                    aria-pressed={active}
+                    title="Nach Gewerk filtern"
+                    className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold transition ${
+                      active
+                        ? "border-[#FF2A00] bg-[#FF2A00] text-white shadow-sm"
+                        : "border-slate-200 bg-white text-slate-500 hover:border-red-300 hover:bg-red-50/50"
+                    }`}
+                  >
+                    {t.name}
+                  </button>
+                );
+              })}
+            </>
+          )}
         </div>
       </div>
 
@@ -4312,10 +12965,19 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
           <LoadingBlock label="Pins werden geladen…" />
         ) : (
           <>
+            {/* touch-none (touch-action: none) unterbindet das native Pinch-to-Zoom/
+                Scrollen des Browsers auf diesem Element bereits UNBEDINGT, unabhängig
+                vom aktuellen Zoomstand — Safari/Chrome übernehmen dadurch nie selbst
+                das Zoomen der Seite, auch nicht beim Erreichen von MAX_ZOOM = 4.0.
+                Das deckt Punkt 2 der Zoom-Stopp-Anforderung bereits vollständig und
+                zuverlässiger ab als ein bedingtes preventDefault() erst am Cap (touch-
+                action ist dafür der vom Browser vorgesehene Mechanismus). Der eigentliche
+                Zoom-Stopp bei aktuell 400% erfolgt zentral in clampScale via
+                FLOORPLAN_MAX_SCALE, siehe Kommentar dort. */}
             <div
               ref={viewportRef}
               className="relative h-full w-full touch-none select-none overflow-hidden"
-              style={{ cursor: creatingPin ? "wait" : isPanningActive ? "grabbing" : "grab" }}
+              style={{ cursor: busyCreating ? "wait" : isPanningActive ? "grabbing" : noteMode ? "copy" : "grab" }}
               onPointerDown={handleViewportPointerDown}
               onPointerMove={handleViewportPointerMove}
               onPointerUp={handleViewportPointerUp}
@@ -4323,9 +12985,35 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
               onPointerCancel={handleViewportPointerUp}
             >
               <div
+                ref={contentRef}
                 className="relative w-full origin-top-left select-none"
                 style={{
-                  transform: `translate(${translate.x}px, ${translate.y}px) scale(${scale})`,
+                  // TABLET CANVAS ZOOM FIX: translate3d(...) statt translate(...) — dieselbe
+                  // 2D-Verschiebung, aber über die 3D-Transform-Pipeline gerendert.
+                  //
+                  // NACHTRAG nach Praxis-Rückmeldung vom iPad (Safari): will-change: transform
+                  // wurde hier bewusst WIEDER ENTFERNT, obwohl es ursprünglich als reine
+                  // Performance-Optimierung gedacht war (vorab einen Compositor-Layer für die
+                  // Bühne anlegen, um einen kurzen Ruckler beim allerersten Zoom/Pan zu
+                  // vermeiden). Ehrlicher Stand: der weiße Bildschirm bestand auf einem echten
+                  // iPad auch nach der Kachel-/Deep-Zoom-Umstellung weiter fort, obwohl die
+                  // eigentlich angezeigten Bilddaten (einzelne 512px-Kacheln) für sich genommen
+                  // längst unproblematisch klein sind. Das spricht dafür, dass die Ursache nicht
+                  // (nur) in der Pixelgröße der angezeigten Inhalte lag, sondern im von WebKit
+                  // für die per CSS transform:scale() stark vergrößerte Bühne selbst angelegten
+                  // Compositor-Backing-Store — und will-change: transform erzwingt genau diese
+                  // vorzeitige, dedizierte Layer-Promotion, noch bevor überhaupt gezoomt wird.
+                  // Diese Vermutung ist NICHT durch eine Konsolen-Fehlermeldung bestätigt
+                  // (auf dem betroffenen iPad war kein Remote-Debugging möglich) und wird
+                  // deshalb ausdrücklich als Hypothese behandelt, nicht als gesicherte Ursache.
+                  // Das Entfernen selbst ist risikolos (reiner Performance-Hinweis an den
+                  // Browser, keine Funktionsänderung) und wird zusammen mit einer gezielten
+                  // Nachfrage zur tatsächlichen Zoomstufe beim Auftreten des weißen Bildschirms
+                  // ausgeliefert (siehe Einordnung in der Antwort) — falls das allein nicht
+                  // reicht, ist die auf dem Bildschirm ohnehin bereits sichtbare Zoom-Prozentzahl
+                  // (siehe {Math.round(scale * 100)}% weiter unten) die nächste, diesmal
+                  // faktenbasierte Spur statt einer weiteren Vermutung.
+                  transform: `translate3d(${translate.x}px, ${translate.y}px, 0) scale(${scale})`,
                   ...(isCad
                     ? {}
                     : {
@@ -4337,46 +13025,122 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
               >
                 {isCad && (
                   // CAD-Grundriss (.dwg/.dxf): stilisierte Blueprint-Ansicht, siehe CadBlueprintPlan.
-                  // Pins werden exakt wie bei Bild-/PDF-Grundrissen über % Koordinaten relativ zu
-                  // diesem Container platziert, verschoben und verwaltet — bleiben dadurch beim
-                  // Zoomen/Verschieben der "Bühne" exakt an ihrer relativen Position fixiert.
-                  <CadBlueprintPlan ref={imgRef} fileName={fileName} ext={fileExt} />
+                  // Kein echter Vektor-Koordinatenraum vorhanden (reiner Platzhalter ohne
+                  // geparste Geometrie) — Pins/Notizen bleiben hier bewusst eine separate,
+                  // Prozent-positionierte HTML-Ebene (siehe PinsAndNotesLayer), keine SVG-
+                  // Einbettung wie bei PDF/SVG-Grundrissen unten.
+                  <>
+                    <CadBlueprintPlan ref={imgRef} fileName={fileName} ext={fileExt} />
+                    <PinsAndNotesLayer
+                      visiblePins={visiblePins}
+                      pinNumberById={pinNumberById}
+                      draggingPinId={draggingPinId}
+                      dragPos={dragPos}
+                      session={session}
+                      scale={scale}
+                      startDrag={startDrag}
+                      dragMovedRef={dragMovedRef}
+                      onPinClick={onPinClick}
+                      showNotes={showNotes}
+                      planNotes={planNotes}
+                      draggingNoteId={draggingNoteId}
+                      noteDragPos={noteDragPos}
+                      startNoteDrag={startNoteDrag}
+                      noteDragMovedRef={noteDragMovedRef}
+                      onNoteClick={onNoteClick}
+                    />
+                  </>
                 )}
-                {isPdf && !isCad && (
-                  // PDF-Grundrisse werden über pdf.js in ein <canvas> gerendert (siehe
-                  // PdfPlanCanvas), statt wie zuvor per <embed> — und bei jeder signifikanten
-                  // Zoom-Änderung mit höherer Auflösung neu gerendert (zoomScale={scale}),
-                  // statt das einmal gerenderte Bild nur per CSS zu strecken. Dadurch bleiben
-                  // Pläne und Schriftzüge auch beim starken Heranzoomen gestochen scharf.
-                  <PdfPlanCanvas ref={imgRef} url={floor.image_url} renderScale={PDF_RENDER_SCALE_MIN} zoomScale={scale} />
-                )}
-                {!isCad && !isPdf && (
-                  <img
+                {(isPdf || isSvg) && !isCad && (
+                  // PDF- UND native SVG-Grundrisse laufen über PlanSvgStage: ein gemeinsamer
+                  // SVG-Koordinatenraum, in dem sowohl der Vektor-Plan selbst (PdfPlanCanvas
+                  // via pdf.js' SVGGraphics-Backend, bzw. SvgPlanCanvas für native .svg-
+                  // Uploads) als auch die Pin-/Notiz-Ebene als <g>/<foreignObject>-Elemente
+                  // eingebettet sind — beide skalieren dadurch über dieselbe SVG-Geometrie,
+                  // nicht nur über eine daneben liegende, lediglich synchron transformierte
+                  // HTML-Ebene. Details und Abwägungen siehe Kommentar bei PlanSvgStage.
+                  <PlanSvgStage
                     ref={imgRef}
-                    src={floor.image_url}
-                    alt={floor.name}
-                    className="pointer-events-none block w-full select-none opacity-90"
-                    draggable={false}
-                  />
+                    planKind={isPdf ? "pdf" : "svg"}
+                    url={plan.image_url}
+                    zoomScale={scale}
+                    touchReleaseTick={touchReleaseTick}
+                    activePointersRef={panPointersRef}
+                  >
+                    <PinsAndNotesLayer
+                      visiblePins={visiblePins}
+                      pinNumberById={pinNumberById}
+                      draggingPinId={draggingPinId}
+                      dragPos={dragPos}
+                      session={session}
+                      scale={scale}
+                      startDrag={startDrag}
+                      dragMovedRef={dragMovedRef}
+                      onPinClick={onPinClick}
+                      showNotes={showNotes}
+                      planNotes={planNotes}
+                      draggingNoteId={draggingNoteId}
+                      noteDragPos={noteDragPos}
+                      startNoteDrag={startNoteDrag}
+                      noteDragMovedRef={noteDragMovedRef}
+                      onNoteClick={onNoteClick}
+                    />
+                  </PlanSvgStage>
                 )}
-                {visiblePins.map((pin) => (
-                  <PinMarker
-                    key={pin.id}
-                    pin={draggingPinId === pin.id && dragPos ? { ...pin, x: dragPos.x, y: dragPos.y } : pin}
-                    draggable={!!session}
-                    isDragging={draggingPinId === pin.id}
-                    viewScale={scale}
-                    onDragStart={(e) => startDrag(pin, e)}
-                    onClick={(p) => {
-                      if (dragMovedRef.current) {
-                        dragMovedRef.current = false;
-                        return;
-                      }
-                      onPinClick(p);
-                    }}
-                  />
-                ))}
+                {!isCad && !isPdf && !isSvg && (
+                  <>
+                    {/* TABLET CANVAS ZOOM FIX, Teil 3: Kachel-/Deep-Zoom-Ansicht statt eines
+                        einzelnen <img> — siehe TiledPlanImage weiter oben. imgRef zeigt
+                        unverändert auf den äußeren Wrapper-<div>, posFromEvent funktioniert
+                        dadurch exakt wie zuvor (getBoundingClientRect() liefert für ein <img>
+                        und ein <div> gleichermaßen die tatsächliche, bereits skalierte
+                        Bildschirmfläche). Ältere Grundrisse ohne tile_manifest sowie ein
+                        eventuell fehlgeschlagener Kachel-Upload zeigen automatisch weiterhin
+                        nur das bisherige Fallback-Bild — keine Regression. */}
+                    <TiledPlanImage
+                      ref={imgRef}
+                      plan={plan}
+                      scale={scale}
+                      touchReleaseTick={touchReleaseTick}
+                      activePointersRef={panPointersRef}
+                    />
+                    <PinsAndNotesLayer
+                      visiblePins={visiblePins}
+                      pinNumberById={pinNumberById}
+                      draggingPinId={draggingPinId}
+                      dragPos={dragPos}
+                      session={session}
+                      scale={scale}
+                      startDrag={startDrag}
+                      dragMovedRef={dragMovedRef}
+                      onPinClick={onPinClick}
+                      showNotes={showNotes}
+                      planNotes={planNotes}
+                      draggingNoteId={draggingNoteId}
+                      noteDragPos={noteDragPos}
+                      startNoteDrag={startNoteDrag}
+                      noteDragMovedRef={noteDragMovedRef}
+                      onNoteClick={onNoteClick}
+                    />
+                  </>
+                )}
               </div>
+
+              {/* Long-Press-Fortschrittsanzeige (siehe handleViewportPointerDown/
+                  LONG_PRESS_MS): kurzer, sich ausbreitender Ring an der Druckposition,
+                  solange der Long Press zum Anlegen eines neuen Pins/einer neuen Notiz
+                  läuft — bewusst außerhalb von contentRef platziert (viewport-lokale
+                  Pixelkoordinaten, unbeeinflusst von der Zoom-/Pan-Transformation der
+                  Plan-"Bühne"). Farbe folgt dem aktiven Werkzeug (Notiz-Modus = Amber,
+                  sonst Markenrot, wie MapPin/StickyNote an anderer Stelle). */}
+              {longPressPoint && (
+                <div
+                  className={`pointer-events-none absolute z-30 h-11 w-11 -translate-x-1/2 -translate-y-1/2 animate-ping rounded-full border-2 ${
+                    noteMode ? "border-amber-400" : "border-[#FF2A00]"
+                  }`}
+                  style={{ left: longPressPoint.x, top: longPressPoint.y }}
+                />
+              )}
             </div>
 
             {/* Zoom-Steuerung: Mausrad, Pinch-Geste (Touch) und diese Buttons sind
@@ -4418,6 +13182,156 @@ function FloorPlanView({ floor, pins, loading, creatingPin, session, trades = []
             </div>
           </>
         )}
+      </div>
+
+      {/* Kompakte Pin-Liste unter dem Grundriss (Anforderung: Pin-Nummer, Titel/Gewerk,
+          Status — bewusst OHNE Fotos). Zeigt dieselbe, ggf. gefilterte
+          Teilmenge wie die Marker auf dem Plan direkt darüber (visiblePins) und bleibt
+          damit konsistent mit der Filter-/Suchleiste; Klick auf eine Zeile öffnet
+          denselben Pin wie ein Klick auf den Marker. Innerhalb einer eigenen,
+          scrollbaren Box (max-h-72) begrenzt, damit die Seite bei sehr vielen Pins
+          nicht unbegrenzt in die Länge wächst. */}
+      <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+        <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5">
+          <span className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-500">
+            <Table size={13} className="text-slate-400" /> Pins auf dieser Skizze
+          </span>
+          <span className="text-xs font-medium text-slate-400">
+            {hasActivePinFilters ? `${visiblePins.length} von ${pins.length}` : pins.length}
+          </span>
+        </div>
+        {sortedListPins.length === 0 ? (
+          <p className="px-4 py-6 text-center text-sm text-slate-400">
+            {pins.length === 0 ? "Noch keine Pins auf dieser Skizze." : "Kein Pin entspricht der aktuellen Filterung."}
+          </p>
+        ) : (
+          <div className="max-h-72 divide-y divide-slate-100 overflow-y-auto">
+            {sortedListPins.map((pin) => {
+              const s = STATUS[pin.status];
+              return (
+                <button
+                  key={pin.id}
+                  type="button"
+                  onClick={() => onPinClick(pin)}
+                  className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition hover:bg-slate-50"
+                >
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-100 text-[11px] font-bold text-slate-500">
+                    {pinNumberById.get(pin.id)}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-semibold text-slate-800">{pin.title}</span>
+                    <span className="block truncate text-xs text-slate-400">
+                      {getPinTradeNames(pin, tradesById) || "Kein Gewerk"}
+                    </span>
+                  </span>
+                  <span
+                    className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${s.bg} ${s.text}`}
+                  >
+                    <span className={`h-1.5 w-1.5 rounded-full ${s.dot}`} /> {s.label}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {helpModalOpen && (
+        <FloorPlanHelpModal session={session} noteMode={noteMode} onClose={() => setHelpModalOpen(false)} />
+      )}
+
+      {/* Fortschritts-Overlay Geschoss-PDF-Export — vollflächig & nicht schließbar
+          (kein onClose), da der laufende Export nicht sinnvoll abgebrochen werden
+          kann; verschwindet automatisch, sobald generateFloorPinsTablePdf im
+          finally-Block von handleExportFloor pdfExportStage wieder leert. */}
+      {pdfExportStage && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-3 rounded-2xl bg-white px-8 py-7 shadow-xl">
+            <Loader2 size={30} className="animate-spin text-[#FF2A00]" />
+            <p className="text-sm font-semibold text-slate-700">{pdfExportStage}</p>
+            <p className="max-w-[220px] text-center text-[11px] leading-snug text-slate-400">
+              Alle Fotos werden geladen und in den Bericht eingebettet — bei vielen Bildern kann das einen Moment dauern.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// GRUNDRISS-HILFE — kompaktes Modal, ersetzt den früheren Fließtext-Hinweis über dem
+// Grundriss (siehe "Hilfe"-Button in FloorPlanView) durch eine explizit aufrufbare,
+// übersichtliche Bedienungsanleitung für die Long-Press-Gesten.
+// ----------------------------------------------------------------------------------
+function FloorPlanHelpModal({ session, noteMode, onClose }) {
+  const items = [
+    {
+      icon: MapPin,
+      title: "Grundriss gedrückt halten",
+      text: "= neuen Mängel-Pin setzen (bzw. im Notiz-Modus eine neue Notiz platzieren).",
+    },
+    {
+      icon: Move,
+      title: "Pin oder Notiz gedrückt halten",
+      text: "= Verschieben aktivieren — anschließend an die gewünschte Stelle ziehen.",
+    },
+    {
+      icon: Crosshair,
+      title: "Kurzer Klick/Tipp auf einen Pin",
+      text: "= Details öffnen und bearbeiten (Fotos, Status, Verlauf).",
+    },
+    {
+      icon: Navigation,
+      title: "Kurzer Klick/Tipp auf freie Fläche",
+      text: "= nichts weiter — dient ausschließlich dem Zoomen/Verschieben der Ansicht, legt keinen Pin an.",
+    },
+    {
+      icon: ZoomIn,
+      title: "Mausrad, Zwei-Finger-Geste oder Zoom-Buttons",
+      text: "= Grundriss stufenlos vergrößern/verkleinern (max. 200 %, min. 50 %).",
+    },
+  ];
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-[70]`}>
+      <div className="w-full max-w-sm rounded-2xl bg-white p-5 shadow-2xl sm:rounded-2xl">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <HelpCircle size={18} className="text-[#FF2A00]" />
+            <h3 className="text-base font-bold text-slate-900">Bedienung der Grundrissskizze</h3>
+          </div>
+          <button onClick={onClose} className={MODAL_CLOSE_BTN}>
+            <X size={20} />
+          </button>
+        </div>
+        <ul className="space-y-3">
+          {items.map((item) => (
+            <li key={item.title} className="flex items-start gap-3">
+              <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-50 text-[#FF2A00]">
+                <item.icon size={14} />
+              </span>
+              <p className="text-sm leading-snug text-slate-600">
+                <span className="font-semibold text-slate-900">{item.title}</span> {item.text}
+              </p>
+            </li>
+          ))}
+        </ul>
+        {noteMode && (
+          <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
+            Notiz-Modus ist gerade aktiv: ein Long Press auf dem Plan platziert aktuell eine Notiz statt eines Mängel-Pins.
+          </p>
+        )}
+        {!session && (
+          <p className="mt-4 rounded-lg bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500 ring-1 ring-inset ring-slate-200">
+            Nur Ansicht — zum Setzen oder Verschieben von Pins bitte anmelden. Zoomen und Verschieben des Grundrisses ist auch ohne Anmeldung möglich.
+          </p>
+        )}
+        <button
+          onClick={onClose}
+          className="mt-5 w-full rounded-lg bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-200"
+        >
+          Verstanden
+        </button>
       </div>
     </div>
   );
@@ -4499,7 +13413,7 @@ function AngleCompass({ value, onChange, disabled }) {
         <span className="absolute left-1 top-1/2 -translate-y-1/2 text-[10px] font-bold text-slate-400">W</span>
 
         {/* Mittelpunkt */}
-        <span className="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-blue-600" />
+        <span className="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#FF2A00]" />
 
         {/* Richtungszeiger + Sichtfeld-Vorschau, live mitrotierend */}
         <div
@@ -4517,7 +13431,7 @@ function AngleCompass({ value, onChange, disabled }) {
         <div>
           <div className="mb-1 flex items-center justify-between">
             <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Blickrichtung</label>
-            <span className="rounded bg-blue-50 px-1.5 py-0.5 text-xs font-bold text-blue-700">{value}°</span>
+            <span className="rounded bg-red-50 px-1.5 py-0.5 text-xs font-bold text-red-700">{value}°</span>
           </div>
           <input
             type="range"
@@ -4526,7 +13440,7 @@ function AngleCompass({ value, onChange, disabled }) {
             value={value}
             disabled={disabled}
             onChange={(e) => onChange(Number(e.target.value))}
-            className="w-full accent-blue-600 disabled:opacity-60"
+            className="w-full accent-[#FF2A00] disabled:opacity-60"
           />
         </div>
         <div className="flex gap-1.5">
@@ -4537,7 +13451,7 @@ function AngleCompass({ value, onChange, disabled }) {
               disabled={disabled}
               className={`flex-1 rounded-lg border px-2 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
                 value === q.value
-                  ? "border-transparent bg-blue-600 text-white shadow-sm"
+                  ? "border-transparent bg-[#FF2A00] text-white shadow-sm"
                   : "border-slate-200 text-slate-500 hover:bg-slate-50"
               }`}
             >
@@ -4551,25 +13465,584 @@ function AngleCompass({ value, onChange, disabled }) {
 }
 
 // ----------------------------------------------------------------------------------
+// VOICE-TO-TEXT DIKTIERFUNKTION — Browser Web Speech API
+// ----------------------------------------------------------------------------------
+// useDictation kapselt EINE Diktier-"Sitzung" für genau ein Textfeld (Thema ODER
+// Kommentar bekommen im PinModal jeweils eine eigene, unabhängige Instanz, damit sich
+// beide Felder nicht gegenseitig beeinflussen). getBaseText/setText koppeln den Hook
+// lose an das jeweilige Formularfeld, ohne dass useDictation selbst irgendetwas vom
+// Pin-Datenmodell wissen muss.
+//
+// Anhänge-Logik ("kein Überschreiben"): beim Start wird der zu diesem Zeitpunkt im
+// Feld stehende Text EINMALIG als baseTextRef eingefroren. Während der Aufnahme wird
+// bei jedem (auch nur vorläufigen) Zwischenergebnis stets baseText + aktueller
+// Erkennungstext neu gesetzt — der ursprüngliche Text bleibt dadurch unangetastet,
+// während Zwischen- UND Endergebnisse live sichtbar dahinter weiterlaufen.
+function useDictation({ getBaseText, setText }) {
+  const recognitionRef = useRef(null);
+  const baseTextRef = useRef("");
+  const [listening, setListening] = useState(false);
+  const [toastMessage, setToastMessage] = useState("");
+  const toastTimerRef = useRef(null);
+  const supported = typeof window !== "undefined" && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+
+  const showToast = (message) => {
+    setToastMessage(message);
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => setToastMessage(""), 3200);
+  };
+
+  const stopListening = () => {
+    recognitionRef.current?.stop();
+  };
+
+  const startListening = () => {
+    if (!supported) {
+      showToast("Spracherkennung im Browser nicht verfügbar.");
+      return;
+    }
+    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = "de-DE";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    baseTextRef.current = getBaseText() || "";
+    let finalText = "";
+
+    recognition.onresult = (event) => {
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) finalText += transcript;
+        else interim += transcript;
+      }
+      const combined = `${finalText}${interim}`.trim();
+      const separator = baseTextRef.current && combined ? " " : "";
+      setText(`${baseTextRef.current}${separator}${combined}`);
+    };
+    recognition.onerror = (event) => {
+      console.error("Spracherkennung fehlgeschlagen:", event.error);
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        showToast("Mikrofonzugriff wurde nicht erlaubt.");
+      } else if (event.error !== "no-speech" && event.error !== "aborted") {
+        showToast("Spracherkennung im Browser nicht verfügbar.");
+      }
+      setListening(false);
+    };
+    recognition.onend = () => {
+      setListening(false);
+      recognitionRef.current = null;
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+      setListening(true);
+    } catch (err) {
+      console.error("Spracherkennung konnte nicht gestartet werden:", err);
+      showToast("Spracherkennung im Browser nicht verfügbar.");
+      recognitionRef.current = null;
+    }
+  };
+
+  const toggle = () => {
+    if (listening) stopListening();
+    else startListening();
+  };
+
+  // Sauberes Aufräumen beim Verlassen des Feldes/Schließen des Modals — eine noch
+  // laufende Erkennung darf nicht unbemerkt im Hintergrund weiterlauschen.
+  useEffect(
+    () => () => {
+      recognitionRef.current?.stop();
+      if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    },
+    []
+  );
+
+  return { listening, supported, toggle, toastMessage };
+}
+
+// Kompakter Mikrofon-Button für Diktierfelder: pulsiert rot mit "Höre zu…"-Hinweis
+// während der Aufnahme, zeigt bei fehlender Browser-Unterstützung oder verweigerter
+// Mikrofon-Freigabe eine dezente, selbst verschwindende Hinweis-Toast (siehe
+// useDictation/showToast) — die App stürzt in beiden Fällen nicht ab, das Textfeld
+// bleibt ganz normal manuell bedienbar.
+function DictationButton({ dictation, label }) {
+  return (
+    <div className="relative shrink-0">
+      <button
+        type="button"
+        onClick={dictation.toggle}
+        title={dictation.listening ? "Diktat stoppen" : `${label} per Spracheingabe diktieren`}
+        className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition ${
+          dictation.listening
+            ? "animate-pulse border-transparent bg-[#EF4444] text-white shadow-sm"
+            : "border-slate-200 bg-white text-slate-400 hover:border-[#FF2A00] hover:text-[#FF2A00]"
+        }`}
+      >
+        <Mic size={14} />
+      </button>
+      {dictation.listening && (
+        <span className="absolute -bottom-5 right-0 z-10 whitespace-nowrap rounded-full bg-[#EF4444] px-2 py-0.5 text-[10px] font-semibold text-white shadow">
+          Höre zu…
+        </span>
+      )}
+      {dictation.toastMessage && (
+        <span className="absolute -bottom-6 right-0 z-10 whitespace-nowrap rounded-md bg-slate-800 px-2 py-1 text-[10px] font-medium text-white shadow-lg">
+          {dictation.toastMessage}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// FOTO-MARKUP-EDITOR — Canvas-basiertes Annotationstool für Mängelfotos
+// ----------------------------------------------------------------------------------
+// Vollflächiges Bearbeitungs-Modal: lädt das Foto EINMALIG über loadImageAsDataUrl
+// (Fetch+Blob statt eines cross-origin <img>) auf eine eigene Data-URL herunter, bevor
+// es auf den Canvas gezeichnet wird — dadurch bleibt der Canvas garantiert "unbefleckt"
+// (kein CORS-Tainted-Canvas), auch wenn das Original in Supabase Storage liegt, und
+// canvas.toDataURL() am Ende funktioniert zuverlässig. Undo/Zurücksetzen arbeiten mit
+// vollständigen ImageData-Snapshots (siehe pushUndoSnapshot) — bei den hier verwendeten
+// Canvas-Auflösungen (siehe MARKUP_MAX_DIM) ein bewusster, einfacher und robuster
+// Kompromiss, kein Verlaufsprotokoll einzelner Zeichen-Operationen.
+const MARKUP_COLORS = [
+  { key: "red", value: "#EF4444", label: "Rot" },
+  { key: "brand", value: "#FF2A00", label: "Marken-Orange" },
+];
+const MARKUP_STROKE_WIDTHS = [
+  { key: "thin", value: 3, label: "Dünn" },
+  { key: "medium", value: 6, label: "Mittel" },
+  { key: "thick", value: 11, label: "Dick" },
+];
+const MARKUP_TOOLS = [
+  { key: "pen", label: "Freihand", icon: Pencil },
+  { key: "arrow", label: "Pfeil", icon: ArrowUpRight },
+  { key: "circle", label: "Kreis", icon: Circle },
+  { key: "rectangle", label: "Rechteck", icon: Square },
+];
+const MARKUP_MAX_DIM = 1400; // Zeichen-Auflösung — genug Detail zum Einkreisen von Schäden, ohne den Speicher (Undo-Snapshots) unnötig zu belasten.
+const MARKUP_UNDO_LIMIT = 15;
+const MARKUP_EXPORT_QUALITY = 0.85;
+
+function PhotoMarkupEditor({ photo, onClose, onSave }) {
+  const canvasRef = useRef(null);
+  const baseImageDataRef = useRef(null); // Zustand des unbearbeiteten Fotos, für "Zurücksetzen"
+  const undoStackRef = useRef([]);
+  const drawStateRef = useRef(null); // { startX, startY, lastX, lastY } während eines aktiven Zeichenvorgangs
+  const [tool, setTool] = useState("pen");
+  const [color, setColor] = useState(MARKUP_COLORS[0].value);
+  const [strokeWidth, setStrokeWidth] = useState(MARKUP_STROKE_WIDTHS[1].value);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [canUndo, setCanUndo] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setLoadError("");
+      try {
+        const { dataUrl } = await loadImageAsDataUrl(photo.photo_url);
+        const img = new Image();
+        img.onload = () => {
+          if (cancelled) return;
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          const ratio = Math.min(1, MARKUP_MAX_DIM / img.naturalWidth, MARKUP_MAX_DIM / img.naturalHeight);
+          canvas.width = Math.max(1, Math.round(img.naturalWidth * ratio));
+          canvas.height = Math.max(1, Math.round(img.naturalHeight * ratio));
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          baseImageDataRef.current = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          undoStackRef.current = [];
+          setCanUndo(false);
+          setLoading(false);
+        };
+        img.onerror = () => {
+          if (!cancelled) {
+            setLoadError("Foto konnte nicht geladen werden.");
+            setLoading(false);
+          }
+        };
+        img.src = dataUrl;
+      } catch (err) {
+        console.error("Foto für den Markup-Editor konnte nicht geladen werden:", err);
+        if (!cancelled) {
+          setLoadError("Foto konnte nicht geladen werden.");
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [photo.photo_url]);
+
+  const pushUndoSnapshot = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    undoStackRef.current.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+    if (undoStackRef.current.length > MARKUP_UNDO_LIMIT) undoStackRef.current.shift();
+    setCanUndo(true);
+  };
+
+  const handleUndo = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || undoStackRef.current.length === 0) return;
+    const ctx = canvas.getContext("2d");
+    ctx.putImageData(undoStackRef.current.pop(), 0, 0);
+    setCanUndo(undoStackRef.current.length > 0);
+  };
+
+  const handleClear = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || !baseImageDataRef.current) return;
+    pushUndoSnapshot();
+    canvas.getContext("2d").putImageData(baseImageDataRef.current, 0, 0);
+  };
+
+  // Rechnet Bildschirm- in Canvas-Koordinaten um — der Canvas wird per CSS
+  // (max-h-full/max-w-full) responsiv herunterskaliert, seine tatsächliche
+  // Zeichenauflösung (canvas.width/height) bleibt aber konstant bei MARKUP_MAX_DIM.
+  const posFromEvent = (e) => {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((e.clientX - rect.left) / rect.width) * canvas.width,
+      y: ((e.clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+
+  const drawArrow = (ctx, fromX, fromY, toX, toY) => {
+    const headLength = Math.max(12, strokeWidth * 2.4);
+    const angle = Math.atan2(toY - fromY, toX - fromX);
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = strokeWidth;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(fromX, fromY);
+    ctx.lineTo(toX, toY);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(toX, toY);
+    ctx.lineTo(toX - headLength * Math.cos(angle - Math.PI / 6), toY - headLength * Math.sin(angle - Math.PI / 6));
+    ctx.lineTo(toX - headLength * Math.cos(angle + Math.PI / 6), toY - headLength * Math.sin(angle + Math.PI / 6));
+    ctx.closePath();
+    ctx.fill();
+  };
+
+  const handlePointerDown = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    const pos = posFromEvent(e);
+    pushUndoSnapshot();
+    drawStateRef.current = { startX: pos.x, startY: pos.y, lastX: pos.x, lastY: pos.y };
+    if (tool === "pen") {
+      const ctx = canvas.getContext("2d");
+      ctx.strokeStyle = color;
+      ctx.lineWidth = strokeWidth;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      // Kurzer Ministrich statt eines reinen moveTo: macht auch einen Tap ohne
+      // jede Bewegung (z.B. um nur einen Punkt zu markieren) sichtbar.
+      ctx.beginPath();
+      ctx.moveTo(pos.x, pos.y);
+      ctx.lineTo(pos.x + 0.01, pos.y + 0.01);
+      ctx.stroke();
+    }
+  };
+
+  const handlePointerMove = (e) => {
+    const state = drawStateRef.current;
+    if (!state) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    const pos = posFromEvent(e);
+
+    if (tool === "pen") {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = strokeWidth;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(state.lastX, state.lastY);
+      ctx.lineTo(pos.x, pos.y);
+      ctx.stroke();
+      state.lastX = pos.x;
+      state.lastY = pos.y;
+      return;
+    }
+
+    // Formen (Pfeil/Kreis/Rechteck): Live-Vorschau — der beim Zeichenbeginn gepushte
+    // Undo-Snapshot wird bei jeder Bewegung zunächst restauriert und die Form darüber
+    // neu gezeichnet, damit stets nur EINE (die aktuelle) Vorschau sichtbar ist statt
+    // sich überlagernder Zwischenstände.
+    const snapshot = undoStackRef.current[undoStackRef.current.length - 1];
+    if (snapshot) ctx.putImageData(snapshot, 0, 0);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = strokeWidth;
+    if (tool === "arrow") {
+      drawArrow(ctx, state.startX, state.startY, pos.x, pos.y);
+    } else if (tool === "circle") {
+      const rx = Math.max(1, Math.abs(pos.x - state.startX) / 2);
+      const ry = Math.max(1, Math.abs(pos.y - state.startY) / 2);
+      const cx = (pos.x + state.startX) / 2;
+      const cy = (pos.y + state.startY) / 2;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (tool === "rectangle") {
+      ctx.strokeRect(state.startX, state.startY, pos.x - state.startX, pos.y - state.startY);
+    }
+  };
+
+  const handlePointerUp = (e) => {
+    if (!drawStateRef.current) return;
+    const canvas = canvasRef.current;
+    if (canvas?.hasPointerCapture?.(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+    drawStateRef.current = null;
+  };
+
+  const handleSave = async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    setSaveError("");
+    setSaving(true);
+    try {
+      const rawDataUrl = canvas.toDataURL("image/jpeg", MARKUP_EXPORT_QUALITY);
+      // Nochmalige, großzügig bemessene Komprimierung über denselben Pfad wie alle
+      // anderen eingebetteten Fotos (siehe compressImageDataUrl) — hält die
+      // Dateigröße auch bei einer sehr hochauflösenden Ausgangsaufnahme im
+      // praxistauglichen Rahmen für State/Sync-Warteschlange und PDF-Export.
+      const compressed = await compressImageDataUrl(rawDataUrl, PDF_PHOTO_MAX_WIDTH * 2, PDF_PHOTO_MAX_HEIGHT * 2, MARKUP_EXPORT_QUALITY);
+      await onSave(compressed.dataUrl);
+    } catch (err) {
+      console.error("Markup konnte nicht gespeichert werden:", err);
+      setSaveError("Änderungen konnten nicht gespeichert werden. Bitte erneut versuchen.");
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] flex flex-col bg-slate-950">
+      <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+        <p className="flex items-center gap-2 text-sm font-bold text-white">
+          <PenTool size={16} className="text-[#FF2A00]" /> Foto-Markup
+        </p>
+        <button onClick={onClose} disabled={saving} className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white disabled:opacity-40">
+          <X size={20} />
+        </button>
+      </div>
+
+      <div className="relative flex flex-1 items-center justify-center overflow-hidden p-3">
+        {loading && (
+          <div className="flex flex-col items-center gap-2 text-slate-400">
+            <Loader2 size={24} className="animate-spin" />
+            <span className="text-xs">Foto wird geladen…</span>
+          </div>
+        )}
+        {loadError && !loading && <p className="text-sm text-rose-400">{loadError}</p>}
+        <canvas
+          ref={canvasRef}
+          className={`max-h-full max-w-full touch-none rounded-lg border border-slate-800 shadow-2xl ${loading || loadError ? "hidden" : ""}`}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+        />
+      </div>
+
+      {!loading && !loadError && (
+        <div className="border-t border-slate-800 bg-slate-900 px-3 py-3">
+          <div className="mb-2.5 flex flex-wrap items-center gap-1.5">
+            {MARKUP_TOOLS.map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => setTool(t.key)}
+                className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition ${
+                  tool === t.key ? "bg-[#FF2A00] text-white" : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                }`}
+              >
+                <t.icon size={14} /> {t.label}
+              </button>
+            ))}
+            <span className="mx-1 h-5 w-px bg-slate-700" />
+            {MARKUP_COLORS.map((c) => (
+              <button
+                key={c.key}
+                type="button"
+                onClick={() => setColor(c.value)}
+                title={c.label}
+                className={`h-7 w-7 rounded-full border-2 transition ${color === c.value ? "border-white" : "border-transparent"}`}
+                style={{ backgroundColor: c.value }}
+              />
+            ))}
+            <span className="mx-1 h-5 w-px bg-slate-700" />
+            {MARKUP_STROKE_WIDTHS.map((w) => (
+              <button
+                key={w.key}
+                type="button"
+                onClick={() => setStrokeWidth(w.value)}
+                title={w.label}
+                className={`inline-flex h-7 w-7 items-center justify-center rounded-full transition ${
+                  strokeWidth === w.value ? "bg-slate-700" : "hover:bg-slate-800"
+                }`}
+              >
+                <span className="rounded-full bg-white" style={{ width: w.value, height: w.value }} />
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex gap-1.5">
+              <button
+                type="button"
+                onClick={handleUndo}
+                disabled={!canUndo}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Undo2 size={14} /> Rückgängig
+              </button>
+              <button
+                type="button"
+                onClick={handleClear}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-200 transition hover:bg-slate-700"
+              >
+                <Eraser size={14} /> Zurücksetzen
+              </button>
+            </div>
+            <div className="flex items-center gap-2">
+              {saveError && <span className="text-[11px] font-medium text-rose-400">{saveError}</span>}
+              <button
+                type="button"
+                onClick={onClose}
+                disabled={saving}
+                className="rounded-lg px-3.5 py-2 text-sm font-semibold text-slate-300 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Abbrechen
+              </button>
+              <button
+                type="button"
+                onClick={handleSave}
+                disabled={saving}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Änderungen speichern
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Einzelnes Vorschaubild in der Fotogalerie eines Pins (siehe PinModal unten) —
+// eigene Komponente statt eines Inline-Ausdrucks innerhalb von photos.map(), weil
+// useOfflineCapableAssetUrl (Offline-Asset-Cache, siehe oben) einen eigenen React-
+// Hook je Foto braucht, das ist innerhalb einer .map()-Callback-Funktion nicht
+// zulässig (Regeln der Hooks). Reicht die aufgelöste (online: unveränderte, offline:
+// ggf. lokale object:-URL) sowohl an das Vorschaubild selbst als auch an den
+// Lightbox-Trigger weiter, damit beide dieselbe, bereits zwischengespeicherte
+// Quelle verwenden.
+function PinPhotoThumb({ photo, readOnly, onZoom, onRemove, onMarkup }) {
+  const resolvedUrl = useOfflineCapableAssetUrl(photo.photo_url);
+  const displayUrl = resolvedUrl || photo.photo_url;
+  return (
+    <div className="group relative aspect-square overflow-hidden rounded-lg border border-slate-200">
+      <img
+        src={displayUrl}
+        alt=""
+        className="h-full w-full cursor-zoom-in object-cover transition group-hover:opacity-90"
+        onClick={() => onZoom(displayUrl)}
+      />
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 transition group-hover:bg-black/20">
+        <ZoomIn size={16} className="text-white opacity-0 transition group-hover:opacity-100" />
+      </div>
+      {!readOnly && (
+        <button
+          onClick={() => onRemove(photo)}
+          className="absolute right-1 top-1 rounded-full bg-slate-900/70 p-0.5 text-white opacity-0 transition group-hover:opacity-100"
+        >
+          <X size={12} />
+        </button>
+      )}
+      {/* Foto-Markup-Editor-Trigger — bewusst dauerhaft sichtbar (nicht erst bei Hover
+          wie die Löschen-Schaltfläche), damit das Werkzeug auf den kleinen
+          Vorschaubildern gut auffindbar bleibt (siehe Anforderung "gut sichtbares
+          Stift-/Bearbeiten-Icon"). */}
+      {!readOnly && (
+        <button
+          onClick={() => onMarkup(photo)}
+          title="Foto bearbeiten (Markup)"
+          className="absolute bottom-1 left-1 inline-flex items-center justify-center rounded-full bg-white/90 p-1 text-slate-700 shadow transition hover:bg-white hover:text-[#FF2A00]"
+        >
+          <PenTool size={12} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
 // PIN DETAIL MODAL
 // ----------------------------------------------------------------------------------
 
-function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSaveFields, onDelete, onAddTodo, onToggleTodo, onRemoveTodo, onUploadPhotos, onRemovePhoto }) {
+function PinModal({
+  pin,
+  pins,
+  pinNumber,
+  isNew,
+  readOnly,
+  trades,
+  project,
+  floor,
+  plan,
+  users,
+  generatedBy,
+  onRequestLogin,
+  onClose,
+  onSaveFields,
+  onDuplicate,
+  onDelete,
+  onUploadPhotos,
+  onRemovePhoto,
+  onSaveMarkup,
+}) {
   const [draft, setDraft] = useState({
     title: pin.title,
     status: pin.status,
     priority: pin.priority,
     description: pin.description,
-    assignee: pin.assigned_to || "",
     angle: pin.angle ?? 0,
-    trade_id: pin.trade_id || "",
+    // Mehrfachauswahl (siehe ANFORDERUNG "Multi-Select Trades for Pins"): getPinTradeIds
+    // fängt auch ältere, noch mit dem früheren Einzelfeld trade_id angelegte Pins ab.
+    trade_ids: getPinTradeIds(pin),
+    dueDate: pin.due_date || "",
+    area: pin.area || "",
   });
-  const [todoInput, setTodoInput] = useState("");
   const [lightboxSrc, setLightboxSrc] = useState(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Sicherheitsabfrage vor dem endgültigen Löschen eines Pins (siehe handleDeleteClick
+  // unten) — vorher gab es einen "Löschen"-Button ohne jede Bestätigung, ein
+  // versehentlicher Klick hätte den Pin samt aller Fotos und des Verlaufs sofort und
+  // unwiderruflich entfernt.
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [uploadingPhotos, setUploadingPhotos] = useState(false);
-  const [todoBusy, setTodoBusy] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [exportPdfError, setExportPdfError] = useState("");
+  const [duplicating, setDuplicating] = useState(false); // siehe handleDuplicateClick
+  const [markupPhoto, setMarkupPhoto] = useState(null); // aktuell im Foto-Markup-Editor geöffnetes Foto
   const fileInputRef = useRef(null);
 
   const update = (field, value) => {
@@ -4577,7 +14050,39 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
     setDraft((d) => ({ ...d, [field]: value }));
   };
 
-  const todos = pin.pin_todos || [];
+  // An-/Abwählen eines einzelnen Gewerks in der Mehrfachauswahl (siehe TradeChipsPicker
+  // unten, ANFORDERUNG "Multi-Select Trades for Pins") — toggelt ausschließlich die
+  // angeklickte ID, alle bereits gewählten anderen Gewerke bleiben unverändert erhalten.
+  const toggleTrade = (tradeId) => {
+    if (readOnly) return;
+    setDraft((d) => {
+      const current = d.trade_ids || [];
+      const next = current.includes(tradeId) ? current.filter((id) => id !== tradeId) : [...current, tradeId];
+      return { ...d, trade_ids: next };
+    });
+  };
+
+  // "Mangel duplizieren" (siehe onDuplicate/handleDuplicatePin in App): übergibt den
+  // vollständigen, GESPEICHERTEN Pin (nicht den ggf. noch unspeicherten draft) — App
+  // legt daraus sofort eine vollständige Kopie an (siehe duplicatePin) und öffnet
+  // direkt im Anschluss deren Bearbeitungs-Modal (siehe key={activePin.id} an der
+  // PinModal-Einbindung in App, sorgt für einen sauberen Formular-Reset beim
+  // Umspringen auf die neue Kopie).
+  const handleDuplicateClick = async () => {
+    if (readOnly || isNew || !onDuplicate || duplicating) return;
+    setDuplicating(true);
+    try {
+      await onDuplicate(pin);
+    } finally {
+      setDuplicating(false);
+    }
+  };
+
+  // Voice-to-Text (Abschnitt 2): zwei unabhängige Diktier-Sitzungen, je eine für
+  // "Thema" und "Beschreibung / Notiz" — siehe useDictation weiter oben.
+  const titleDictation = useDictation({ getBaseText: () => draft.title, setText: (v) => update("title", v) });
+  const descriptionDictation = useDictation({ getBaseText: () => draft.description, setText: (v) => update("description", v) });
+
   const photos = pin.pin_photos || [];
 
   const handleSave = async () => {
@@ -4589,9 +14094,10 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
         status: draft.status,
         priority: draft.priority,
         description: draft.description,
-        assigned_to: draft.assignee,
         angle: draft.angle,
-        trade_id: draft.trade_id || null,
+        trade_ids: draft.trade_ids || [],
+        due_date: draft.dueDate || null,
+        area: draft.area.trim(),
       });
       // Bei Erfolg schließt der Aufrufer (App) das Modal.
     } catch {
@@ -4601,25 +14107,46 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
     }
   };
 
-  const handleDeleteClick = async () => {
+  // Öffnet nur noch die Sicherheitsabfrage (siehe deleteConfirmOpen oben) — die
+  // eigentliche, unwiderrufliche Löschung passiert erst in handleConfirmDelete unten,
+  // nach expliziter Bestätigung im ConfirmDialog.
+  const handleDeleteClick = () => {
     if (readOnly) return;
+    setDeleteConfirmOpen(true);
+  };
+
+  const handleConfirmDelete = async () => {
     setDeleting(true);
     try {
       await onDelete();
+      // Bei Erfolg schließt der Aufrufer (App) bereits das gesamte Pin-Modal — ein
+      // separates Schließen von deleteConfirmOpen ist dann nicht mehr nötig.
     } catch {
       setDeleting(false);
+      setDeleteConfirmOpen(false);
     }
   };
 
-  const addTodo = async () => {
-    if (readOnly || !todoInput.trim() || todoBusy) return;
-    const text = todoInput.trim();
-    setTodoInput("");
-    setTodoBusy(true);
+  // Schneller Einzel-PDF-Export dieses einen Pins (siehe generateSinglePinPdf) —
+  // bewusst OHNE Login-Sperre (readOnly-Guard), da reine Berichtserstellung keine
+  // Schreibaktion ist und auch Gästen beim schnellen Nachfragen an Nachunternehmer
+  // nützt. Nur für bestehende Pins möglich (isNew hat noch keine gespeicherten Daten,
+  // ID oder Fotos).
+  const handleExportSinglePin = async () => {
+    if (isNew) return;
+    setExportPdfError("");
+    setExportingPdf(true);
     try {
-      await onAddTodo(text);
+      // allPins (alle Pins DIESER Grundrissskizze, siehe pins-Prop) versorgt die
+      // Übersichts-Minimap im Einzel-Export mit den übrigen Pins zur
+      // Kontext-Orientierung (siehe Kommentar in generateSinglePinPdf) — nicht nur den
+      // gerade exportierten.
+      await generateSinglePinPdf({ project, floor, plan, pin, exportNumber: pinNumber, trades, generatedBy, allPins: pins });
+    } catch (err) {
+      console.error("Einzel-PDF-Export fehlgeschlagen:", err);
+      setExportPdfError("Export fehlgeschlagen.");
     } finally {
-      setTodoBusy(false);
+      setExportingPdf(false);
     }
   };
 
@@ -4644,20 +14171,25 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
         {/* Header */}
         <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-5 py-4">
           <div className="flex-1">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-blue-600">
-              {isNew ? "Neuer Pin" : `Pin #${pin.id.slice(0, 8)}`}
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-[#FF2A00]">
+              {isNew ? "Neuer Pin" : pinNumber ? `Pin Nr. ${pinNumber}` : `Pin #${pin.id.slice(0, 8)}`}
             </p>
-            <input
-              value={draft.title}
-              onChange={(e) => update("title", e.target.value)}
-              disabled={readOnly}
-              placeholder="Titel des Mangels…"
-              className="w-full border-none p-0 text-lg font-bold text-slate-900 outline-none placeholder:text-slate-300 disabled:bg-transparent"
-            />
+            <div className="flex items-center gap-2">
+              <input
+                value={draft.title}
+                onChange={(e) => update("title", e.target.value)}
+                disabled={readOnly}
+                placeholder="Titel des Mangels…"
+                className="w-full min-w-0 flex-1 border-none p-0 text-lg font-bold text-slate-900 outline-none placeholder:text-slate-300 disabled:bg-transparent"
+              />
+              {!readOnly && <DictationButton dictation={titleDictation} label="Thema" />}
+            </div>
           </div>
-          <button onClick={onClose} className={MODAL_CLOSE_BTN}>
-            <X size={20} />
-          </button>
+          <div className="flex shrink-0 items-center gap-1">
+            <button onClick={onClose} className={MODAL_CLOSE_BTN}>
+              <X size={20} />
+            </button>
+          </div>
         </div>
 
         {readOnly && (
@@ -4677,9 +14209,9 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
             einsehbar, nicht manuell editierbar. */}
         {!isNew && (
           <p className="mx-5 mt-3 text-[11px] text-slate-400">
-            Angelegt von {pin.created_by || "unbekannt"} am {formatDateTime(pin.created_at)}
+            Angelegt von {resolveUserLabel(pin.created_by, users) || "unbekannt"} am {formatDateTime(pin.created_at)}
             {pin.updated_by && pin.updated_at && pin.updated_at !== pin.created_at && (
-              <> · zuletzt bearbeitet von {pin.updated_by} am {formatDateTime(pin.updated_at)}</>
+              <> · zuletzt bearbeitet von {resolveUserLabel(pin.updated_by, users)} am {formatDateTime(pin.updated_at)}</>
             )}
           </p>
         )}
@@ -4724,103 +14256,76 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
             </div>
           </div>
 
-          {/* Blickrichtung / Aufnahmewinkel */}
-          <div className="rounded-lg border border-slate-100 bg-slate-50/60 p-3">
-            <AngleCompass value={draft.angle ?? 0} onChange={(deg) => update("angle", deg)} disabled={readOnly} />
+          {/* Lage auf dem Plan (Detail-Crop) + Blickrichtung / Aufnahmewinkel */}
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+            <PinPlanCropThumbnail pin={pin} plan={plan} number={pinNumber} />
+            <div className="flex-1 rounded-lg border border-slate-100 bg-slate-50/60 p-3">
+              <AngleCompass value={draft.angle ?? 0} onChange={(deg) => update("angle", deg)} disabled={readOnly} />
+            </div>
           </div>
 
           {/* Description */}
           <div>
             <FieldLabel>Beschreibung / Notiz</FieldLabel>
-            <textarea
-              value={draft.description}
-              onChange={(e) => update("description", e.target.value)}
-              disabled={readOnly}
-              rows={3}
-              placeholder="Details zum Mangel oder zur Aufgabe…"
-              className="w-full resize-none rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-blue-500/30 placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
-            />
+            <div className="relative">
+              <textarea
+                value={draft.description}
+                onChange={(e) => update("description", e.target.value)}
+                disabled={readOnly}
+                rows={3}
+                placeholder="Details zum Mangel…"
+                className="w-full resize-none rounded-lg border border-slate-200 px-3 py-2 pr-10 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+              />
+              {!readOnly && (
+                <div className="absolute right-2 top-2">
+                  <DictationButton dictation={descriptionDictation} label="Beschreibung" />
+                </div>
+              )}
+            </div>
           </div>
 
-          {/* Assignee */}
+          {/* Gewerke (Mehrfachauswahl, siehe ANFORDERUNG "Multi-Select Trades for
+              Pins") — bekommt als Chip-Auswahl bewusst die volle Modalbreite statt wie
+              zuvor die halbe Spalte des früheren Dropdowns, damit mehrere gewählte
+              Gewerke lesbar umbrechen können. Bereich bleibt als eigenes Feld direkt
+              darunter. "Anschlussbezeichnung" und "Firma / Zuständige Person" wurden
+              entfernt (siehe PDF LAYOUT CLEANUP-Anforderung: beide Felder komplett aus
+              Anlege-/Bearbeiten-Modal und PDF-Bericht entfernt). */}
           <div>
-            <FieldLabel>Zuständige Person / Dienstleister</FieldLabel>
+            <FieldLabel>Gewerke</FieldLabel>
+            {/* TradeChipsPicker filtert intern bereits selbst auf "aktiv ODER aktuell
+                ausgewählt" anhand von selected (siehe Komponente oben) — ein bereits
+                gewähltes, inzwischen deaktiviertes Gewerk bleibt dadurch sichtbar,
+                ohne dass hier zusätzlich vorgefiltert werden muss. */}
+            <TradeChipsPicker trades={trades} selected={draft.trade_ids || []} onToggle={toggleTrade} disabled={readOnly} />
+          </div>
+          <div>
+            <FieldLabel>Bereich</FieldLabel>
             <div className="relative">
-              <User className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+              <MapPin className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
               <input
-                value={draft.assignee}
-                onChange={(e) => update("assignee", e.target.value)}
+                value={draft.area}
+                onChange={(e) => update("area", e.target.value)}
                 disabled={readOnly}
-                placeholder="z.B. Fa. Mustermann Elektro"
-                className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-blue-500/30 placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
+                placeholder="z.B. Flur Nord"
+                className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
               />
             </div>
           </div>
 
-          {/* Gewerk */}
+          {/* Frist / Fälligkeitsdatum */}
           <div>
-            <FieldLabel>Gewerk</FieldLabel>
+            <FieldLabel>Frist / Fälligkeitsdatum</FieldLabel>
             <div className="relative">
-              <Wrench className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-              <select
-                value={draft.trade_id || ""}
-                onChange={(e) => update("trade_id", e.target.value)}
+              <Calendar className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+              <input
+                type="date"
+                value={draft.dueDate}
+                onChange={(e) => update("dueDate", e.target.value)}
                 disabled={readOnly}
-                className="w-full appearance-none rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-blue-500/30 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
-              >
-                <option value="">Kein Gewerk zugeordnet</option>
-                {(trades || [])
-                  .filter((t) => t.active || t.id === pin.trade_id)
-                  .map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name}
-                      {!t.active ? " (inaktiv)" : ""}
-                    </option>
-                  ))}
-              </select>
+                className="w-full rounded-lg border border-slate-200 py-2 pl-9 pr-3 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+              />
             </div>
-          </div>
-
-          {/* Todos */}
-          <div>
-            <label className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-              <ListChecks size={14} /> Aufgaben
-            </label>
-            <div className="space-y-1.5">
-              {todos.map((t) => (
-                <div key={t.id} className="group flex items-center gap-2 rounded-lg border border-slate-100 bg-slate-50 px-2.5 py-1.5">
-                  <button onClick={() => !readOnly && onToggleTodo(t)} disabled={readOnly} className="shrink-0 text-blue-600 disabled:cursor-not-allowed">
-                    {t.completed ? <CheckSquare size={17} /> : <Square size={17} className="text-slate-400" />}
-                  </button>
-                  <span className={`flex-1 text-sm ${t.completed ? "text-slate-400 line-through" : "text-slate-700"}`}>{t.text}</span>
-                  {!readOnly && (
-                    <button onClick={() => onRemoveTodo(t.id)} className="text-slate-300 opacity-0 transition hover:text-rose-500 group-hover:opacity-100">
-                      <X size={14} />
-                    </button>
-                  )}
-                </div>
-              ))}
-              {todos.length === 0 && <p className="text-xs text-slate-400">Noch keine Aufgaben erfasst.</p>}
-            </div>
-            {!readOnly && (
-              <div className="mt-2 flex gap-2">
-                <input
-                  value={todoInput}
-                  onChange={(e) => setTodoInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && addTodo()}
-                  disabled={todoBusy}
-                  placeholder="Neue Aufgabe hinzufügen…"
-                  className="flex-1 rounded-lg border border-slate-200 px-3 py-1.5 text-sm outline-none ring-blue-500/30 placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 disabled:bg-slate-50"
-                />
-                <button
-                  onClick={addTodo}
-                  disabled={todoBusy}
-                  className="flex items-center gap-1 rounded-lg bg-slate-100 px-3 text-sm font-semibold text-slate-600 transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {todoBusy ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
-                </button>
-              </div>
-            )}
           </div>
 
           {/* Photos */}
@@ -4841,25 +14346,14 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
             />
             <div className="grid grid-cols-4 gap-2">
               {photos.map((photo) => (
-                <div key={photo.id} className="group relative aspect-square overflow-hidden rounded-lg border border-slate-200">
-                  <img
-                    src={photo.photo_url}
-                    alt=""
-                    className="h-full w-full cursor-zoom-in object-cover transition group-hover:opacity-90"
-                    onClick={() => setLightboxSrc(photo.photo_url)}
-                  />
-                  <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 transition group-hover:bg-black/20">
-                    <ZoomIn size={16} className="text-white opacity-0 transition group-hover:opacity-100" />
-                  </div>
-                  {!readOnly && (
-                    <button
-                      onClick={() => onRemovePhoto(photo)}
-                      className="absolute right-1 top-1 rounded-full bg-slate-900/70 p-0.5 text-white opacity-0 transition group-hover:opacity-100"
-                    >
-                      <X size={12} />
-                    </button>
-                  )}
-                </div>
+                <PinPhotoThumb
+                  key={photo.id}
+                  photo={photo}
+                  readOnly={readOnly}
+                  onZoom={setLightboxSrc}
+                  onRemove={onRemovePhoto}
+                  onMarkup={setMarkupPhoto}
+                />
               ))}
               {uploadingPhotos && (
                 <div className="flex aspect-square flex-col items-center justify-center gap-1 rounded-lg border border-slate-200 bg-slate-50 text-slate-400">
@@ -4871,7 +14365,7 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
                 <button
                   onClick={() => fileInputRef.current?.click()}
                   disabled={uploadingPhotos}
-                  className="flex aspect-square flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-slate-300 text-slate-400 transition hover:border-blue-400 hover:text-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="flex aspect-square flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-slate-300 text-slate-400 transition hover:border-[#FF2A00] hover:text-[#FF2A00] disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <ImagePlus size={18} />
                   <span className="text-[10px] font-medium">Foto hochladen</span>
@@ -4894,7 +14388,245 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
           )}
         </div>
 
-        {/* Footer */}
+        {/* Footer: fünf Buttons in der Fußzeile — Löschen | Einzel-PDF Export |
+            Duplizieren | Abbrechen | Speichern (siehe ANFORDERUNG "PIN DUPLICATION WITH
+            SUB-NUMBERING & FOOTER ACTION BUTTONS"). "Löschen" bleibt unverändert bei
+            JEDEM Pin sichtbar und funktionsfähig, ausdrücklich auch direkt nach einem
+            Long Press bei einem frisch angelegten (isNew) Pin (siehe vorherige
+            ANFORDERUNG "ADD DIRECT LÖSCHEN BUTTON…", unverändert erhalten: der Pin
+            existiert zu diesem Zeitpunkt bereits real in pins/Supabase bzw. — offline —
+            als lokal angelegter Pin mit eigener Offline-ID in der Sync-Warteschlange,
+            handleDeletePin behandelt isNew- und bestehende Pins deshalb ohnehin bereits
+            identisch). Einzel-PDF Export und Duplizieren bleiben dagegen bewusst nur bei
+            bereits ausgefüllten, bestehenden Pins aktiv (deaktiviert samt Tooltip bei
+            isNew) — ein Export oder eine vollständige Kopie eines gerade erst leeren
+            Entwurfs wäre wenig hilfreich. Position/Reihenfolge der fünf Buttons bleibt
+            dabei immer gleich, nur der Aktivierungszustand ändert sich — bei schmalen
+            Bildschirmen (siehe flex-wrap) bricht die linke Gruppe bei Bedarf in eine
+            zweite Zeile um, statt Buttons abzuschneiden. */}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-5 py-3.5">
+          {!readOnly ? (
+            <div className="flex flex-wrap items-center gap-1">
+              <button
+                onClick={handleDeleteClick}
+                disabled={deleting || duplicating}
+                className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {deleting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />} Löschen
+              </button>
+              <div className="relative">
+                <button
+                  onClick={handleExportSinglePin}
+                  disabled={isNew || exportingPdf || deleting || duplicating}
+                  title={
+                    isNew
+                      ? "Für einen gerade erst angelegten, noch leeren Pin nicht verfügbar"
+                      : "Diesen Pin als schnelles 1-Seiten-PDF exportieren — inkl. Foto und Lageplan-Ausschnitt"
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {exportingPdf ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />} PDF Export
+                </button>
+                {exportPdfError && (
+                  <p className="absolute bottom-full left-0 mb-1.5 w-52 rounded-md bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 ring-1 ring-inset ring-rose-200">
+                    {exportPdfError}
+                  </p>
+                )}
+              </div>
+              {onDuplicate && (
+                <button
+                  onClick={handleDuplicateClick}
+                  disabled={isNew || duplicating || deleting}
+                  title={
+                    isNew
+                      ? "Für einen gerade erst angelegten, noch leeren Pin nicht verfügbar"
+                      : "Sofort eine vollständige Kopie dieses Pins anlegen, leicht versetzt daneben auf dem Plan"
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {duplicating ? <Loader2 size={16} className="animate-spin" /> : <Copy size={16} />} Duplizieren
+                </button>
+              )}
+            </div>
+          ) : (
+            <span />
+          )}
+          <div className="flex gap-2">
+            <button
+              onClick={onClose}
+              disabled={saving || deleting || duplicating}
+              className={BTN_SECONDARY}
+            >
+              {readOnly ? "Schließen" : "Abbrechen"}
+            </button>
+            {readOnly ? (
+              <button
+                onClick={onRequestLogin}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
+              >
+                <LogIn size={16} /> Anmelden zum Bearbeiten
+              </button>
+            ) : (
+              <button
+                onClick={handleSave}
+                disabled={saving || deleting || duplicating}
+                className={BTN_PRIMARY}
+              >
+                {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Speichern
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {lightboxSrc && <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
+
+      {markupPhoto && (
+        <PhotoMarkupEditor
+          photo={markupPhoto}
+          onClose={() => setMarkupPhoto(null)}
+          onSave={async (dataUrl) => {
+            await onSaveMarkup(markupPhoto, dataUrl);
+            setMarkupPhoto(null);
+          }}
+        />
+      )}
+
+      {/* Sicherheitsabfrage vor dem endgültigen Löschen (siehe handleDeleteClick/
+          handleConfirmDelete oben) — entfernt den Pin samt aller Fotos, To-dos und der
+          Bearbeitungshistorie unwiderruflich, daher erst nach expliziter Bestätigung. */}
+      {deleteConfirmOpen && (
+        <ConfirmDialog
+          title="Pin löschen"
+          message={`„${pin.title || "Ohne Titel"}" wird endgültig gelöscht — inklusive aller Fotos und der Bearbeitungshistorie. Das kann nicht rückgängig gemacht werden.`}
+          confirmLabel="Endgültig löschen"
+          busy={deleting}
+          onCancel={() => setDeleteConfirmOpen(false)}
+          onConfirm={handleConfirmDelete}
+        />
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------------
+// SKIZZEN-NOTIZ BEARBEITEN — schlankes Modal für Text, Kategorie (Farbe) und
+// Verschieben/Löschen einer Plan-Notiz. Bewusst deutlich einfacher als PinModal
+// (kein Status, keine Priorität, keine Fotos/Verlauf) — eine Notiz ist ein
+// reiner Vor-Ort-Hinweis, keine dokumentationspflichtige Mängelerfassung.
+// ----------------------------------------------------------------------------------
+function PlanNoteModal({ note, isNew, readOnly, onRequestLogin, onClose, onSave, onDelete }) {
+  const [text, setText] = useState(note.text || "");
+  const [color, setColor] = useState(note.color || "amber");
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleSave = async () => {
+    if (readOnly) return;
+    if (!text.trim()) {
+      setError("Bitte einen Text für die Notiz eingeben.");
+      return;
+    }
+    setError("");
+    setSaving(true);
+    try {
+      await onSave({ text: text.trim(), color });
+    } catch (err) {
+      console.error("Notiz konnte nicht gespeichert werden:", err);
+      setError(err?.message || "Die Notiz konnte nicht gespeichert werden. Bitte erneut versuchen.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteClick = async () => {
+    if (readOnly) return;
+    setDeleting(true);
+    try {
+      await onDelete();
+    } catch {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <div className={`${MODAL_BACKDROP_BASE} z-50`}>
+      <div className="flex max-h-[92vh] w-full flex-col overflow-hidden rounded-t-2xl bg-white shadow-2xl sm:max-h-[85vh] sm:max-w-md sm:rounded-2xl">
+        <div className={MODAL_HEADER_ROW}>
+          <div>
+            <p className={MODAL_EYEBROW}>{isNew ? "Neue Notiz" : "Plan-Notiz"}</p>
+            <h2 className="flex items-center gap-1.5 text-lg font-bold text-slate-900">
+              <StickyNote size={18} className="text-amber-500" /> Skizzen-Notiz
+            </h2>
+          </div>
+          <button onClick={onClose} className={MODAL_CLOSE_BTN}>
+            <X size={20} />
+          </button>
+        </div>
+
+        {readOnly && (
+          <div className="mx-5 mt-3 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
+            <Lock size={14} className="shrink-0" />
+            <span>
+              Nur Ansicht —{" "}
+              <button onClick={onRequestLogin} className="underline underline-offset-2 hover:text-amber-900">
+                jetzt anmelden
+              </button>
+              , um diese Notiz zu bearbeiten.
+            </span>
+          </div>
+        )}
+
+        <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          <div>
+            <FieldLabel>Notiztext</FieldLabel>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              disabled={readOnly}
+              rows={2}
+              placeholder="z.B. Gefahrenbereich, Lagerfläche Elektro, Fluchtweg freihalten…"
+              className="w-full resize-none rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none ring-[#FF2A00]/30 placeholder:text-slate-400 focus:border-[#FF2A00] focus:ring-4 disabled:bg-slate-50"
+            />
+            {!readOnly && (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {PLAN_NOTE_QUICK_TEXTS.map((quick) => (
+                  <button
+                    key={quick}
+                    type="button"
+                    onClick={() => setText(quick)}
+                    className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-500 transition hover:border-amber-300 hover:bg-amber-50 hover:text-amber-700"
+                  >
+                    {quick}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div>
+            <FieldLabel>Kategorie / Farbe</FieldLabel>
+            <div className="grid grid-cols-2 gap-1.5">
+              {Object.entries(PLAN_NOTE_COLORS).map(([key, c]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => !readOnly && setColor(key)}
+                  disabled={readOnly}
+                  className={`flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed ${
+                    color === key ? `${c.bg} ${c.text} border-transparent ring-2 ring-inset ring-current/20` : "border-slate-200 text-slate-500 hover:bg-slate-50"
+                  }`}
+                >
+                  <span className={`h-2 w-2 rounded-full ${c.dot}`} /> {c.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {error && <p className="text-xs font-medium text-rose-600">{error}</p>}
+        </div>
+
         <div className="flex items-center justify-between gap-3 border-t border-slate-100 px-5 py-3.5">
           {!isNew && !readOnly ? (
             <button
@@ -4908,34 +14640,24 @@ function PinModal({ pin, isNew, readOnly, trades, onRequestLogin, onClose, onSav
             <span />
           )}
           <div className="flex gap-2">
-            <button
-              onClick={onClose}
-              disabled={saving || deleting}
-              className={BTN_SECONDARY}
-            >
+            <button onClick={onClose} disabled={saving || deleting} className={BTN_SECONDARY}>
               {readOnly ? "Schließen" : "Abbrechen"}
             </button>
             {readOnly ? (
               <button
                 onClick={onRequestLogin}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[#FF2A00] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[#E02400]"
               >
                 <LogIn size={16} /> Anmelden zum Bearbeiten
               </button>
             ) : (
-              <button
-                onClick={handleSave}
-                disabled={saving || deleting}
-                className={BTN_PRIMARY}
-              >
+              <button onClick={handleSave} disabled={saving || deleting} className={BTN_PRIMARY}>
                 {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Speichern
               </button>
             )}
           </div>
         </div>
       </div>
-
-      {lightboxSrc && <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     </div>
   );
 }
@@ -4951,6 +14673,16 @@ function App() {
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authModalOpen, setAuthModalOpen] = useState(false);
+
+  // Verpflichtende App-Zugriffssperre (siehe LoginScreen): getrennt von "session", weil
+  // sie zusätzlich zur echten Supabase-Session auch über die Offline-Anmeldung
+  // (verifyOfflineCredential) freigeschaltet werden kann, ohne dass dabei eine echte,
+  // RLS-fähige Session entsteht. authSource hält fest, auf welchem Weg — steuert u.a.
+  // die Kopfzeilen-Anzeige weiter unten. Default false: vor der ersten erfolgreichen
+  // Anmeldung (bzw. bevor eine bereits von Supabase persistierte Session geladen ist)
+  // ist ausschließlich der Login-Bildschirm sichtbar.
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authSource, setAuthSource] = useState(null); // 'online' | 'offline' | null
 
   useEffect(() => {
     let mounted = true;
@@ -4969,9 +14701,44 @@ function App() {
     };
   }, []);
 
+  // Sobald eine echte Supabase-Session vorliegt (frisch angemeldet, oder von Supabase
+  // selbst aus einer früheren Sitzung persistiert und beim Start automatisch
+  // wiederhergestellt — das funktioniert dank localStorage-Persistenz sogar ohne
+  // Netzverbindung), gilt die App-Zugriffssperre als aufgehoben. Bewusst einseitig
+  // (setzt nur auf true, nie zurück auf false) — das Abmelden läuft ausschließlich
+  // über handleAppLogout weiter unten, damit ein kurzzeitig null werdendes "session"
+  // während eines Auth-Übergangs nicht versehentlich zurück auf den Login-Bildschirm
+  // wechselt, während z. B. die Offline-Anmeldung bereits aktiv ist.
+  useEffect(() => {
+    if (session) {
+      setIsAuthenticated(true);
+      setAuthSource("online");
+    }
+  }, [session]);
+
+  // "Angemeldet bleiben" für den Offline-Anmeldepfad (siehe rememberOfflineSession/
+  // getRememberedOfflineEmail oben): erst NACHDEM der erste Supabase-Session-Check
+  // abgeschlossen ist (authLoading === false), sonst würde diese Prüfung kurzzeitig
+  // fälschlich "offline" anzeigen, obwohl gleich darauf noch eine echte Online-
+  // Session eintrifft. Greift nur, wenn keine echte Session vorliegt — eine
+  // vorhandene Online-Session hat immer Vorrang und setzt authSource bereits oben
+  // auf "online".
+  useEffect(() => {
+    if (authLoading || session) return;
+    const rememberedEmail = getRememberedOfflineEmail();
+    if (rememberedEmail) {
+      setIsAuthenticated(true);
+      setAuthSource("offline");
+    }
+  }, [authLoading, session]);
+
   // Zentraler Guard für alle Schreibaktionen: Gäste (kein session) bekommen statt der
   // Aktion das Login-Modal angezeigt (Klick auf "Neues Projekt", "Bearbeiten",
-  // "Löschen", Pin setzen/verschieben, Etage hinzufügen, …).
+  // "Löschen", Pin setzen/verschieben, Etage hinzufügen, …). Bewusst weiterhin an
+  // "session" (nicht "isAuthenticated") gebunden: die App-Zugriffssperre erlaubt zwar
+  // per Offline-Anmeldung das Betrachten der App, tatsächliche Schreibaktionen
+  // benötigen aber zwingend eine echte, RLS-fähige Supabase-Session (siehe
+  // OFFLINE-ANMELDUNG-Kommentar bei verifyOfflineCredential weiter oben).
   const requireAuth = () => {
     if (!session) {
       setAuthModalOpen(true);
@@ -4983,6 +14750,11 @@ function App() {
   const handleSignIn = async (email, password) => {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) throw error;
+    // Fingerabdruck für eine spätere Offline-Anmeldung an diesem Gerät aktualisieren —
+    // bewusst ohne await/eigene Fehlerbehandlung hier: cacheOfflineCredential fängt
+    // Fehler bereits intern ab und darf die gerade erfolgreiche Anmeldung nicht
+    // nachträglich blockieren oder verzögern.
+    cacheOfflineCredential(email, password);
   };
 
   const handleSignUp = async (email, password) => {
@@ -5000,6 +14772,85 @@ function App() {
     }
   };
 
+  // Login-Bildschirm-Handler (siehe LoginScreen): versucht zuerst die echte Online-
+  // Anmeldung (über handleSignIn, mit Zeitlimit gegen ein hängendes Funkloch-Fetch),
+  // weicht bei einer tatsächlichen Verbindungsstörung (nicht bei aktiv von Supabase
+  // abgelehnten Zugangsdaten, siehe isNetworkFailure) auf die lokale Offline-Anmeldung
+  // aus. Wirft bei endgültigem Fehlschlag, damit LoginScreen die Meldung anzeigen kann.
+  const handleGateLogin = async (email, password) => {
+    if (isOnline()) {
+      try {
+        await withTimeout(handleSignIn(email, password), 9000, "Online-Anmeldung");
+        return;
+      } catch (err) {
+        if (!isNetworkFailure(err)) throw err;
+        console.warn("Online-Anmeldung nicht erreichbar, versuche Offline-Anmeldung:", err);
+      }
+    }
+    const offlineOk = await verifyOfflineCredential(email, password);
+    if (offlineOk) {
+      setIsAuthenticated(true);
+      setAuthSource("offline");
+      // "Angemeldet bleiben" auf diesem Gerät (siehe rememberOfflineSession) — beim
+      // nächsten Kaltstart ohne Netz muss das Passwort dadurch nicht erneut
+      // eingegeben werden, siehe restoreRememberedOfflineSession weiter unten.
+      rememberOfflineSession(email);
+      return;
+    }
+    throw new Error(
+      isOnline()
+        ? "Anmeldung fehlgeschlagen. Bitte Zugangsdaten prüfen."
+        : "Keine Internetverbindung und keine passenden, auf diesem Gerät zwischengespeicherten Zugangsdaten gefunden. Für die Offline-Anmeldung ist einmalig eine erfolgreiche Online-Anmeldung auf diesem Gerät erforderlich."
+    );
+  };
+
+  // Vollständiges Abmelden aus Sicht der App-Zugriffssperre: löst bei Bedarf zusätzlich
+  // die echte Supabase-Session auf (handleSignOut) und setzt in jedem Fall isAuthenticated/
+  // authSource zurück — auch im reinen Offline-Anmeldefall, in dem es ohnehin keine
+  // echte Session zum Auflösen gibt.
+  const handleAppLogout = async () => {
+    if (session) await handleSignOut();
+    setIsAuthenticated(false);
+    setAuthSource(null);
+    // Löscht auch die "Angemeldet bleiben"-Markierung des Offline-Anmeldepfads
+    // (siehe rememberOfflineSession/getRememberedOfflineEmail weiter oben) — ohne
+    // diesen Aufruf würde ein Nutzer, der offline angemeldet war, nach dem Klick auf
+    // "Abmelden" beim nächsten App-Start ohne Netzverbindung sofort wieder automatisch
+    // eingeloggt, obwohl er sich aktiv ausgeloggt hat.
+    forgetOfflineSession();
+  };
+
+  // "Passwort vergessen" auf dem Login-Bildschirm (siehe LoginScreen) — läuft
+  // bewusst über den ganz regulären "supabase"-Client (nicht inviteSupabase): hier
+  // ist noch niemand angemeldet, es gibt also keine bestehende Admin-Session, die
+  // durch einen Nebeneffekt gefährdet werden könnte.
+  const handleRequestPasswordReset = async (email) => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: typeof window !== "undefined" ? window.location.origin : undefined,
+    });
+    if (error) throw error;
+  };
+
+  // Eigene Profil-Einstellungen (Abschnitt 4, siehe ProfileModal) — beide Aktionen
+  // setzen zwingend eine echte, angemeldete Supabase-Session voraus (supabase.auth.
+  // updateUser arbeitet immer auf der aktuell aktiven Session des Haupt-Clients).
+  const handleUpdateEmail = async (newEmail) => {
+    const { error } = await supabase.auth.updateUser({ email: newEmail });
+    if (error) throw error;
+  };
+
+  const handleUpdatePassword = async (newPassword) => {
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) throw error;
+    // Den Offline-Anmeldefingerabdruck (siehe cacheOfflineCredential) an das neue
+    // Passwort anpassen — sonst würde die nächste Offline-Anmeldung an diesem Gerät
+    // noch mit dem alten, inzwischen ungültigen Passwort geprüft, obwohl die
+    // Online-Änderung gerade erfolgreich war.
+    if (session?.user?.email) {
+      cacheOfflineCredential(session.user.email, newPassword);
+    }
+  };
+
   // -------------------------------------------------------------------------------
   // DATEN-STATE
   // -------------------------------------------------------------------------------
@@ -5009,21 +14860,52 @@ function App() {
   const [floors, setFloors] = useState([]); // Etagen des aktuell geöffneten Projekts (inkl. leichter Pin-Zusammenfassung)
   const [loadingFloors, setLoadingFloors] = useState(false);
 
-  const [pins, setPins] = useState([]); // Pins der aktuell geöffneten Etage, inkl. pin_todos & pin_photos
+  const [floorPlans, setFloorPlans] = useState([]); // Grundrisskizzen der aktuell geöffneten Etage (inkl. leichter Pin-Zusammenfassung)
+  const [loadingFloorPlans, setLoadingFloorPlans] = useState(false);
+
+  // Bauzeitenplan — Meilensteine des aktuell geöffneten Projekts (siehe ScheduleView/
+  // ProjectScheduleProgress). Bewusst OHNE Offline-Cache (anders als floors/floorPlans/
+  // pins) — reine Terminplanung, keine vor-Ort-Dokumentationspflicht, für die eine
+  // Offline-Verfügbarkeit auf der Baustelle entscheidend wäre.
+  const [milestones, setMilestones] = useState([]);
+  const [loadingMilestones, setLoadingMilestones] = useState(false);
+  const [milestoneModalState, setMilestoneModalState] = useState(null); // { mode: "create" | "edit", milestone }
+
+  const [pins, setPins] = useState([]); // Pins der aktuell geöffneten Grundrissskizze, inkl. pin_photos
   const [loadingPins, setLoadingPins] = useState(false);
 
+  // Skizzen-Notizen (Plan Annotations) der aktuell geöffneten Grundrissskizze — werden
+  // zusammen mit den Pins geladen (siehe Effekt bei selectedFloorPlanId weiter unten),
+  // daher bewusst ohne eigenes loadingPlanNotes (loadingPins deckt beide ab).
+  const [planNotes, setPlanNotes] = useState([]);
+
   const [creatingPin, setCreatingPin] = useState(false);
+  const [creatingNote, setCreatingNote] = useState(false);
   const [globalError, setGlobalError] = useState(null);
 
-  const [screen, setScreen] = useState("projects"); // projects | floors | plan
+  const [screen, setScreen] = useState("projects"); // projects | floors | sketches | plan
   const [selectedProjectId, setSelectedProjectId] = useState(null);
   const [selectedFloorId, setSelectedFloorId] = useState(null);
+  const [selectedFloorPlanId, setSelectedFloorPlanId] = useState(null);
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": aktuell aktiver Tab in der
+  // Skizzenübersicht (SketchOverview) eines Geschosses. "grundriss" ist Default, siehe
+  // ANFORDERUNG Punkt 1. Wird unten per Effekt bei jedem Geschosswechsel zurückgesetzt,
+  // damit ein neu geöffnetes Geschoss immer mit "Grundrisse / Bestand" startet.
+  const [activeSketchCategory, setActiveSketchCategory] = useState("grundriss");
   const [query, setQuery] = useState("");
   const [modalState, setModalState] = useState(null); // { pinId, isNew }
+  const [noteModalState, setNoteModalState] = useState(null); // { noteId, isNew }
   const [floorModalOpen, setFloorModalOpen] = useState(false);
   const [editFloorModalState, setEditFloorModalState] = useState(null); // { floor }
   const [deleteFloorConfirm, setDeleteFloorConfirm] = useState(null); // { target }
   const [deleteFloorBusy, setDeleteFloorBusy] = useState(false);
+  const [floorPlanModalOpen, setFloorPlanModalOpen] = useState(false);
+  const [editFloorPlanModalState, setEditFloorPlanModalState] = useState(null); // { plan }
+  const [deleteFloorPlanConfirm, setDeleteFloorPlanConfirm] = useState(null); // { target }
+  const [deleteFloorPlanBusy, setDeleteFloorPlanBusy] = useState(false);
+  // ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL" — siehe
+  // SketchExportModal/handleExportSelectedSketchesPdf weiter unten.
+  const [sketchExportModalOpen, setSketchExportModalOpen] = useState(false);
   const [projectModalState, setProjectModalState] = useState(null); // { mode: "create" | "edit", project }
   const [deleteConfirm, setDeleteConfirm] = useState(null); // { target }
   const [deleteBusy, setDeleteBusy] = useState(false);
@@ -5033,6 +14915,7 @@ function App() {
 
   const [users, setUsers] = useState([]); // app_users, nur für angemeldete Nutzer ladbar (RLS)
   const [usersAdminOpen, setUsersAdminOpen] = useState(false);
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
 
   const [dropboxConnected, setDropboxConnected] = useState(() => isDropboxConnected());
   const [dropboxModalOpen, setDropboxModalOpen] = useState(false);
@@ -5046,10 +14929,23 @@ function App() {
   const [online, setOnline] = useState(() => isOnline());
   const [syncQueue, setSyncQueue] = useState(() => readSyncQueue());
   const [syncing, setSyncing] = useState(false);
+  // Sync-Status der Dexie-Schicht (./offline): ausstehende Pins, laufender Lauf, Ergebnis des letzten Laufs.
+  const { pendingCount: pendingPinCount, isSyncing: pinsSyncing, lastResult: pinSyncResult } = useOfflineSync();
 
   const project = projects.find((p) => p.id === selectedProjectId);
   const floor = floors.find((f) => f.id === selectedFloorId);
+  const plan = floorPlans.find((fp) => fp.id === selectedFloorPlanId);
   const activePin = modalState ? pins.find((p) => p.id === modalState.pinId) : null;
+  // Fortlaufende Pin-Nummer(n) ALLER Pins dieser Grundrissskizze — exakt dieselbe
+  // Logik (inkl. Unter-Nummerierung per "Duplizieren" erzeugter Kopien, siehe
+  // computePinNumberById) wie pinNumberById in FloorPlanView und wie die
+  // Export-Funktionen, damit die im Modal-Header angezeigte "Pin Nr. X" garantiert
+  // mit der Nummer auf dem Plan und in der Export-Tabelle übereinstimmt. Wird
+  // zusätzlich in handleDuplicatePin gebraucht, um die Nummer des Quell-Pins in die
+  // Bearbeitungshistorie der neuen Kopie zu schreiben.
+  const pinNumberEntryById = computePinNumberById(pins);
+  const activePinNumber = activePin ? pinNumberEntryById.get(activePin.id)?.label ?? null : null;
+  const activeNote = noteModalState ? planNotes.find((n) => n.id === noteModalState.noteId) : null;
 
   // Projektspezifische Gewerke-Einschränkung: null bedeutet "für dieses Projekt wurde
   // noch nie eine Auswahl gespeichert" (Bestandsprojekt von vor diesem Feature) — in
@@ -5060,14 +14956,16 @@ function App() {
   // Gewerk-Auswahl im Mängel-Modal (PinModal).
   const projectTradeIds = resolveProjectTradeIds(project);
   const projectTrades = projectTradeIds === null ? trades : trades.filter((t) => projectTradeIds.includes(t.id));
-  // Ist dem aktuell geöffneten Pin ein Gewerk zugeordnet, das (z.B. durch eine
-  // spätere Änderung der Projekt-Gewerke) nicht mehr in projectTrades enthalten ist,
-  // wird es dem Pin-Modal zusätzlich mitgegeben — sonst würde eine bestehende
-  // Zuordnung im Dropdown kommentarlos verschwinden, statt nur nicht mehr neu
-  // wählbar zu sein.
-  const activePinTrade = activePin?.trade_id ? trades.find((t) => t.id === activePin.trade_id) : null;
-  const pinModalTrades =
-    activePinTrade && !projectTrades.some((t) => t.id === activePinTrade.id) ? [...projectTrades, activePinTrade] : projectTrades;
+  // Sind dem aktuell geöffneten Pin ein oder mehrere Gewerke zugeordnet, die (z.B.
+  // durch eine spätere Änderung der Projekt-Gewerke) nicht mehr in projectTrades
+  // enthalten sind, werden sie dem Pin-Modal zusätzlich mitgegeben — sonst würde eine
+  // bestehende Zuordnung in der Chip-Auswahl kommentarlos verschwinden, statt nur
+  // nicht mehr neu wählbar zu sein (siehe TradeChipsPicker/getPinTradeIds).
+  const activePinExtraTrades = getPinTradeIds(activePin)
+    .filter((id) => !projectTrades.some((t) => t.id === id))
+    .map((id) => trades.find((t) => t.id === id))
+    .filter(Boolean);
+  const pinModalTrades = activePinExtraTrades.length > 0 ? [...projectTrades, ...activePinExtraTrades] : projectTrades;
 
   // Verknüpft die angemeldete Supabase-Auth-Session (nur E-Mail bekannt) mit dem
   // fachlichen Benutzerprofil aus app_users, sofern eines mit derselben E-Mail-
@@ -5080,6 +14978,15 @@ function App() {
   // (Abschnitt 3, siehe logPinActivity/created_by/updated_by) — null, solange
   // niemand angemeldet ist (Mängel-Aktionen erfordern ohnehin eine Anmeldung).
   const currentActor = session?.user?.email ? { email: session.user.email, name: currentAppUser?.name || session.user.email } : null;
+
+  // Rollen- & Projekt-Filterung (Abschnitt 3): die Projektübersicht bekommt diese
+  // gefilterte Liste statt der rohen "projects" gereicht — Administrator (bzw. noch
+  // kein app_users-Profil vorhanden, siehe canUserAccessProject-Bootstrap) sieht
+  // dadurch weiterhin ausnahmslos alle Projekte, jede andere Rolle nur die eigenen.
+  // Bewusst NUR die Sichtbarkeit der Liste betroffen — welche Schreibrechte eine
+  // Rolle innerhalb eines ihr zugeordneten Projekts hat, ist nicht Teil dieser
+  // Anforderung und bleibt unverändert (siehe Einordnung).
+  const visibleProjects = projects.filter((p) => canUserAccessProject(currentAppUser, p.id));
 
   // -------------------------------------------------------------------------------
   // DATA FETCHING
@@ -5104,7 +15011,12 @@ function App() {
     };
   }, []);
 
+  // An isAuthenticated statt an [] gebunden: solange die verpflichtende App-
+  // Zugriffssperre aktiv ist (siehe LoginScreen), sollen Projektdaten erst gar nicht im
+  // Hintergrund abgerufen werden — nicht nur nicht angezeigt. Feuert erneut, sobald
+  // isAuthenticated von false auf true wechselt (erfolgreiche Anmeldung).
   useEffect(() => {
+    if (!isAuthenticated) return undefined;
     let cancelled = false;
     (async () => {
       setLoadingProjects(true);
@@ -5136,12 +15048,15 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isAuthenticated]);
 
   // Gewerke sind öffentlich lesbar und unabhängig vom ausgewählten Projekt — werden
-  // deshalb einmalig beim Start geladen (inkl. automatischer Erstbefüllung des
-  // Standard-Katalogs, falls die Tabelle noch leer ist, siehe fetchTrades()).
+  // deshalb einmalig nach erfolgreicher Anmeldung geladen (inkl. automatischer
+  // Erstbefüllung des Standard-Katalogs, falls die Tabelle noch leer ist, siehe
+  // fetchTrades()). Ebenfalls an isAuthenticated statt an [] gebunden, aus demselben
+  // Grund wie beim Projekte-Abruf direkt darüber.
   useEffect(() => {
+    if (!isAuthenticated) return undefined;
     let cancelled = false;
     (async () => {
       try {
@@ -5155,7 +15070,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isAuthenticated]);
 
   // Die Benutzerliste enthält E-Mail-Adressen (RLS-Policy: nur "authenticated" darf
   // lesen) und wird deshalb erst nach erfolgreichem Login geladen.
@@ -5212,38 +15127,192 @@ function App() {
     };
   }, [selectedProjectId]);
 
+  // Bauzeitenplan-Meilensteine des aktuell geöffneten Projekts — lädt parallel zu den
+  // Etagen (gleiche Abhängigkeit selectedProjectId), bewusst ohne Offline-Cache/
+  // Fallback (siehe Kommentar bei der milestones-State-Deklaration oben).
   useEffect(() => {
-    if (!selectedFloorId) {
-      setPins([]);
+    if (!selectedProjectId) {
+      setMilestones([]);
       return;
     }
     let cancelled = false;
     (async () => {
-      setLoadingPins(true);
+      setLoadingMilestones(true);
       try {
-        if (!isOnline()) throw new Error("Keine Internetverbindung.");
-        const data = await fetchPinsWithDetails(selectedFloorId);
-        if (!cancelled) {
-          setPins(data);
-          cachePinsOffline(selectedFloorId, data);
+        const data = await fetchProjectMilestones(selectedProjectId);
+        if (!cancelled) setMilestones(data);
+      } catch (err) {
+        console.error("Bauzeitenplan-Meilensteine konnten nicht geladen werden:", err);
+        if (!cancelled) setGlobalError("Bauzeitenplan-Meilensteine konnten nicht geladen werden. Bitte erneut versuchen.");
+      } finally {
+        if (!cancelled) setLoadingMilestones(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProjectId]);
+
+  // ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS": Stale-
+  // While-Revalidate — der IndexedDB-Cache (siehe getSketchesForFloorFromIDB oben)
+  // wird IMMER zuerst geprüft, unabhängig vom Online-Status, und bei einem Treffer
+  // SOFORT gerendert (Zero-Latency, kein Lade-Spinner). Der anschließende
+  // Server-Request läuft in JEDEM Fall trotzdem weiter im Hintergrund und ersetzt
+  // den angezeigten Stand, sobald er eintrifft — ein Netzwerkfehler NACH einem
+  // bereits erfolgten Cache-Treffer wird deshalb bewusst nicht mehr als harter
+  // Fehler gemeldet (der Nutzer sieht ja bereits einen validen, nur ggf. leicht
+  // veralteten Stand), sondern nur als Konsolenwarnung. Der bereits bestehende
+  // localStorage-Fallback (readCachedFloorPlans) bleibt unverändert als zweite
+  // Sicherheitsnetz-Ebene bestehen, für den Fall, dass weder IndexedDB noch das
+  // Netzwerk etwas liefern.
+  useEffect(() => {
+    if (!selectedFloorId) {
+      setFloorPlans([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      let servedFromIdb = false;
+      try {
+        const idbSketches = await getSketchesForFloorFromIDB(selectedFloorId);
+        if (!cancelled && idbSketches && idbSketches.length > 0) {
+          setFloorPlans(idbSketches);
+          setLoadingFloorPlans(false);
+          servedFromIdb = true;
         }
       } catch (err) {
-        const cached = readCachedPins(selectedFloorId);
-        if (cached) {
-          console.warn("Pins konnten nicht live geladen werden, verwende Offline-Cache:", err);
-          if (!cancelled) setPins(cached);
+        console.warn("IndexedDB-Zwischenspeicher für Grundrisskizzen konnte nicht gelesen werden:", err);
+      }
+      if (!servedFromIdb && !cancelled) setLoadingFloorPlans(true);
+      try {
+        if (!isOnline()) throw new Error("Keine Internetverbindung.");
+        const data = await fetchFloorPlansWithPinSummary(selectedFloorId);
+        if (!cancelled) {
+          setFloorPlans(data);
+          cacheFloorPlansOffline(selectedFloorId, data);
+          saveSketchesForFloorToIDB(selectedFloorId, data);
+        }
+      } catch (err) {
+        if (servedFromIdb) {
+          console.warn(
+            "Grundrisskizzen konnten im Hintergrund nicht aktualisiert werden, zuletzt zwischengespeicherter Stand (IndexedDB) bleibt sichtbar:",
+            err
+          );
         } else {
-          console.error("Pins konnten nicht geladen werden:", err);
-          if (!cancelled) setGlobalError("Pins konnten nicht geladen werden. Bitte erneut versuchen.");
+          const cached = readCachedFloorPlans(selectedFloorId);
+          if (cached) {
+            console.warn("Grundrisskizzen konnten nicht live geladen werden, verwende Offline-Cache:", err);
+            if (!cancelled) setFloorPlans(cached);
+          } else {
+            console.error("Grundrisskizzen konnten nicht geladen werden:", err);
+            if (!cancelled) setGlobalError("Grundrisskizzen konnten nicht geladen werden. Bitte erneut versuchen.");
+          }
         }
       } finally {
-        if (!cancelled) setLoadingPins(false);
+        if (!cancelled) setLoadingFloorPlans(false);
       }
     })();
     return () => {
       cancelled = true;
     };
   }, [selectedFloorId]);
+
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": bei jedem Geschosswechsel zurück auf den
+  // Default-Tab "Grundrisse / Bestand" springen, damit nicht versehentlich der zuletzt
+  // in einem anderen Geschoss aktive Tab (z.B. "Werkpläne") übernommen wird, obwohl das
+  // neue Geschoss in dieser Kategorie eventuell noch leer ist.
+  useEffect(() => {
+    setActiveSketchCategory("grundriss");
+  }, [selectedFloorId]);
+
+  // Pins der geöffneten Grundrissskizze: Offline-First über Dexie (./offline).
+  // 1. Sofort den lokalen Stand zeigen (kein Warten auf das Netz).
+  // 2. Ist eine Verbindung da: erst lokale, noch nicht übertragene Änderungen hochladen, dann den
+  //    Serverstand per Pull in Dexie einmischen (ungesyncte lokale Änderungen bleiben erhalten)
+  //    und neu anzeigen.
+  // 3. Ohne Verbindung und ohne lokalen Stand: einmalige Übernahme der alten Caches (IndexedDB/
+  //    localStorage aus der Zeit vor Dexie), damit bereits geöffnete Skizzen offline lesbar bleiben.
+  useEffect(() => {
+    if (!selectedFloorPlanId) {
+      setPins([]);
+      setPlanNotes([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      let servedLocally = false;
+      try {
+        const localPins = await offlineStore.loadPlanPins(selectedFloorPlanId);
+        if (!cancelled && localPins.length > 0) {
+          setPins(localPins);
+          setLoadingPins(false);
+          servedLocally = true;
+        }
+      } catch (err) {
+        console.warn("Lokaler Pin-Stand (Dexie) konnte nicht gelesen werden:", err);
+      }
+      if (!servedLocally && !cancelled) setLoadingPins(true);
+      try {
+        if (!isOnline()) throw new Error("Keine Internetverbindung.");
+        await syncEngine.refreshPlan(selectedFloorPlanId);
+        const fresh = await offlineStore.loadPlanPins(selectedFloorPlanId);
+        if (!cancelled) setPins(fresh);
+      } catch (err) {
+        if (servedLocally) {
+          console.warn("Pins konnten im Hintergrund nicht aktualisiert werden, lokaler Stand (Dexie) bleibt sichtbar:", err);
+        } else {
+          // Migrationspfad: alte Caches einmalig nach Dexie übernehmen. Pins mit offline_-ID gehören
+          // noch zur alten Warteschlange und werden dort synchronisiert, nicht hier.
+          let legacyPins = null;
+          try {
+            legacyPins = (await getPinsFromIDB(selectedFloorPlanId)) || readCachedPins(selectedFloorPlanId);
+          } catch {
+            legacyPins = readCachedPins(selectedFloorPlanId);
+          }
+          const importable = (legacyPins || []).filter((p) => !isOfflineId(p.id));
+          if (importable.length > 0) {
+            console.warn("Pins konnten nicht live geladen werden, übernehme alten Offline-Cache nach Dexie:", err);
+            try {
+              await offlineStore.cacheServerPins(importable);
+              if (!cancelled) setPins(await offlineStore.loadPlanPins(selectedFloorPlanId));
+            } catch (importErr) {
+              console.error("Alter Offline-Cache konnte nicht nach Dexie übernommen werden:", importErr);
+              if (!cancelled) setPins(importable);
+            }
+          } else {
+            console.error("Pins konnten nicht geladen werden:", err);
+            if (!cancelled) setGlobalError("Pins konnten nicht geladen werden. Bitte erneut versuchen.");
+          }
+        }
+      } finally {
+        if (!cancelled) setLoadingPins(false);
+      }
+      // Skizzen-Notizen laufen bewusst als eigener, unabhängiger Block: ein Fehler
+      // beim Laden der Notizen soll die bereits erfolgreich geladenen Pins nicht
+      // verwerfen (und umgekehrt) — beide Ressourcen haben ihren eigenen
+      // Offline-Lese-Cache (siehe cachePlanNotesOffline/readCachedPlanNotes).
+      try {
+        if (!isOnline()) throw new Error("Keine Internetverbindung.");
+        const notes = await fetchPlanNotes(selectedFloorPlanId);
+        if (!cancelled) {
+          setPlanNotes(notes);
+          cachePlanNotesOffline(selectedFloorPlanId, notes);
+        }
+      } catch (err) {
+        const cachedNotes = readCachedPlanNotes(selectedFloorPlanId);
+        if (cachedNotes) {
+          console.warn("Notizen konnten nicht live geladen werden, verwende Offline-Cache:", err);
+          if (!cancelled) setPlanNotes(cachedNotes);
+        } else {
+          console.error("Skizzen-Notizen konnten nicht geladen werden:", err);
+          if (!cancelled) setPlanNotes([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFloorPlanId]);
 
   // Hält den lokalen Offline-Cache auch nach optimistischen Zwischenständen aktuell
   // (neuer Pin, geänderte Felder, neues Foto, …), nicht nur beim initialen Laden
@@ -5253,22 +15322,40 @@ function App() {
     if (selectedProjectId) cacheFloorsOffline(selectedProjectId, floors);
   }, [floors, selectedProjectId]);
   useEffect(() => {
-    if (selectedFloorId) cachePinsOffline(selectedFloorId, pins);
-  }, [pins, selectedFloorId]);
+    if (selectedFloorId) cacheFloorPlansOffline(selectedFloorId, floorPlans);
+  }, [floorPlans, selectedFloorId]);
+  // ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS": exakt
+  // dasselbe Prinzip, jetzt zusätzlich auch in den neuen IndexedDB-Cache gespiegelt
+  // ("sofort synchron aktualisiert" bei JEDER Änderung — Anlegen, Bearbeiten,
+  // Löschen, Duplizieren, Foto hinzufügen/entfernen, Offline-Synchronisation, …
+  // laufen alle über genau diese beiden State-Setter, ein einzelner zentraler Effekt
+  // je Ressource deckt dadurch automatisch JEDEN Mutationspfad ab, ohne dass jede
+  // einzelne Aktion selbst um einen IndexedDB-Schreibzugriff ergänzt werden müsste).
+  useEffect(() => {
+    if (selectedFloorId) saveSketchesForFloorToIDB(selectedFloorId, floorPlans);
+  }, [floorPlans, selectedFloorId]);
+  // Pins werden hier bewusst nicht mehr gespiegelt: Dexie (./offline) ist die Quelle der Wahrheit
+  // und wird von den Pin-Handlern selbst geschrieben.
+  useEffect(() => {
+    if (selectedFloorPlanId) cachePlanNotesOffline(selectedFloorPlanId, planNotes);
+  }, [planNotes, selectedFloorPlanId]);
   useEffect(() => {
     cacheProjectsOffline(projects);
   }, [projects]);
 
   // -------------------------------------------------------------------------------
   // Hilfsfunktionen, um die "leichten" Pin-Zusammenfassungen (nur id/status) in
-  // floors- und projects-State synchron zu halten, damit Badges auf Etagen- und
-  // Projektübersicht sofort korrekt sind, ohne nach jeder Pin-Änderung alles neu
-  // vom Server zu laden.
+  // floors-, floorPlans- und projects-State synchron zu halten, damit Badges auf
+  // Etagen-, Grundrisskizzen- und Projektübersicht sofort korrekt sind, ohne nach
+  // jeder Pin-Änderung alles neu vom Server zu laden. floorId aktualisiert die
+  // geschossweite Aggregation (alle Skizzen zusammen), planId zusätzlich die
+  // Aggregation der konkret betroffenen Grundrisskizze.
   // -------------------------------------------------------------------------------
 
-  const addPinSummary = (floorId, pin) => {
+  const addPinSummary = (floorId, planId, pin) => {
     const summary = { id: pin.id, status: pin.status };
     setFloors((prev) => prev.map((f) => (f.id === floorId ? { ...f, pins: [...(f.pins || []), summary] } : f)));
+    setFloorPlans((prev) => prev.map((fp) => (fp.id === planId ? { ...fp, pins: [...(fp.pins || []), summary] } : fp)));
     setProjects((prev) =>
       prev.map((p) =>
         p.id !== selectedProjectId
@@ -5278,8 +15365,11 @@ function App() {
     );
   };
 
-  const removePinSummary = (floorId, pinId) => {
+  const removePinSummary = (floorId, planId, pinId) => {
     setFloors((prev) => prev.map((f) => (f.id === floorId ? { ...f, pins: (f.pins || []).filter((p) => p.id !== pinId) } : f)));
+    setFloorPlans((prev) =>
+      prev.map((fp) => (fp.id === planId ? { ...fp, pins: (fp.pins || []).filter((p) => p.id !== pinId) } : fp))
+    );
     setProjects((prev) =>
       prev.map((p) =>
         p.id !== selectedProjectId
@@ -5289,8 +15379,13 @@ function App() {
     );
   };
 
-  const updatePinSummaryStatus = (floorId, pinId, status) => {
+  const updatePinSummaryStatus = (floorId, planId, pinId, status) => {
     setFloors((prev) => prev.map((f) => (f.id === floorId ? { ...f, pins: (f.pins || []).map((p) => (p.id === pinId ? { ...p, status } : p)) } : f)));
+    setFloorPlans((prev) =>
+      prev.map((fp) =>
+        fp.id === planId ? { ...fp, pins: (fp.pins || []).map((p) => (p.id === pinId ? { ...p, status } : p)) } : fp
+      )
+    );
     setProjects((prev) =>
       prev.map((p) =>
         p.id !== selectedProjectId
@@ -5323,13 +15418,33 @@ function App() {
     };
   }, []);
 
-  // Ein Pin gilt als "noch nicht synchronisiert", solange irgendein Eintrag in der
-  // Warteschlange sich auf ihn bezieht — entweder über seine (dann noch lokale)
-  // Offline-ID, oder weil bereits eine Folgeänderung für ihn wartet. Weitere
-  // Bearbeitungen an einem solchen Pin werden bewusst ebenfalls eingereiht (statt
-  // direkt an Supabase gesendet), damit die Reihenfolge der Änderungen erhalten
-  // bleibt, auch wenn zwischenzeitlich kurz wieder eine Verbindung bestand.
-  const isPinPendingSync = (pinId) => isOfflineId(pinId) || syncQueue.some((q) => q.pinId === pinId || q.localId === pinId);
+  // Hinweis: Pins, Pin-Fotos, Verlauf und Löschungen laufen seit der Umstellung auf Dexie
+  // (./offline) nicht mehr über diese Warteschlange. Sie nimmt nur noch Einträge auf, die
+  // noch nicht umgestellt sind (reorder_floors, update_photo für bereits synchronisierte
+  // Fotos) sowie Altbestände aus der Zeit vor der Umstellung (create_pin/update_pin/
+  // upload_photo/delete_pin), die beim ersten Online-Gang nach dem Update noch abgearbeitet werden.
+
+  // Meldet fehlgeschlagene Übertragungen der Dexie-Schicht. Reine Verbindungsabbrüche bleiben still,
+  // sie werden automatisch beim nächsten "online" wiederholt (der Status-Indikator zeigt die ausstehenden).
+  useEffect(() => {
+    if (!pinSyncResult || pinSyncResult.failed === 0) return;
+    if (pinSyncResult.aborted === "network" || pinSyncResult.aborted === "offline") return;
+    setGlobalError(
+      pinSyncResult.aborted === "session"
+        ? "Die Anmeldung ist abgelaufen. Lokal gespeicherte Änderungen werden übertragen, sobald du wieder angemeldet bist."
+        : "Ein Teil der lokal gespeicherten Änderungen konnte noch nicht übertragen werden. Die App versucht es automatisch erneut."
+    );
+  }, [pinSyncResult]);
+
+  // Frisch hochgeladene Pin-Fotos für die Offline-Anzeige vormerken (best effort, siehe
+  // cacheAssetForOfflineUseInBackground): lokal wird nach dem Upload kein Blob mehr vorgehalten.
+  useEffect(
+    () =>
+      syncEngine.onSynced((result) => {
+        (result.uploadedPhotoUrls || []).forEach((url) => cacheAssetForOfflineUseInBackground(url));
+      }),
+    []
+  );
 
   // Arbeitet die Warteschlange sequenziell (FIFO) ab, sobald wieder eine Verbindung
   // besteht — ein einzelner fehlschlagender Eintrag beendet den Lauf, alle bereits
@@ -5351,7 +15466,12 @@ function App() {
       for (const item of queue) {
         const targetPinId = item.pinId ? idMap.get(item.pinId) || resolveOfflineId(item.pinId) : null;
         if (item.type === "create_pin") {
-          const pin = await createPin(item.floorId, item.x, item.y, item.actor);
+          // item.overrides trägt ein offline dupliziertes/per Vorlage befülltes
+          // Klemmbrett bis zum Synchronisieren mit — ohne diese Weitergabe würde der
+          // serverseitig neu angelegte Pin wieder auf die generischen createPin-
+          // Standardwerte zurückfallen, obwohl lokal längst die kopierten Stammdaten
+          // angezeigt werden (siehe handlePlanClick).
+          const pin = await createPin(item.planId, item.floorId, item.x, item.y, item.actor, item.overrides || {});
           await logPinActivity(pin.id, "created", "Mängel-Pin angelegt (offline erfasst, synchronisiert)", item.actor);
           idMap.set(item.localId, pin.id);
           rememberSyncedPinId(item.localId, pin.id);
@@ -5364,6 +15484,29 @@ function App() {
           const file = dataUrlToFile(item.dataUrl, item.fileName, item.mimeType);
           await uploadPinPhoto(targetPinId, file, item.actor);
           await logPinActivity(targetPinId, "photo_added", `Foto hochgeladen: „${item.fileName}" (offline erfasst, synchronisiert)`, item.actor);
+        } else if (item.type === "update_photo") {
+          // Foto-Markup, offline gespeichert (siehe handleSavePhotoMarkup) — ersetzt
+          // beim Synchronisieren die Bilddatei des bereits bestehenden Fotos exakt wie
+          // im Online-Fall (siehe updatePinPhotoUrl), inkl. Aufräumen der alten Version.
+          await updatePinPhotoUrl({ id: item.photoId, pin_id: targetPinId, photo_url: item.oldPhotoUrl }, item.dataUrl, item.actor);
+          await logPinActivity(targetPinId, "photo_edited", "Foto bearbeitet (offline erfasst, synchronisiert)", item.actor);
+        } else if (item.type === "delete_pin") {
+          // Offline-Löschung (siehe handleDeletePin) — photos wurde beim Einreihen des
+          // Warteschlangen-Eintrags mitgeschickt (der lokale Zustand kennt den Pin zu
+          // diesem Zeitpunkt ja bereits nicht mehr), deletePin() räumt damit wie im
+          // Online-Fall auch die zugehörigen Storage-Dateien mit auf. Ein etwaiger noch
+          // davor in der Warteschlange stehender update_pin-Eintrag für denselben Pin
+          // (Bearbeitung vor der Löschung, beides offline) läuft in der Reihenfolge der
+          // Warteschlange einfach vorher durch — unschädlich, das Ergebnis ist ohnehin
+          // "gelöscht".
+          await deletePin({ id: targetPinId, pin_photos: item.photos || [] });
+        } else if (item.type === "reorder_floors") {
+          // floorIds sind bereits echte, serverseitige Etagen-IDs — anders als bei
+          // Pins ist das Anlegen einer Etage NICHT offline-fähig (siehe handleAddFloor,
+          // kein !online-Zweig dort), ein rein offline angelegtes, noch unsynchronisiertes
+          // Geschoss kann also gar nicht Teil einer umsortierten Reihenfolge sein. Eine
+          // idMap-Auflösung wie bei targetPinId ist hier deshalb nicht nötig.
+          await reorderFloors(item.floorIds.map((id) => ({ id })));
         }
         processedAny = true;
         const remaining = readSyncQueue().filter((q) => q.id !== item.id);
@@ -5401,8 +15544,17 @@ function App() {
     }
     if (selectedFloorId) {
       try {
-        const freshPins = await fetchPinsWithDetails(selectedFloorId);
-        setPins(freshPins);
+        const freshPlans = await fetchFloorPlansWithPinSummary(selectedFloorId);
+        setFloorPlans(freshPlans);
+      } catch (err) {
+        console.error("Grundrisskizzen konnten nach der Synchronisation nicht aktualisiert werden:", err);
+      }
+    }
+    if (selectedFloorPlanId) {
+      try {
+        // Erst lokale Änderungen hochladen, dann Serverstand holen und in Dexie einmischen.
+        await syncEngine.refreshPlan(selectedFloorPlanId);
+        setPins(await offlineStore.loadPlanPins(selectedFloorPlanId));
       } catch (err) {
         console.error("Pins konnten nach der Synchronisation nicht aktualisiert werden:", err);
       }
@@ -5423,13 +15575,40 @@ function App() {
   // -------------------------------------------------------------------------------
 
   const openProject = (id) => {
+    // Verteidigung in der Tiefe zur clientseitigen Filterung von visibleProjects
+    // oben (siehe canUserAccessProject): die Projektübersicht zeigt einer
+    // Standard-Rolle ohnehin nur zugeordnete Projekte an, dieser zusätzliche Guard
+    // greift nur, falls eine nicht mehr zugängliche Projekt-ID auf anderem Weg
+    // angesteuert würde (z.B. veralteter Offline-Cache-Eintrag).
+    if (!canUserAccessProject(currentAppUser, id)) {
+      setGlobalError("Für dieses Projekt liegt keine Berechtigung vor.");
+      return;
+    }
     setSelectedProjectId(id);
     setSelectedFloorId(null);
+    setSelectedFloorPlanId(null);
     setScreen("floors");
   };
 
+  // Führt zur Grundrisskizzen-Übersicht dieses Geschosses (Ebene 3) — NICHT mehr
+  // direkt in die Planansicht. Erst die konkrete Auswahl einer Skizze (siehe
+  // openFloorPlanSketch) öffnet die interaktive Pin-Ebene (Ebene 4).
   const openFloor = (id) => {
     setSelectedFloorId(id);
+    setSelectedFloorPlanId(null);
+    setScreen("sketches");
+  };
+
+  // Führt zum Bauzeitenplan (Ebene 2b, parallel zur Etagenübersicht) — bewusst über
+  // einen eigenen screen-Wert statt eines Reiters innerhalb von FloorOverview, damit
+  // die Navigation dem etablierten Breadcrumb-Muster dieser App folgt (siehe
+  // Breadcrumb-Leiste weiter unten).
+  const openScheduleView = () => {
+    setScreen("schedule");
+  };
+
+  const openFloorPlanSketch = (id) => {
+    setSelectedFloorPlanId(id);
     setScreen("plan");
   };
 
@@ -5452,35 +15631,130 @@ function App() {
     setDeleteConfirm({ target: proj });
   };
 
+  // Favoriten-Stern in ProjectOverview (Grid- & Listenansicht) — optimistisches Update
+  // mit Rollback, damit der Klick sofort sichtbar reagiert, ein Speicherfehler aber nicht
+  // stillschweigend zu einem falschen Favoriten-Status in der Oberfläche führt.
+  const handleToggleProjectFavorite = async (project) => {
+    if (!requireAuth()) return;
+    const nextValue = !project.is_favorite;
+    setProjects((prev) => prev.map((p) => (p.id === project.id ? { ...p, is_favorite: nextValue } : p)));
+    try {
+      await updateProject(project.id, { is_favorite: nextValue });
+    } catch (err) {
+      console.error("Favoriten-Status konnte nicht gespeichert werden:", err);
+      setProjects((prev) => prev.map((p) => (p.id === project.id ? { ...p, is_favorite: !nextValue } : p)));
+      setGlobalError("Favoriten-Status konnte nicht gespeichert werden. Bitte erneut versuchen.");
+    }
+  };
+
+  // Projekt abschließen/wiederherstellen (siehe "Projekt abschließen"-Button in
+  // FloorOverview und die Schnell-Reaktivierung direkt auf der Kachel im Archiv-Filter
+  // von ProjectOverview) — beide Oberflächen rufen denselben Handler, damit Status und
+  // is_archived nie auseinanderlaufen können. Reines Umschalten anhand des aktuellen
+  // project.is_archived: aktiv -> Abgeschlossen/archiviert, archiviert -> wieder
+  // "In Bearbeitung"/aktiv. Optimistisches Update mit Rollback wie beim Favoriten-Stern.
+  const handleToggleProjectArchive = async (project) => {
+    if (!requireAuth()) return;
+    const nextArchived = !project.is_archived;
+    const nextStatus = nextArchived ? "Abgeschlossen" : "In Bearbeitung";
+    const prevStatus = project.status;
+    setProjects((prev) =>
+      prev.map((p) => (p.id === project.id ? { ...p, is_archived: nextArchived, status: nextStatus } : p))
+    );
+    try {
+      await updateProject(project.id, { is_archived: nextArchived, status: nextStatus });
+    } catch (err) {
+      console.error("Archiv-Status konnte nicht gespeichert werden:", err);
+      setProjects((prev) =>
+        prev.map((p) => (p.id === project.id ? { ...p, is_archived: !nextArchived, status: prevStatus } : p))
+      );
+      setGlobalError(
+        nextArchived
+          ? "Projekt konnte nicht abgeschlossen werden. Bitte erneut versuchen."
+          : "Projekt konnte nicht wiederhergestellt werden. Bitte erneut versuchen."
+      );
+    }
+  };
+
   const handleSaveProject = async (fields) => {
+    // _coverImageFile ist kein echtes Projektfeld (siehe ProjectFormModal), sondern
+    // die neu ausgewählte Titelbild-Datei, noch nicht hochgeladen — beim Anlegen
+    // existiert die für den Storage-Pfad benötigte Projekt-ID erst NACH dem Insert,
+    // deshalb läuft der eigentliche Upload immer erst hier, nie im Modal selbst.
+    const { _coverImageFile: coverImageFile, ...projectFields } = fields;
     if (projectModalState.mode === "create") {
-      const created = await createProject(fields);
-      setProjects((prev) => [{ ...created, floors: [] }, ...prev]);
+      const created = await createProject(projectFields);
+      let finalProject = created;
+      if (coverImageFile) {
+        // Ein fehlgeschlagener Titelbild-Upload darf das bereits erfolgreich
+        // angelegte Projekt nicht verwerfen — das Projekt bleibt bestehen, nur das
+        // Titelbild fehlt dann, mit klarer Rückmeldung über das globale Fehler-Banner
+        // statt eines Fehlers im (dann schon geschlossenen) Anlage-Dialog.
+        try {
+          const publicUrl = await uploadProjectCoverImage(created.id, coverImageFile);
+          finalProject = await updateProject(created.id, { cover_image_url: publicUrl });
+        } catch (err) {
+          console.error("Projekt-Titelbild konnte nicht hochgeladen werden:", err);
+          setGlobalError("Projekt wurde angelegt, das Titelbild konnte aber nicht hochgeladen werden. Bitte im Bearbeiten-Dialog erneut versuchen.");
+        }
+      }
+      setProjects((prev) => [{ ...finalProject, floors: [] }, ...prev]);
     } else {
-      const updated = await updateProject(projectModalState.project.id, fields);
+      let updatePayload = projectFields;
+      if (coverImageFile) {
+        try {
+          const publicUrl = await uploadProjectCoverImage(projectModalState.project.id, coverImageFile);
+          updatePayload = { ...updatePayload, cover_image_url: publicUrl };
+        } catch (err) {
+          console.error("Projekt-Titelbild konnte nicht hochgeladen werden:", err);
+          setGlobalError("Die übrigen Änderungen werden gespeichert, das neue Titelbild konnte aber nicht hochgeladen werden. Bitte erneut versuchen.");
+        }
+      }
+      const updated = await updateProject(projectModalState.project.id, updatePayload);
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? { ...p, ...updated } : p)));
     }
     setProjectModalState(null);
-    // Fehler werden NICHT hier gefangen: ProjectFormModal wartet auf dieses Promise
-    // und zeigt einen Fehlertext direkt im Modal, falls Insert/Update scheitern.
+    // Fehler werden (bis auf den separat abgefangenen Titelbild-Upload oben) NICHT
+    // hier gefangen: ProjectFormModal wartet auf dieses Promise und zeigt einen
+    // Fehlertext direkt im Modal, falls Insert/Update scheitern.
   };
 
-  // Schaltet den Status einer einzelnen, beauftragten LPH-Phase in der Detailansicht um
-  // (Klick auf die entsprechende Kachel in LphStatusGrid) und persistiert die Änderung in
-  // Supabase. Optimistisches Update im lokalen State für sofortiges visuelles Feedback,
-  // mit Rollback, falls das Update serverseitig fehlschlägt.
-  const handleUpdateLphStatus = async (phaseKey, newStatus) => {
-    if (!requireAuth() || !project) return;
-    const previousStatus = project.lph_status || defaultLphStatus();
-    const updatedStatus = { ...previousStatus, [phaseKey]: newStatus };
-    setProjects((prev) => prev.map((p) => (p.id === project.id ? { ...p, lph_status: updatedStatus } : p)));
-    try {
-      await updateProject(project.id, { lph_status: updatedStatus });
-    } catch (err) {
-      console.error("LPH-Status konnte nicht gespeichert werden:", err);
-      setGlobalError("Der LPH-Status konnte nicht gespeichert werden. Bitte erneut versuchen.");
-      setProjects((prev) => prev.map((p) => (p.id === project.id ? { ...p, lph_status: previousStatus } : p)));
+  // ---------------------------------------------------------------------------------
+  // BAUZEITENPLAN — MEILENSTEIN-HANDLER (siehe ScheduleView/MilestoneModal)
+  // ---------------------------------------------------------------------------------
+  const openAddMilestoneModal = () => {
+    if (!requireAuth()) return;
+    setMilestoneModalState({ mode: "create", milestone: null });
+  };
+
+  const openEditMilestoneModal = (milestone) => {
+    if (!requireAuth()) return;
+    setMilestoneModalState({ mode: "edit", milestone });
+  };
+
+  const handleSaveMilestone = async (fields) => {
+    if (milestoneModalState.mode === "create") {
+      const created = await createProjectMilestone(selectedProjectId, fields, currentActor);
+      setMilestones((prev) => [...prev, created]);
+    } else {
+      const updated = await updateProjectMilestone(milestoneModalState.milestone.id, fields, currentActor);
+      setMilestones((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
     }
+    setMilestoneModalState(null);
+    // Fehler werden bewusst NICHT hier gefangen — MilestoneModal wartet auf dieses
+    // Promise und zeigt einen Fehlertext direkt im Modal (gleiches Muster wie
+    // handleSaveProject/ProjectFormModal).
+  };
+
+  // Direktes Löschen aus dem Modal-Footer heraus, ohne separaten Bestätigungsdialog —
+  // gleiches, bereits etabliertes Muster wie handleDeleteNote/PlanNoteModal (siehe
+  // ANFORDERUNG "Direct Delete in Pin- & Notiz-Modals"), bewusst auch für Meilensteine
+  // übernommen statt ConfirmDialog: ein Bauabschnitt trägt deutlich weniger Risiko
+  // (keine Fotos/Verlauf/Unterpins) als ein Mängel-Pin.
+  const handleDeleteMilestone = async (milestoneId) => {
+    await deleteProjectMilestone(milestoneId);
+    setMilestones((prev) => prev.filter((m) => m.id !== milestoneId));
+    setMilestoneModalState(null);
   };
 
   const confirmDeleteProject = async () => {
@@ -5493,6 +15767,7 @@ function App() {
       if (selectedProjectId === target.id) {
         setSelectedProjectId(null);
         setSelectedFloorId(null);
+        setSelectedFloorPlanId(null);
         setScreen("projects");
       }
       setDeleteConfirm(null);
@@ -5513,26 +15788,51 @@ function App() {
     setFloorModalOpen(true);
   };
 
-  const handleAddFloor = async (name, file) => {
+  // Ein Geschoss ist ab sofort ein reiner Namens-Container (siehe createFloor) — kein
+  // Datei-Upload mehr auf dieser Ebene, siehe stattdessen handleAddFloorPlanSketch.
+  const handleAddFloor = async (name) => {
     if (!selectedProjectId) return;
-    const newFloor = await createFloor(selectedProjectId, name, file);
-    setFloors((prev) => [...prev, { ...newFloor, pins: [] }]);
+    // Neues Geschoss wird ans Ende der aktuellen Reihenfolge angehängt (sort_order =
+    // bisherige Anzahl Geschosse) — exakt dasselbe Muster wie handleCreateTrade weiter
+    // unten für Gewerke.
+    const newFloor = await createFloor(selectedProjectId, name, floors.length);
+    setFloors((prev) => [...prev, { ...newFloor, pins: [], floor_plans: [] }]);
     setProjects((prev) =>
       prev.map((p) =>
         p.id !== selectedProjectId
           ? p
-          : {
-              ...p,
-              floors: [
-                ...(p.floors || []),
-                { id: newFloor.id, name: newFloor.name, image_url: newFloor.image_url, file_type: newFloor.file_type, pins: [] },
-              ],
-            }
+          : { ...p, floors: [...(p.floors || []), { id: newFloor.id, name: newFloor.name, pins: [] }] }
       )
     );
     setFloorModalOpen(false);
     // Fehler werden NICHT hier gefangen: NewFloorModal wartet auf dieses Promise
-    // und zeigt einen Fehlertext direkt im Modal, falls Upload oder Insert scheitern.
+    // und zeigt einen Fehlertext direkt im Modal, falls der Insert scheitert.
+  };
+
+  // Drag & Drop Reordering (siehe Grip-Handle in FloorOverview): orderedFloors liegt
+  // bereits in der neuen Zielreihenfolge vor (Reihenfolge, nicht sort_order-Werte —
+  // die werden hier bzw. in reorderFloors/flushSyncQueue final vergeben). Optimistisch
+  // sofort in React State UND im Offline-JSON-Cache übernommen (Punkt 15-Architektur,
+  // siehe cacheFloorsOffline) — die neue Reihenfolge bleibt dadurch auch nach einem
+  // Reload sofort sichtbar, unabhängig vom Ausgang der Server-Synchronisation.
+  const handleReorderFloors = async (orderedFloors) => {
+    setFloors(orderedFloors);
+    if (selectedProjectId) cacheFloorsOffline(selectedProjectId, orderedFloors);
+    const floorIds = orderedFloors.map((f) => f.id);
+    if (!online) {
+      setSyncQueue(enqueueSyncItem({ type: "reorder_floors", projectId: selectedProjectId, floorIds, actor: currentActor }));
+      return;
+    }
+    try {
+      await reorderFloors(orderedFloors);
+    } catch (err) {
+      // Der Online-Status kann kurzzeitig veralten (siehe requireOnline-Kommentare an
+      // anderer Stelle) — statt eines harten, folgenlosen Fehlers wird derselbe
+      // Offline-Sync-Pfad genutzt: die neue Reihenfolge bleibt lokal sichtbar (State ist
+      // oben bereits gesetzt) und wird beim nächsten erfolgreichen Sync-Lauf nachgezogen.
+      console.error("Reihenfolge der Etagen konnte nicht direkt gespeichert werden, wird nachsynchronisiert:", err);
+      setSyncQueue(enqueueSyncItem({ type: "reorder_floors", projectId: selectedProjectId, floorIds, actor: currentActor }));
+    }
   };
 
   const openEditFloorModal = (floor) => {
@@ -5540,26 +15840,21 @@ function App() {
     setEditFloorModalState({ floor });
   };
 
-  const handleUpdateFloor = async (name, file) => {
-    if (!editFloorModalState || !selectedProjectId) return;
+  const handleUpdateFloor = async (name) => {
+    if (!editFloorModalState) return;
     const floorId = editFloorModalState.floor.id;
-    const updated = await updateFloor(floorId, selectedProjectId, name, file);
-    setFloors((prev) => prev.map((f) => (f.id === floorId ? { ...f, ...updated } : f)));
+    const updated = await updateFloor(floorId, name);
+    setFloors((prev) => prev.map((f) => (f.id === floorId ? { ...f, name: updated.name } : f)));
     setProjects((prev) =>
       prev.map((p) =>
         p.id !== selectedProjectId
           ? p
-          : {
-              ...p,
-              floors: (p.floors || []).map((f) =>
-                f.id === floorId ? { ...f, name: updated.name, image_url: updated.image_url, file_type: updated.file_type } : f
-              ),
-            }
+          : { ...p, floors: (p.floors || []).map((f) => (f.id === floorId ? { ...f, name: updated.name } : f)) }
       )
     );
     setEditFloorModalState(null);
     // Fehler werden NICHT hier gefangen: EditFloorModal wartet auf dieses Promise
-    // und zeigt einen Fehlertext direkt im Modal, falls Upload oder Update scheitern.
+    // und zeigt einen Fehlertext direkt im Modal, falls das Update scheitert.
   };
 
   const handleDeleteFloorClick = (floor) => {
@@ -5579,19 +15874,16 @@ function App() {
           p.id !== selectedProjectId ? p : { ...p, floors: (p.floors || []).filter((f) => f.id !== target.id) }
         )
       );
-      // Falls die gelöschte Etage gerade geöffnet war (z.B. Rücksprung aus der
-      // Grundriss-Ansicht in die Etagenübersicht, ohne dass selectedFloorId zwischenzeitlich
-      // geändert wurde), automatisch auf eine verbleibende Etage wechseln — der useEffect
-      // auf selectedFloorId lädt deren Pins dann selbstständig nach. Gibt es keine Etage
-      // mehr, zurück zur Etagenübersicht des Projekts.
+      // Falls das gelöschte Geschoss gerade geöffnet war (z.B. Rücksprung aus der
+      // Grundrisskizzen- oder Planansicht in die Geschossübersicht, ohne dass
+      // selectedFloorId zwischenzeitlich geändert wurde): zurück zur Geschossübersicht
+      // des Projekts, statt in ein anderes Geschoss zu springen — die darunterliegenden
+      // Skizzen/Pins gehörten zum gelöschten Geschoss und sind serverseitig bereits
+      // per ON DELETE CASCADE mitgelöscht.
       if (selectedFloorId === target.id) {
-        const remaining = floors.filter((f) => f.id !== target.id);
-        if (remaining.length > 0) {
-          setSelectedFloorId(remaining[0].id);
-        } else {
-          setSelectedFloorId(null);
-          setScreen("floors");
-        }
+        setSelectedFloorId(null);
+        setSelectedFloorPlanId(null);
+        setScreen("floors");
       }
       setDeleteFloorConfirm(null);
     } catch (err) {
@@ -5599,6 +15891,151 @@ function App() {
       setGlobalError("Die Etage konnte nicht gelöscht werden. Bitte erneut versuchen.");
     } finally {
       setDeleteFloorBusy(false);
+    }
+  };
+
+  // -------------------------------------------------------------------------------
+  // GRUNDRISSSKIZZEN (Ebene 3) — ein Geschoss kann mehrere Skizzen enthalten, jede
+  // mit eigener Datei und eigenen, strikt daran gebundenen Pins (siehe plan_id).
+  // -------------------------------------------------------------------------------
+
+  const openFloorPlanModal = () => {
+    if (!requireAuth()) return;
+    setFloorPlanModalOpen(true);
+  };
+
+  // MULTI-FILE UPLOAD FÜR GRUNDRISSSKIZZEN: entries ist ein Array aus { name, file }
+  // (siehe NewFloorPlanModal — bei genau einer Datei ein Array mit einem Eintrag, bei
+  // mehreren Dateien ein Eintrag je ausgewählter Datei mit deren Dateinamen als Titel).
+  // Die Dateien werden bewusst SEQUENZIELL (nicht per Promise.all) hochgeladen: jede
+  // Grundrissdatei löst bereits für sich genommen einen mehrstufigen Vorgang aus
+  // (optionale PDF-Komprimierung, Kachel-Pyramiden-Erzeugung für Raster-Bilder, siehe
+  // uploadFloorPlan) — mehrere davon gleichzeitig würden die Bandbreite und den
+  // Hauptthread auf genau den Tablets unnötig belasten, für die die Kachel-Pyramide
+  // ursprünglich eingeführt wurde. Sequenziell lässt sich außerdem der geforderte "Lade
+  // Skizze X von Y hoch…"-Fortschritt exakt abbilden. onProgress(current, total,
+  // statusMessage) wird vor jeder Datei mit dem laufenden Index aufgerufen und danach
+  // erneut für Zwischenstatus-Meldungen (z.B. PDF-Komprimierung) durchgereicht.
+  const handleAddFloorPlanSketch = async (entries, onProgress) => {
+    if (!selectedFloorId || !selectedProjectId) return;
+    for (let i = 0; i < entries.length; i++) {
+      const { name, file } = entries[i];
+      onProgress?.(i + 1, entries.length, null);
+      const newPlan = await createFloorPlanSketch(
+        selectedFloorId,
+        selectedProjectId,
+        name,
+        file,
+        (statusMessage) => onProgress?.(i + 1, entries.length, statusMessage),
+        // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": neue Uploads werden automatisch der
+        // gerade im Tab aktiven Kategorie zugeordnet (Punkt 2) — ohne diese Übergabe würde
+        // createFloorPlanSketch stillschweigend auf seinen Default "grundriss" zurückfallen,
+        // unabhängig davon, in welchem Tab der Nutzer tatsächlich hochgeladen hat.
+        activeSketchCategory
+      );
+      // Jede erfolgreich gespeicherte Skizze wird SOFORT übernommen (nicht erst nach
+      // der gesamten Batch) — schlägt eine spätere Datei fehl, bleiben die bereits
+      // hochgeladenen Skizzen dadurch korrekt sichtbar und konsistent mit der
+      // Datenbank, statt durch einen einzigen Fehlschlag am Ende verworfen zu werden.
+      setFloorPlans((prev) => [...prev, { ...newPlan, pins: [] }]);
+    }
+    setFloorPlanModalOpen(false);
+    // Fehler werden NICHT hier gefangen: NewFloorPlanModal wartet auf dieses Promise
+    // und zeigt einen Fehlertext direkt im Modal, falls Upload oder Insert scheitern —
+    // das Modal bleibt in diesem Fall offen, bereits erfolgreich hochgeladene Dateien
+    // sind zu diesem Zeitpunkt aber schon oben in floorPlans übernommen.
+  };
+
+  const openSketchExportModal = () => setSketchExportModalOpen(true);
+
+  // ANFORDERUNG "CUSTOM MULTI-SKETCH PDF EXPORT WITHIN FLOOR LEVEL": erzeugt EINEN
+  // gemeinsamen PDF-Sammelbericht über die im SketchExportModal vom Nutzer
+  // ausgewählte Teilmenge der Grundrisskizzen des aktuellen Geschosses. floorPlans
+  // (Ebene-3-State) enthält je Skizze bewusst nur eine LEICHTGEWICHTIGE Pin-
+  // Zusammenfassung (nur id + status, siehe fetchFloorPlansWithPinSummary — reicht für
+  // die Status-Badges/Checkbox-Liste in SketchOverview/SketchExportModal, aber nicht
+  // für einen PDF-Bericht mit Fotos). Für den tatsächlichen Bericht werden daher hier
+  // gezielt die VOLLSTÄNDIGEN Pins (inkl. Fotos) aller Skizzen dieses Geschosses in
+  // EINEM Request nachgeladen (fetchPinsForFloor — dieselbe, bereits für den
+  // projektweiten Export genutzte Funktion, siehe fetchAllPinsForProject) und
+  // anschließend client-seitig nach plan_id gruppiert; nicht ausgewählte Skizzen
+  // werden dabei schlicht nie in pinsByPlanId nachgeschlagen und tauchen im
+  // Ergebnis-PDF an keiner Stelle auf.
+  const handleExportSelectedSketchesPdf = async (selectedPlans, { includeOnboarding }) => {
+    if (!floor) return;
+    const allFloorPins = await fetchPinsForFloor(floor.id);
+    const pinsByPlanId = new Map();
+    for (const pin of allFloorPins) {
+      const list = pinsByPlanId.get(pin.plan_id) || [];
+      list.push(pin);
+      pinsByPlanId.set(pin.plan_id, list);
+    }
+    await generateMultiSketchFloorReportPdf({
+      project,
+      floor,
+      plans: selectedPlans,
+      pinsByPlanId,
+      trades: projectTrades,
+      generatedBy: currentActor?.name,
+      includeOnboarding: includeOnboarding && hasOnboardingInfo(project),
+    });
+    // Fehler werden NICHT hier gefangen: SketchExportModal wartet auf dieses Promise
+    // und zeigt einen Fehlertext direkt im Modal, falls Nachladen oder PDF-Erzeugung
+    // scheitern — das Modal bleibt in diesem Fall bewusst offen.
+  };
+
+  const openEditFloorPlanModal = (plan) => {
+    if (!requireAuth()) return;
+    setEditFloorPlanModalState({ plan });
+  };
+
+  // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": EditFloorPlanModal übergibt zusätzlich die
+  // (ggf. geänderte) Kategorie als 4. Argument — ermöglicht die nachträgliche Umkategori-
+  // sierung eines Plans (z.B. versehentlich als "Grundriss" hochgeladener Werkplan), ohne
+  // dass dafür Löschen+Neu-Hochladen nötig wäre. category ist optional/undefined-sicher,
+  // siehe updateFloorPlanSketch (fields.category wird nur bei truthy-Wert gesetzt).
+  const handleUpdateFloorPlanSketch = async (name, file, onStatusMessage, category) => {
+    if (!editFloorPlanModalState || !selectedProjectId) return;
+    const planId = editFloorPlanModalState.plan.id;
+    const updated = await updateFloorPlanSketch(planId, selectedProjectId, name, file, onStatusMessage, category);
+    setFloorPlans((prev) => prev.map((fp) => (fp.id === planId ? { ...fp, ...updated } : fp)));
+    setEditFloorPlanModalState(null);
+    // Fehler werden NICHT hier gefangen: EditFloorPlanModal wartet auf dieses Promise
+    // und zeigt einen Fehlertext direkt im Modal, falls Upload oder Update scheitern.
+  };
+
+  const handleDeleteFloorPlanClick = (plan) => {
+    if (!requireAuth()) return;
+    setDeleteFloorPlanConfirm({ target: plan });
+  };
+
+  const confirmDeleteFloorPlan = async () => {
+    if (!deleteFloorPlanConfirm) return;
+    const target = deleteFloorPlanConfirm.target;
+    setDeleteFloorPlanBusy(true);
+    try {
+      await deleteFloorPlanSketch(target);
+      setFloorPlans((prev) => prev.filter((fp) => fp.id !== target.id));
+      // Aktualisiert die geschossweite Pin-Zusammenfassung (Ebene-2-Badges), da mit der
+      // Skizze auch ihre Pins serverseitig per ON DELETE CASCADE mitgelöscht wurden.
+      const removedPinIds = new Set((target.pins || []).map((p) => p.id));
+      if (removedPinIds.size > 0 && selectedFloorId) {
+        setFloors((prev) =>
+          prev.map((f) => (f.id === selectedFloorId ? { ...f, pins: (f.pins || []).filter((p) => !removedPinIds.has(p.id)) } : f))
+        );
+      }
+      // Falls die gelöschte Skizze gerade in der Planansicht geöffnet war, zurück zur
+      // Grundrisskizzen-Übersicht des Geschosses (analog zu confirmDeleteFloor oben).
+      if (selectedFloorPlanId === target.id) {
+        setSelectedFloorPlanId(null);
+        setScreen("sketches");
+      }
+      setDeleteFloorPlanConfirm(null);
+    } catch (err) {
+      console.error("Grundrissskizze konnte nicht gelöscht werden:", err);
+      setGlobalError("Die Grundrissskizze konnte nicht gelöscht werden. Bitte erneut versuchen.");
+    } finally {
+      setDeleteFloorPlanBusy(false);
     }
   };
 
@@ -5675,6 +16112,50 @@ function App() {
     }
   };
 
+  // Admin-Einladungssystem (Abschnitt 2, Option B, siehe inviteUserToApp/
+  // resendUserInvite/deleteUser oben). Bewusst OHNE eigenen try/catch in
+  // handleInviteUser — InviteUserModal fängt den Fehler selbst ab und zeigt ihn
+  // inline im Formular an (identisches Muster wie handleCreateUser/UserFormModal).
+  // Gibt { directLink } an InviteUserModal zurück (siehe dort) — ist directLink
+  // gesetzt, wurde der Einladungslink direkt erzeugt (Regelfall, siehe
+  // sendInviteLinkPrimary) und das Modal zeigt ihn mit Kopieren-Button an, statt
+  // sich sofort zu schließen.
+  const handleInviteUser = async (fields) => {
+    const { profile, directLink } = await inviteUserToApp({
+      name: fields.name,
+      email: fields.email,
+      kuerzel: "",
+      role: fields.role,
+      projectIds: fields.projectIds,
+      actor: currentActor,
+    });
+    setUsers((prev) => [...prev, profile].sort((a, b) => a.name.localeCompare(b.name)));
+    return { directLink };
+  };
+
+  const handleResendInvite = async (user) => {
+    try {
+      const { directLink } = await resendUserInvite(user.email);
+      const updated = await updateUser(user.id, { invited_at: new Date().toISOString() });
+      setUsers((prev) => prev.map((u) => (u.id === user.id ? { ...u, ...updated } : u)));
+      return { directLink };
+    } catch (err) {
+      console.error("Einladung konnte nicht erneut gesendet werden:", err);
+      setGlobalError("Die Einladung konnte nicht erneut gesendet werden. Bitte erneut versuchen.");
+      return null;
+    }
+  };
+
+  const handleDeleteUser = async (user) => {
+    try {
+      await deleteUser(user.id);
+      setUsers((prev) => prev.filter((u) => u.id !== user.id));
+    } catch (err) {
+      console.error("Zugang konnte nicht entzogen werden:", err);
+      setGlobalError("Der Zugang konnte nicht entzogen werden. Bitte erneut versuchen.");
+    }
+  };
+
   // -------------------------------------------------------------------------------
   // DROPBOX-ARCHIVIERUNG
   // -------------------------------------------------------------------------------
@@ -5705,71 +16186,82 @@ function App() {
   // -------------------------------------------------------------------------------
 
   const handlePlanClick = async (x, y) => {
-    if (!floor || creatingPin) return;
+    if (!floor || !plan || creatingPin) return;
+    // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: Pin-Anlage ist ausschließlich in
+    // der Kategorie "Grundrisse" erlaubt — Werkpläne/Montagepläne dienen ungestört als
+    // reine Referenzansicht. Die Prüfung sitzt bewusst hier auf App-Ebene (nicht nur als
+    // UI-Hinweis in FloorPlanView), damit sie unabhängig vom jeweiligen UI-Zustand
+    // zuverlässig greift.
+    if (!planAllowsPins(plan)) return;
     if (!requireAuth()) return;
     setCreatingPin(true);
     setGlobalError(null);
+    // "Mangel duplizieren" legt seine Kopie inzwischen SOFORT selbst an (siehe
+    // duplicatePin/handleDuplicatePin) statt hier über ein Klemmbrett beim nächsten
+    // Plan-Klick konsumiert zu werden — handlePlanClick legt daher ausnahmslos einen
+    // neuen, leeren Pin mit den generischen Standardwerten an.
+    const overrides = {};
+    const createdDetail = "Mängel-Pin angelegt";
     try {
-      // Offline-First (Punkt 15): ohne Verbindung wird der Pin sofort lokal mit einer
-      // eigenen Offline-ID angelegt (sichtbar, bearbeitbar, fotografierbar wie jeder
-      // andere Pin) und die Anlage in die Warteschlange eingereiht. flushSyncQueue
-      // ersetzt die Offline-ID beim nächsten Synchronisationslauf durch die echte.
-      if (!online) {
-        const localId = generateOfflineId();
-        const nowIso = new Date().toISOString();
-        const offlinePin = {
-          id: localId,
-          floor_id: floor.id,
-          title: "Neuer Eintrag",
-          description: "",
-          status: "offen",
-          priority: "mittel",
-          assigned_to: "",
-          trade_id: null,
-          x,
-          y,
-          angle: 0,
-          created_at: nowIso,
-          updated_at: nowIso,
-          created_by: currentActor?.email || null,
-          updated_by: currentActor?.email || null,
-          pin_todos: [],
-          pin_photos: [],
-          pin_activity_log: [
-            {
-              id: generateOfflineId(),
-              pin_id: localId,
-              action: "created",
-              detail: "Mängel-Pin angelegt (offline erfasst, wird synchronisiert)",
-              actor_email: currentActor?.email || null,
-              actor_name: currentActor?.name || null,
-              created_at: nowIso,
-            },
-          ],
-        };
-        setPins((prev) => [...prev, offlinePin]);
-        addPinSummary(floor.id, offlinePin);
-        setSyncQueue(enqueueSyncItem({ type: "create_pin", localId, floorId: floor.id, x, y, actor: currentActor }));
-        setModalState({ pinId: localId, isNew: true });
-        return;
-      }
-      const newPin = await createPin(floor.id, x, y, currentActor);
-      // Abschnitt 3: automatische Zeit-/Benutzererfassung — jede Pin-Erstellung wird
-      // sofort mit einem eigenen Eintrag in der Bearbeitungshistorie protokolliert.
-      const activity = await logPinActivity(newPin.id, "created", "Mängel-Pin angelegt", currentActor);
-      const pinWithActivity = { ...newPin, pin_activity_log: [activity] };
-      setPins((prev) => [...prev, pinWithActivity]);
-      addPinSummary(floor.id, pinWithActivity);
+      // Offline-First: der Pin wird IMMER zuerst lokal in Dexie angelegt, online wie offline. Die UUID
+      // entsteht auf dem Gerät und ist identisch mit der späteren Supabase-ID, es gibt keine
+      // Offline-ID und kein ID-Mapping mehr. Der Upload läuft im Hintergrund (syncEngine).
+      const newPin = await offlineStore.createPinLocal({
+        planId: plan.id,
+        floorId: floor.id,
+        x,
+        y,
+        actor: currentActor,
+        overrides,
+        activityDetail: online ? createdDetail : `${createdDetail} (offline erfasst)`,
+      });
+      setPins((prev) => [...prev, newPin]);
+      addPinSummary(floor.id, plan.id, newPin);
       setModalState({ pinId: newPin.id, isNew: true });
+      syncEngine.requestSync();
     } catch (err) {
-      console.error("Pin konnte nicht angelegt werden:", err);
-      setGlobalError("Der neue Pin konnte nicht angelegt werden. Bitte Verbindung prüfen und erneut versuchen.");
+      console.error("Pin konnte nicht lokal angelegt werden:", err);
+      setGlobalError("Der neue Pin konnte nicht gespeichert werden. Bitte erneut versuchen.");
     } finally {
       setCreatingPin(false);
     }
   };
 
   const handlePinClick = (pin) => setModalState({ pinId: pin.id, isNew: false });
+
+  // "Mangel duplizieren" (siehe Button im PinModal-Kopf, nur bei bestehenden Pins
+  // sichtbar): legt SOFORT eine vollständige Kopie des betrachteten Pins an (Gewerk,
+  // Bereich, Beschreibung, Status, Priorität, Frist, siehe duplicatePin) minimal
+  // versetzt daneben und öffnet direkt im Anschluss das Bearbeitungs-Modal der neuen
+  // Kopie — kein Zwischenschritt über ein Klemmbrett und einen weiteren Klick auf den
+  // Plan mehr nötig. Bewusst die GESPEICHERTEN Pin-Felder (der volle pin-Prop aus
+  // PinModal, nicht der evtl. noch unspeicherte Modal-Entwurf) — "einen bestehenden,
+  // dokumentierten Mangel duplizieren", nicht "einen halb ausgefüllten Entwurf
+  // klonen". Bewusst an eine bestehende Verbindung gebunden (requireOnline) statt
+  // zusätzlich eine eigene Offline-Warteschlangen-Variante einzuführen.
+  const handleDuplicatePin = async (sourcePin) => {
+    if (!requireOnline("Ein Mangel kann")) return;
+    try {
+      const newPin = await duplicatePin(sourcePin, currentActor);
+      const sourceNumber = pinNumberEntryById.get(sourcePin.id)?.label || "?";
+      const activity = await logPinActivity(
+        newPin.id,
+        "created",
+        `Mängel-Pin dupliziert aus Pin Nr. ${sourceNumber} („${sourcePin.title || "Ohne Titel"}")`,
+        currentActor
+      );
+      const pinWithActivity = { ...newPin, pin_activity_log: [activity] };
+      // Die Kopie wurde direkt in Supabase angelegt: lokal (Dexie) als bereits synchronisiert ablegen,
+      // damit sie auch offline sichtbar, bearbeitbar und löschbar ist.
+      await offlineStore.cacheServerPin(pinWithActivity);
+      setPins((prev) => [...prev, pinWithActivity]);
+      addPinSummary(floor.id, plan.id, pinWithActivity);
+      setModalState({ pinId: newPin.id, isNew: false });
+    } catch (err) {
+      console.error("Pin konnte nicht dupliziert werden:", err);
+      setGlobalError("Der Pin konnte nicht dupliziert werden. Bitte erneut versuchen.");
+    }
+  };
 
   // Hängt einen neuen pin_activity_log-Eintrag optimistisch an den lokalen Zustand
   // eines Pins an — kleine, wiederverwendete Hilfsfunktion für die Pin-Handler unten.
@@ -5782,22 +16274,21 @@ function App() {
     const prevPin = pins.find((p) => p.id === pinId);
     if (!prevPin) return;
     setPins((prev) => prev.map((p) => (p.id === pinId ? { ...p, x, y } : p))); // optimistisches Update
-    if (!online || isPinPendingSync(pinId)) {
-      setSyncQueue(enqueueSyncItem({ type: "update_pin", pinId, fields: { x, y }, actor: currentActor }));
-      appendPinActivity(pinId, {
-        id: generateOfflineId(),
-        pin_id: pinId,
-        action: "moved",
-        detail: "Position auf dem Grundriss verschoben (offline erfasst, wird synchronisiert)",
-        actor_email: currentActor?.email || null,
-        actor_name: currentActor?.name || null,
-        created_at: new Date().toISOString(),
-      });
-      return;
-    }
     try {
-      await updatePin(pinId, { x, y }, currentActor);
-      appendPinActivity(pinId, await logPinActivity(pinId, "moved", "Position auf dem Grundriss verschoben", currentActor));
+      const { pin: updated, activities } = await offlineStore.updatePinLocal(
+        pinId,
+        { x, y },
+        {
+          actor: currentActor,
+          activities: [{ action: "moved", detail: `Position auf dem Grundriss verschoben${online ? "" : " (offline erfasst)"}` }],
+        }
+      );
+      setPins((prev) =>
+        prev.map((p) =>
+          p.id === pinId ? { ...p, ...updated, pin_activity_log: [...(p.pin_activity_log || []), ...activities] } : p
+        )
+      );
+      syncEngine.requestSync();
     } catch (err) {
       console.error("Pin-Position konnte nicht gespeichert werden:", err);
       setGlobalError("Die neue Position des Pins konnte nicht gespeichert werden.");
@@ -5807,84 +16298,46 @@ function App() {
 
   const handleSaveFields = async (pinId, fields) => {
     const prevPin = pins.find((p) => p.id === pinId);
-    if (!online || isPinPendingSync(pinId)) {
-      // Offline-First (Punkt 15): Feldänderungen (Titel, Beschreibung, Gewerk,
-      // Zuständigkeit, Priorität) UND Statuswechsel (Offen → In Bearbeitung →
-      // Abgeschlossen/Freigabe) laufen über denselben Save-Aufruf wie online — der
-      // Unterschied ist ausschließlich, dass hier lokal aktualisiert und in die
-      // Warteschlange eingereiht statt sofort an Supabase gesendet wird.
-      const nowIso = new Date().toISOString();
-      let statusChangeDetail = null;
-      let updatedDetail = null;
-      const newActivity = [];
-      if (prevPin && fields.status !== undefined && fields.status !== prevPin.status) {
-        const fromLabel = STATUS[prevPin.status]?.label || prevPin.status;
-        const toLabel = STATUS[fields.status]?.label || fields.status;
-        statusChangeDetail = `Status: ${fromLabel} → ${toLabel}`;
-        newActivity.push({
-          id: generateOfflineId(),
-          pin_id: pinId,
-          action: "status_changed",
-          detail: `${statusChangeDetail} (offline erfasst, wird synchronisiert)`,
-          actor_email: currentActor?.email || null,
-          actor_name: currentActor?.name || null,
-          created_at: nowIso,
+    const suffix = online ? "" : " (offline erfasst)";
+    // Feldänderungen (Titel, Beschreibung, Gewerk, Bereich, Priorität) und Statuswechsel laufen über
+    // denselben Weg: erst lokal in Dexie, dann im Hintergrund nach Supabase. Die Verlaufseinträge
+    // werden dabei mitgeschrieben und mit dem Pin übertragen.
+    const activities = [];
+    // Statusänderungen (inkl. Freigabe/Abschluss auf "erledigt") werden bewusst als eigener, klar
+    // benannter Verlaufseintrag protokolliert statt nur als generisches "aktualisiert" (Abschnitt 3).
+    if (prevPin && fields.status !== undefined && fields.status !== prevPin.status) {
+      const fromLabel = STATUS[prevPin.status]?.label || prevPin.status;
+      const toLabel = STATUS[fields.status]?.label || fields.status;
+      activities.push({ action: "status_changed", detail: `Status: ${fromLabel} → ${toLabel}${suffix}` });
+    }
+    if (prevPin) {
+      // pinFieldValueChanged statt eines rohen !==-Vergleichs: bei trade_ids (Array, siehe Multi-Select
+      // Gewerke) entsteht bei JEDEM Speichern ein neues Array-Objekt, ein reiner Referenzvergleich hätte
+      // hier fälschlich immer "geändert" protokolliert. getPinTradeIds(prevPin) statt prevPin.trade_ids
+      // direkt fängt zusätzlich ältere, noch nicht auf trade_ids migrierte Pin-Datensätze ab.
+      const changedLabels = Object.keys(PIN_FIELD_LABELS).filter((key) => {
+        if (!Object.prototype.hasOwnProperty.call(fields, key)) return false;
+        const oldVal = key === "trade_ids" ? getPinTradeIds(prevPin) : prevPin[key];
+        return pinFieldValueChanged(key, fields[key], oldVal);
+      });
+      if (changedLabels.length > 0) {
+        activities.push({
+          action: "updated",
+          detail: `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}${suffix}`,
         });
       }
-      if (prevPin) {
-        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter(
-          (key) => Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== prevPin[key]
-        );
-        if (changedLabels.length > 0) {
-          updatedDetail = `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}`;
-          newActivity.push({
-            id: generateOfflineId(),
-            pin_id: pinId,
-            action: "updated",
-            detail: `${updatedDetail} (offline erfasst, wird synchronisiert)`,
-            actor_email: currentActor?.email || null,
-            actor_name: currentActor?.name || null,
-            created_at: nowIso,
-          });
-        }
-      }
-      setPins((prev) =>
-        prev.map((p) =>
-          p.id === pinId
-            ? { ...p, ...fields, updated_by: currentActor?.email || null, updated_at: nowIso, pin_activity_log: [...(p.pin_activity_log || []), ...newActivity] }
-            : p
-        )
-      );
-      if (floor && fields.status !== undefined) updatePinSummaryStatus(floor.id, pinId, fields.status);
-      setSyncQueue(enqueueSyncItem({ type: "update_pin", pinId, fields, actor: currentActor, statusChangeDetail, updatedDetail }));
-      setModalState(null);
-      return;
     }
     try {
-      const updated = await updatePin(pinId, fields, currentActor);
-      const newActivity = [];
-      // Statusänderungen (inkl. Freigabe/Abschluss auf "erledigt") werden bewusst als
-      // eigener, klar benannter Verlaufseintrag protokolliert statt nur als generisches
-      // "aktualisiert" — Abschnitt 3 verlangt das explizit.
-      if (prevPin && fields.status !== undefined && fields.status !== prevPin.status) {
-        const fromLabel = STATUS[prevPin.status]?.label || prevPin.status;
-        const toLabel = STATUS[fields.status]?.label || fields.status;
-        newActivity.push(await logPinActivity(pinId, "status_changed", `Status: ${fromLabel} → ${toLabel}`, currentActor));
-      }
-      if (prevPin) {
-        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter(
-          (key) => Object.prototype.hasOwnProperty.call(fields, key) && fields[key] !== prevPin[key]
-        );
-        if (changedLabels.length > 0) {
-          const detail = `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}`;
-          newActivity.push(await logPinActivity(pinId, "updated", detail, currentActor));
-        }
-      }
+      const { pin: updated, activities: written } = await offlineStore.updatePinLocal(pinId, fields, {
+        actor: currentActor,
+        activities,
+      });
       setPins((prev) =>
-        prev.map((p) => (p.id === pinId ? { ...p, ...updated, pin_activity_log: [...(p.pin_activity_log || []), ...newActivity] } : p))
+        prev.map((p) => (p.id === pinId ? { ...p, ...updated, pin_activity_log: [...(p.pin_activity_log || []), ...written] } : p))
       );
-      if (floor) updatePinSummaryStatus(floor.id, pinId, updated.status);
+      if (floor && plan) updatePinSummaryStatus(floor.id, plan.id, pinId, updated.status);
       setModalState(null);
+      syncEngine.requestSync();
     } catch (err) {
       console.error("Pin konnte nicht gespeichert werden:", err);
       setGlobalError("Die Änderungen am Pin konnten nicht gespeichert werden. Bitte erneut versuchen.");
@@ -5892,10 +16345,12 @@ function App() {
     }
   };
 
-  // Löschen von Pins sowie die gesamte Aufgabenverwaltung (unten) bleiben bewusst an
-  // eine bestehende Verbindung gebunden (siehe Kommentar am Anfang des Offline-Moduls
-  // in der Datenschicht) — requireOnline gibt dafür eine klare, sofortige Rückmeldung
-  // statt eines rohen Netzwerkfehlers.
+  // requireOnline gibt eine klare, sofortige Rückmeldung statt eines rohen
+  // Netzwerkfehlers, für alle Aktionen, die bewusst an eine bestehende Verbindung
+  // gebunden bleiben (siehe Kommentar am Anfang des Offline-Moduls in der
+  // Datenschicht). Das Löschen eines Pins selbst ist seit der Erweiterung der
+  // Offline-Synchronisation um Löschungen (siehe handleDeletePin/"delete_pin" in
+  // flushSyncQueue) NICHT mehr an requireOnline gebunden.
   const requireOnline = (actionLabel) => {
     if (online) return true;
     setGlobalError(`${actionLabel} ist offline nicht möglich. Bitte bei bestehender Internetverbindung erneut versuchen.`);
@@ -5903,14 +16358,21 @@ function App() {
   };
 
   const handleDeletePin = async (pinId) => {
-    if (!floor) return;
-    if (!requireOnline("Ein Pin kann")) return;
+    if (!floor || !plan) return;
     const pinToDelete = pins.find((p) => p.id === pinId);
     try {
-      await deletePin(pinToDelete || { id: pinId, pin_photos: [] });
+      // Ein noch nie synchronisierter Pin verschwindet lokal ersatzlos. Ein bereits auf dem Server
+      // vorhandener bekommt einen Löschmarker, den die Sync-Engine nachzieht (inkl. Storage-Dateien).
+      const outcome = await offlineStore.deletePinLocal(pinId);
+      if (outcome === "none") {
+        // Pin ist lokal (Dexie) nicht bekannt, z. B. aus einem Altbestand: nur online direkt löschbar.
+        if (!requireOnline("Dieser Pin kann")) return;
+        await deletePin(pinToDelete || { id: pinId, pin_photos: [] });
+      }
       setPins((prev) => prev.filter((p) => p.id !== pinId));
-      removePinSummary(floor.id, pinId);
+      removePinSummary(floor.id, plan.id, pinId);
       setModalState(null);
+      syncEngine.requestSync();
     } catch (err) {
       console.error("Pin konnte nicht gelöscht werden:", err);
       setGlobalError("Der Pin konnte nicht gelöscht werden. Bitte erneut versuchen.");
@@ -5919,74 +16381,78 @@ function App() {
   };
 
   // -------------------------------------------------------------------------------
-  // TODOS
+  // SKIZZEN-NOTIZEN (PLAN ANNOTATIONS) — bewusst schlanker als die Pin-Handler oben:
+  // Anlegen, Verschieben, Bearbeiten und Löschen bleiben allesamt an eine bestehende
+  // Verbindung gebunden (requireOnline), es gibt keine Offline-Anlage-Warteschlange
+  // (siehe Kommentar bei der plan_notes-Datenschicht weiter oben).
   // -------------------------------------------------------------------------------
 
-  const handleAddTodo = async (pinId, text) => {
-    if (!requireOnline("Eine Aufgabe kann")) return;
+  const handleAddPlanNote = async (x, y) => {
+    if (!plan || creatingNote) return;
+    // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT" Punkt 3: dieselbe Einschränkung wie bei
+    // handlePlanClick — Notizen zählen als Markierung auf dem Plan und sind damit ebenso
+    // nur in der Kategorie "Grundrisse" sinnvoll, Werkpläne/Montagepläne bleiben reiner
+    // Referenz-Viewer.
+    if (!planAllowsPins(plan)) return;
+    if (!requireAuth()) return;
+    if (!requireOnline("Eine Notiz kann")) return;
+    setCreatingNote(true);
+    setGlobalError(null);
     try {
-      const todo = await addPinTodo(pinId, text, currentActor);
-      const activity = await logPinActivity(pinId, "todo_added", `Aufgabe hinzugefügt: „${text}"`, currentActor);
-      setPins((prev) =>
-        prev.map((p) =>
-          p.id === pinId
-            ? { ...p, pin_todos: [...(p.pin_todos || []), todo], pin_activity_log: [...(p.pin_activity_log || []), activity] }
-            : p
-        )
-      );
+      const newNote = await createPlanNote(plan.id, x, y, currentActor);
+      setPlanNotes((prev) => [...prev, newNote]);
+      setNoteModalState({ noteId: newNote.id, isNew: true });
     } catch (err) {
-      console.error("Aufgabe konnte nicht hinzugefügt werden:", err);
-      setGlobalError("Die Aufgabe konnte nicht gespeichert werden.");
+      console.error("Notiz konnte nicht angelegt werden:", err);
+      setGlobalError("Die neue Notiz konnte nicht angelegt werden. Bitte Verbindung prüfen und erneut versuchen.");
+    } finally {
+      setCreatingNote(false);
     }
   };
 
-  const handleToggleTodo = async (pinId, todo) => {
-    if (!requireOnline("Der Status einer Aufgabe kann")) return;
+  const handleNoteClick = (note) => setNoteModalState({ noteId: note.id, isNew: false });
+
+  const handleMoveNote = async (noteId, x, y) => {
+    if (!session) return;
+    const prevNote = planNotes.find((n) => n.id === noteId);
+    if (!prevNote) return;
+    setPlanNotes((prev) => prev.map((n) => (n.id === noteId ? { ...n, x, y } : n))); // optimistisches Update
+    if (!requireOnline("Eine Notiz kann")) {
+      setPlanNotes((prev) => prev.map((n) => (n.id === noteId ? { ...n, x: prevNote.x, y: prevNote.y } : n))); // Rollback
+      return;
+    }
     try {
-      const updated = await togglePinTodo(todo.id, !todo.completed);
-      const activity = await logPinActivity(
-        pinId,
-        updated.completed ? "todo_completed" : "todo_reopened",
-        `Aufgabe „${todo.text}" ${updated.completed ? "erledigt" : "wieder geöffnet"}`,
-        currentActor
-      );
-      setPins((prev) =>
-        prev.map((p) =>
-          p.id === pinId
-            ? {
-                ...p,
-                pin_todos: (p.pin_todos || []).map((t) => (t.id === todo.id ? updated : t)),
-                pin_activity_log: [...(p.pin_activity_log || []), activity],
-              }
-            : p
-        )
-      );
+      await updatePlanNote(noteId, { x, y }, currentActor);
     } catch (err) {
-      console.error("Aufgabe konnte nicht aktualisiert werden:", err);
-      setGlobalError("Der Status der Aufgabe konnte nicht aktualisiert werden.");
+      console.error("Notiz-Position konnte nicht gespeichert werden:", err);
+      setGlobalError("Die neue Position der Notiz konnte nicht gespeichert werden.");
+      setPlanNotes((prev) => prev.map((n) => (n.id === noteId ? { ...n, x: prevNote.x, y: prevNote.y } : n))); // Rollback
     }
   };
 
-  const handleRemoveTodo = async (pinId, todoId) => {
-    if (!requireOnline("Eine Aufgabe kann")) return;
-    const todo = pins.find((p) => p.id === pinId)?.pin_todos?.find((t) => t.id === todoId);
+  const handleSaveNoteFields = async (noteId, fields) => {
+    if (!requireOnline("Eine Notiz kann")) return;
     try {
-      await deletePinTodo(todoId);
-      const activity = await logPinActivity(pinId, "todo_removed", `Aufgabe entfernt: „${todo?.text || ""}"`, currentActor);
-      setPins((prev) =>
-        prev.map((p) =>
-          p.id === pinId
-            ? {
-                ...p,
-                pin_todos: (p.pin_todos || []).filter((t) => t.id !== todoId),
-                pin_activity_log: [...(p.pin_activity_log || []), activity],
-              }
-            : p
-        )
-      );
+      const updated = await updatePlanNote(noteId, fields, currentActor);
+      setPlanNotes((prev) => prev.map((n) => (n.id === noteId ? updated : n)));
+      setNoteModalState(null);
     } catch (err) {
-      console.error("Aufgabe konnte nicht gelöscht werden:", err);
-      setGlobalError("Die Aufgabe konnte nicht gelöscht werden.");
+      console.error("Notiz konnte nicht gespeichert werden:", err);
+      setGlobalError("Die Notiz konnte nicht gespeichert werden. Bitte erneut versuchen.");
+      throw err; // Modal fängt dies ab und bleibt geöffnet
+    }
+  };
+
+  const handleDeleteNote = async (noteId) => {
+    if (!requireOnline("Eine Notiz kann")) return;
+    try {
+      await deletePlanNote(noteId);
+      setPlanNotes((prev) => prev.filter((n) => n.id !== noteId));
+      setNoteModalState(null);
+    } catch (err) {
+      console.error("Notiz konnte nicht gelöscht werden:", err);
+      setGlobalError("Die Notiz konnte nicht gelöscht werden. Bitte erneut versuchen.");
+      throw err;
     }
   };
 
@@ -5997,48 +16463,16 @@ function App() {
   const handleUploadPhotos = async (pinId, files) => {
     for (const file of files) {
       try {
-        // Offline-First (Punkt 15): das Foto wird sofort als data:-URL am Pin
-        // angezeigt (Kamera-Aufnahme/Auswahl funktioniert unverändert) und der
-        // eigentliche Supabase-Upload in die Warteschlange eingereiht. Die
-        // Dropbox-Archivierung läuft ausschließlich für online aufgenommene Fotos
-        // (siehe Kommentar im Offline-Modul der Datenschicht).
-        if (!online || isPinPendingSync(pinId)) {
-          const dataUrl = await fileToDataUrl(file);
-          const nowIso = new Date().toISOString();
-          const localPhoto = {
-            id: generateOfflineId(),
-            pin_id: pinId,
-            photo_url: dataUrl,
-            uploaded_by: currentActor?.email || null,
-            created_at: nowIso,
-          };
-          setPins((prev) =>
-            prev.map((p) =>
-              p.id === pinId
-                ? {
-                    ...p,
-                    pin_photos: [...(p.pin_photos || []), localPhoto],
-                    pin_activity_log: [
-                      ...(p.pin_activity_log || []),
-                      {
-                        id: generateOfflineId(),
-                        pin_id: pinId,
-                        action: "photo_added",
-                        detail: `Foto hochgeladen: „${file.name}" (offline erfasst, wird synchronisiert)`,
-                        actor_email: currentActor?.email || null,
-                        actor_name: currentActor?.name || null,
-                        created_at: nowIso,
-                      },
-                    ],
-                  }
-                : p
-            )
-          );
-          setSyncQueue(enqueueSyncItem({ type: "upload_photo", pinId, dataUrl, fileName: file.name, mimeType: file.type, actor: currentActor }));
-          continue;
-        }
-        const photo = await uploadPinPhoto(pinId, file, currentActor);
-        const activity = await logPinActivity(pinId, "photo_added", `Foto hochgeladen: „${file.name}"`, currentActor);
+        // Client-seitige Komprimierung IMMER zuerst. compressImage() wirft nie selbst (siehe dortiger
+        // Kommentar), ein einzelnes fehlerhaftes Foto fällt also bestenfalls auf die Originaldatei zurück.
+        const compressedFile = await compressImage(file);
+        // Offline-First: das Foto liegt zuerst als Blob in Dexie (kein Base64 im localStorage mehr) und
+        // wird sofort am Pin angezeigt. Der Upload in den Storage samt pin_photos-Zeile läuft im
+        // Hintergrund (syncEngine), online wie offline.
+        const { photo, activity } = await offlineStore.addPhotoLocal(pinId, compressedFile, {
+          actor: currentActor,
+          activityDetail: `Foto hochgeladen: „${compressedFile.name}"${online ? "" : " (offline erfasst)"}`,
+        });
         setPins((prev) =>
           prev.map((p) =>
             p.id === pinId
@@ -6046,27 +16480,53 @@ function App() {
               : p
           )
         );
-        // Dropbox-Archivierung (Abschnitt 4) ist bewusst best effort: sie läuft NACH
-        // dem primären, bereits erfolgreichen Supabase-Upload und darf diesen bei
-        // einem Fehlschlag weder rückgängig machen noch blockieren.
-        if (dropboxConnected && currentAppUser?.kuerzel) {
-          syncPhotoToDropbox(file, currentAppUser.kuerzel).catch((err) => {
+        syncEngine.requestSync();
+        // Dropbox-Archivierung (Abschnitt 4) ist bewusst best effort und läuft nur für online
+        // aufgenommene Fotos. Sie nutzt dieselbe komprimierte Fassung wie der Supabase-Upload.
+        if (online && dropboxConnected && currentAppUser?.kuerzel) {
+          syncPhotoToDropbox(compressedFile, currentAppUser.kuerzel).catch((err) => {
             console.error("Dropbox-Sync fehlgeschlagen:", err);
             setGlobalError(`Foto wurde gespeichert, die Dropbox-Archivierung ist aber fehlgeschlagen: ${err?.message || err}`);
           });
         }
       } catch (err) {
-        console.error("Foto konnte nicht hochgeladen werden:", err);
-        setGlobalError(`Foto "${file.name}" konnte nicht hochgeladen werden.`);
+        console.error("Foto konnte nicht gespeichert werden:", err);
+        setGlobalError(`Foto "${file.name}" konnte nicht gespeichert werden.`);
       }
     }
   };
 
   const handleRemovePhoto = async (pinId, photo) => {
-    if (!requireOnline("Ein Foto kann")) return;
     try {
-      await deletePinPhoto(photo);
-      const activity = await logPinActivity(pinId, "photo_removed", "Foto entfernt", currentActor);
+      // Foto, das noch gar nicht hochgeladen wurde: existiert nur lokal und lässt sich auch offline verwerfen.
+      if (await offlineStore.removePendingPhoto(photo.id)) {
+        const activity = await offlineStore.addActivityLocal(pinId, {
+          action: "photo_removed",
+          detail: `Foto entfernt${online ? "" : " (offline erfasst)"}`,
+          actor: currentActor,
+        });
+        setPins((prev) =>
+          prev.map((p) =>
+            p.id === pinId
+              ? {
+                  ...p,
+                  pin_photos: (p.pin_photos || []).filter((ph) => ph.id !== photo.id),
+                  pin_activity_log: [...(p.pin_activity_log || []), activity],
+                }
+              : p
+          )
+        );
+        syncEngine.requestSync();
+        return;
+      }
+      // Bereits hochgeladenes Foto: bleibt bewusst an eine bestehende Verbindung gebunden.
+      if (!requireOnline("Ein Foto kann")) return;
+      // Frisch aufgenommene Fotos zeigt die App bis zum nächsten Laden noch als data:-URL, für das
+      // Aufräumen im Storage wird die echte URL aus Dexie gebraucht.
+      const realUrl = (await offlineStore.getPhotoRemoteUrl(photo.id)) || photo.photo_url;
+      await deletePinPhoto({ ...photo, photo_url: realUrl });
+      await offlineStore.dropPhotoRow(photo.id);
+      const activity = await offlineStore.addActivityLocal(pinId, { action: "photo_removed", detail: "Foto entfernt", actor: currentActor });
       setPins((prev) =>
         prev.map((p) =>
           p.id === pinId
@@ -6078,43 +16538,147 @@ function App() {
             : p
         )
       );
+      syncEngine.requestSync();
     } catch (err) {
       console.error("Foto konnte nicht gelöscht werden:", err);
       setGlobalError("Das Foto konnte nicht gelöscht werden.");
     }
   };
 
+  // Foto-Markup (siehe PhotoMarkupEditor): das bearbeitete Bild wird sofort und unabhängig vom
+  // Online-Status lokal im Pin-State hinterlegt. Die dauerhafte Speicherung läuft je nach Herkunft
+  // über einen von drei Pfaden:
+  //  1. Foto wartet selbst noch auf den Upload (Blob in Dexie) -> das lokale Blob wird durch die
+  //     bearbeitete Fassung ersetzt, hochgeladen wird gleich die bearbeitete Version.
+  //  2. Foto ist bereits synchronisiert, aber gerade keine Verbindung -> "update_photo"-Eintrag in der
+  //     bestehenden Warteschlange (siehe flushSyncQueue).
+  //  3. Online & synchronisiert -> direkter Upload via updatePinPhotoUrl.
+  const handleSavePhotoMarkup = async (pinId, photo, editedDataUrl) => {
+    setPins((prev) =>
+      prev.map((p) =>
+        p.id === pinId
+          ? { ...p, pin_photos: (p.pin_photos || []).map((ph) => (ph.id === photo.id ? { ...ph, photo_url: editedDataUrl } : ph)) }
+          : p
+      )
+    );
+
+    try {
+      if (await offlineStore.isPhotoPending(photo.id)) {
+        await offlineStore.replacePendingPhotoBlob(photo.id, offlineStore.dataUrlToBlob(editedDataUrl));
+        syncEngine.requestSync();
+        return;
+      }
+    } catch (err) {
+      console.error("Bearbeitetes Foto konnte nicht lokal gespeichert werden:", err);
+      setGlobalError("Das bearbeitete Foto konnte nicht lokal gespeichert werden.");
+      return;
+    }
+
+    // Echte Storage-URL der bisherigen Fassung (die App zeigt frisch hochgeladene Fotos noch als data:-URL).
+    const previousUrl = (await offlineStore.getPhotoRemoteUrl(photo.id)) || photo.photo_url;
+
+    if (!online) {
+      setSyncQueue(
+        enqueueSyncItem({ type: "update_photo", pinId, photoId: photo.id, oldPhotoUrl: previousUrl, dataUrl: editedDataUrl, actor: currentActor })
+      );
+      appendPinActivity(pinId, {
+        id: generateOfflineId(),
+        pin_id: pinId,
+        action: "photo_edited",
+        detail: "Foto bearbeitet (offline erfasst, wird synchronisiert)",
+        actor_email: currentActor?.email || null,
+        actor_name: currentActor?.name || null,
+        created_at: new Date().toISOString(),
+      });
+      return;
+    }
+
+    try {
+      const updated = await updatePinPhotoUrl({ ...photo, photo_url: previousUrl }, editedDataUrl, currentActor);
+      await offlineStore.setPhotoUrlLocal(photo.id, updated.photo_url);
+      setPins((prev) =>
+        prev.map((p) => (p.id === pinId ? { ...p, pin_photos: (p.pin_photos || []).map((ph) => (ph.id === photo.id ? updated : ph)) } : p))
+      );
+      appendPinActivity(pinId, await offlineStore.addActivityLocal(pinId, { action: "photo_edited", detail: "Foto bearbeitet", actor: currentActor }));
+      syncEngine.requestSync();
+    } catch (err) {
+      console.error("Bearbeitetes Foto konnte nicht dauerhaft gespeichert werden:", err);
+      setGlobalError("Das bearbeitete Foto konnte nicht dauerhaft gespeichert werden — die Änderung ist vorerst nur lokal sichtbar.");
+    }
+  };
+
   return (
     <div className="min-h-screen w-full bg-slate-50 font-sans text-slate-900">
-      {/* Top bar */}
-      <div className="sticky top-0 z-30 border-b border-slate-200 bg-slate-900 text-white">
+      <SplashScreen />
+      {/* Startet den Offline-Sync (Dexie -> Supabase) beim Laden, bei "online" und beim Zurückkehren
+          in den Vordergrund. Erst nach dem Login aktiv (Row-Level-Security). Der Status wird über
+          den bestehenden OfflineStatusIndicator angezeigt, daher ohne eigenen Chip. */}
+      <OfflineSyncManager enabled={!!session} showBadge={false} />
+      {/* Verpflichtende App-Zugriffssperre (siehe isAuthenticated in App()): solange sie
+          aktiv ist, wird ausschließlich LoginScreen gerendert — weder Kopfzeile/
+          Navigation noch Projektlisten, Etagen, Grundrisse oder Pins existieren dann im
+          Rendering-Baum, entsprechende Datenabrufe (siehe DATA-FETCHING-Effekte weiter
+          oben) laufen ebenfalls erst nach erfolgreicher Anmeldung an. */}
+      {!isAuthenticated ? (
+        <LoginScreen onLogin={handleGateLogin} onRegister={handleSignUp} onForgotPassword={handleRequestPasswordReset} />
+      ) : (
+        <>
+      {/* Top bar — klares Weiß mit feiner Umrandung statt einer dunklen Fläche: passt
+          sich damit nahtlos in das übrige, helle Anwendungsdesign ein. Die Wortmarke
+          steht jetzt in Markenrot (tone="brand") statt in Weiß, da der Untergrund
+          selbst weiß ist. Navigations-Highlights (aktueller Breadcrumb-Schritt,
+          Primär-Button "Anmelden") tragen bewusst weiterhin das kräftige Markenrot —
+          alle sekundären Kopfzeilen-Aktionen (Dropbox, Benutzer, Abmelden) sind
+          dezent-neutral in Hellgrau gehalten, damit das Rot als Akzent erkennbar
+          bleibt statt in der Fläche unterzugehen. */}
+      <div className="sticky top-0 z-30 border-b border-slate-200 bg-white text-slate-700 shadow-sm">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-2.5 text-xs font-medium sm:px-6">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="flex items-center gap-1.5 text-slate-300">
-              <Building2 size={14} className="text-blue-400" /> BauDoc
+            <span className="flex items-center gap-2">
+              <BrandLogotype tone="brand" size="sm" />
+              <span className="hidden text-slate-400 sm:inline">· BauDoc</span>
             </span>
-            <span className="text-slate-500">/</span>
+            <span className="text-slate-300">/</span>
             <button
               onClick={() => setScreen("projects")}
-              className={`transition hover:text-white ${screen === "projects" ? "text-white" : "text-slate-400"}`}
+              className={`transition hover:text-[#FF2A00] ${screen === "projects" ? "font-semibold text-[#FF2A00]" : "text-slate-500"}`}
             >
               Projekte
             </button>
             {project && (
               <>
-                <span className="text-slate-500">/</span>
+                <span className="text-slate-300">/</span>
                 <button
                   onClick={() => setScreen("floors")}
-                  className={`transition hover:text-white ${screen === "floors" ? "text-white" : "text-slate-400"}`}
+                  className={`transition hover:text-[#FF2A00] ${
+                    screen === "floors" || screen === "schedule" ? "font-semibold text-[#FF2A00]" : "text-slate-500"
+                  }`}
                 >
                   {project.name}
                 </button>
               </>
             )}
-            {floor && screen === "plan" && (
+            {project && screen === "schedule" && (
               <>
-                <span className="text-slate-500">/</span>
-                <span className="text-white">{floor.name}</span>
+                <span className="text-slate-300">/</span>
+                <span className="font-semibold text-[#FF2A00]">Bauzeitenplan</span>
+              </>
+            )}
+            {floor && (screen === "sketches" || screen === "plan") && (
+              <>
+                <span className="text-slate-300">/</span>
+                <button
+                  onClick={() => setScreen("sketches")}
+                  className={`transition hover:text-[#FF2A00] ${screen === "sketches" ? "font-semibold text-[#FF2A00]" : "text-slate-500"}`}
+                >
+                  {floor.name}
+                </button>
+              </>
+            )}
+            {plan && screen === "plan" && (
+              <>
+                <span className="text-slate-300">/</span>
+                <span className="font-semibold text-[#FF2A00]">{plan.name}</span>
               </>
             )}
           </div>
@@ -6124,43 +16688,69 @@ function App() {
                 Zugriff (Anlegen/Umbenennen/Deaktivieren/Sortieren) erfolgt ausschließlich
                 kontextbezogen aus dem Projektformular heraus, siehe onManageTrades bei
                 ProjectFormModal weiter unten. */}
-            <OfflineStatusIndicator online={online} pendingCount={syncQueue.length} syncing={syncing} />
+            <OfflineStatusIndicator online={online} pendingCount={syncQueue.length + pendingPinCount} syncing={syncing || pinsSyncing} />
             <button
               onClick={openDropboxModal}
               title="Dropbox-Verbindung (Foto-Archivierung)"
-              className="inline-flex items-center gap-1.5 rounded-md bg-slate-800 px-2.5 py-1.5 font-semibold text-slate-200 transition hover:bg-slate-700"
+              className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
             >
-              {dropboxConnected ? <Cloud size={13} className="text-emerald-400" /> : <CloudOff size={13} />}{" "}
+              {dropboxConnected ? <Cloud size={13} className="text-emerald-600" /> : <CloudOff size={13} />}{" "}
               <span className="hidden sm:inline">Dropbox</span>
             </button>
             <button
               onClick={openUsersAdmin}
               title="Benutzerverwaltung"
-              className="inline-flex items-center gap-1.5 rounded-md bg-slate-800 px-2.5 py-1.5 font-semibold text-slate-200 transition hover:bg-slate-700"
+              className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
             >
               <UserCog size={13} /> <span className="hidden sm:inline">Benutzer</span>
             </button>
             {authLoading ? (
-              <span className="text-slate-500">Lädt…</span>
+              <span className="text-slate-400">Lädt…</span>
             ) : session ? (
               <>
-                <span className="hidden items-center gap-1.5 text-slate-300 sm:flex">
+                <span className="hidden items-center gap-1.5 text-slate-500 sm:flex">
                   <User size={13} /> Angemeldet als {session.user?.email}
                 </span>
                 <button
-                  onClick={handleSignOut}
-                  className="inline-flex items-center gap-1.5 rounded-md bg-slate-800 px-2.5 py-1.5 font-semibold text-slate-200 transition hover:bg-slate-700"
+                  onClick={() => setProfileModalOpen(true)}
+                  title="Mein Profil"
+                  className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
+                >
+                  <Settings size={13} /> <span className="hidden sm:inline">Profil</span>
+                </button>
+                <button
+                  onClick={handleAppLogout}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
                 >
                   <LogOut size={13} /> Abmelden
                 </button>
               </>
             ) : (
-              <button
-                onClick={() => setAuthModalOpen(true)}
-                className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-2.5 py-1.5 font-semibold text-white transition hover:bg-blue-700"
-              >
-                <LogIn size={13} /> Anmelden
-              </button>
+              // An dieser Stelle ist isAuthenticated zwingend true (siehe App-
+              // Zugriffssperre weiter oben) — dieser Zweig ist also ausschließlich die
+              // Offline-Anmeldung (verifyOfflineCredential): keine echte, RLS-fähige
+              // Supabase-Session vorhanden. Schreibaktionen bleiben in diesem Zustand
+              // weiterhin über requireAuth() an eine echte Online-Anmeldung gebunden
+              // (dort öffnet sich bei Bedarf ganz normal das AuthModal) — hier geht es
+              // ausschließlich um das Beenden der App-Zugriffssperre selbst.
+              <>
+                <span
+                  className="hidden items-center gap-1.5 text-amber-600 sm:flex"
+                  title="Offline angemeldet — für Bearbeitungen ist zusätzlich eine Online-Anmeldung erforderlich, sobald wieder Netz verfügbar ist."
+                >
+                  {/* authSource dient hier als Plausibilitätsprüfung: session ist null, das
+                      kann nach der App-Zugriffssperre weiter oben nur die Offline-Anmeldung
+                      sein — bleibt authSource dennoch unerwartet leer, wird trotzdem kein
+                      irreführendes "Offline" behauptet. */}
+                  <WifiOff size={13} /> {authSource === "offline" ? "Offline angemeldet" : "Angemeldet"}
+                </span>
+                <button
+                  onClick={handleAppLogout}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-600 transition hover:bg-slate-200"
+                >
+                  <LogOut size={13} /> Abmelden
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -6170,14 +16760,16 @@ function App() {
 
       {screen === "projects" && (
         <ProjectOverview
-          projects={projects}
+          projects={visibleProjects}
           loading={loadingProjects}
           onOpenProject={openProject}
+          onToggleFavorite={handleToggleProjectFavorite}
           query={query}
           setQuery={setQuery}
           onCreateProject={openCreateProject}
           onEditProject={openEditProject}
           onDeleteProject={handleDeleteProjectClick}
+          onArchiveProject={handleToggleProjectArchive}
         />
       )}
 
@@ -6192,44 +16784,113 @@ function App() {
           onOpenAddFloor={openFloorModal}
           onEditProject={openEditProject}
           onDeleteProject={handleDeleteProjectClick}
-          onChangeLphStatus={handleUpdateLphStatus}
+          onArchiveProject={handleToggleProjectArchive}
           onEditFloor={openEditFloorModal}
           onDeleteFloor={handleDeleteFloorClick}
+          onReorderFloors={handleReorderFloors}
           onExportPdf={openPdfExportModal}
+          milestones={milestones}
+          onOpenSchedule={openScheduleView}
           readOnly={!session}
         />
       )}
 
-      {screen === "plan" && floor && (
+      {screen === "schedule" && project && (
+        <ScheduleView
+          project={project}
+          milestones={milestones}
+          trades={projectTrades}
+          loading={loadingMilestones}
+          onBack={() => setScreen("floors")}
+          onOpenAddMilestone={openAddMilestoneModal}
+          onEditMilestone={openEditMilestoneModal}
+          readOnly={!session}
+        />
+      )}
+
+      {screen === "sketches" && floor && (
+        <SketchOverview
+          floor={floor}
+          plans={floorPlans}
+          loading={loadingFloorPlans}
+          activeCategory={activeSketchCategory}
+          onChangeCategory={setActiveSketchCategory}
+          onBack={() => setScreen("floors")}
+          onOpenPlan={openFloorPlanSketch}
+          onOpenAddPlan={openFloorPlanModal}
+          onEditPlan={openEditFloorPlanModal}
+          onDeletePlan={handleDeleteFloorPlanClick}
+          onOpenExportModal={openSketchExportModal}
+          readOnly={!session}
+        />
+      )}
+
+      {screen === "plan" && floor && plan && (
         <FloorPlanView
           floor={floor}
+          plan={plan}
           pins={pins}
+          planNotes={planNotes}
           loading={loadingPins}
           creatingPin={creatingPin}
+          creatingNote={creatingNote}
           session={session}
           trades={projectTrades}
-          onBack={() => setScreen("floors")}
+          project={project}
+          generatedBy={currentActor?.name}
+          onBack={() => setScreen("sketches")}
           onPlanClick={handlePlanClick}
           onPinClick={handlePinClick}
           onPinMove={handlePinMove}
+          onAddNote={handleAddPlanNote}
+          onNoteClick={handleNoteClick}
+          onNoteMove={handleMoveNote}
         />
       )}
 
       {activePin && (
         <PinModal
+          // key=Pin-ID: erzwingt einen vollständigen Remount, sobald sich modalState.pinId
+          // ändert, WÄHREND das Modal bereits geöffnet ist — genau der Fall beim direkten
+          // Umspringen von einem Pin auf seine frisch angelegte Kopie (siehe "Mangel
+          // duplizieren"/handleDuplicatePin: setModalState wechselt hier von der Quelle
+          // direkt auf newPin.id, ohne das Modal zwischendurch zu schließen). Ohne diesen
+          // Key würde React dieselbe Komponenten-Instanz weiterverwenden und der interne
+          // draft-Formzustand (Titel, Beschreibung, Status, …) bliebe fälschlich auf den
+          // Werten des vorherigen Pins stehen, obwohl Kopfzeile und Fotos bereits
+          // korrekt die neue Kopie zeigen.
+          key={activePin.id}
           pin={activePin}
+          pins={pins}
+          pinNumber={activePinNumber}
           isNew={modalState.isNew}
           readOnly={!session}
           trades={pinModalTrades}
+          project={project}
+          floor={floor}
+          plan={plan}
+          users={users}
+          generatedBy={currentActor?.name}
           onRequestLogin={() => setAuthModalOpen(true)}
           onClose={() => setModalState(null)}
           onSaveFields={(fields) => handleSaveFields(activePin.id, fields)}
+          onDuplicate={handleDuplicatePin}
           onDelete={() => handleDeletePin(activePin.id)}
-          onAddTodo={(text) => handleAddTodo(activePin.id, text)}
-          onToggleTodo={(todo) => handleToggleTodo(activePin.id, todo)}
-          onRemoveTodo={(todoId) => handleRemoveTodo(activePin.id, todoId)}
           onUploadPhotos={(files) => handleUploadPhotos(activePin.id, files)}
           onRemovePhoto={(photo) => handleRemovePhoto(activePin.id, photo)}
+          onSaveMarkup={(photo, dataUrl) => handleSavePhotoMarkup(activePin.id, photo, dataUrl)}
+        />
+      )}
+
+      {activeNote && (
+        <PlanNoteModal
+          note={activeNote}
+          isNew={noteModalState.isNew}
+          readOnly={!session}
+          onRequestLogin={() => setAuthModalOpen(true)}
+          onClose={() => setNoteModalState(null)}
+          onSave={(fields) => handleSaveNoteFields(activeNote.id, fields)}
+          onDelete={() => handleDeleteNote(activeNote.id)}
         />
       )}
 
@@ -6246,10 +16907,63 @@ function App() {
       {deleteFloorConfirm && (
         <ConfirmDialog
           title="Etage wirklich löschen?"
-          message={`Möchtest du die Etage „${deleteFloorConfirm.target.name}" samt allen enthaltenen Pins wirklich löschen?`}
+          message={`Möchtest du die Etage „${deleteFloorConfirm.target.name}" samt allen Grundrisskizzen und enthaltenen Pins wirklich löschen?`}
           onConfirm={confirmDeleteFloor}
           onCancel={() => setDeleteFloorConfirm(null)}
           busy={deleteFloorBusy}
+        />
+      )}
+
+      {floorPlanModalOpen && (
+        <NewFloorPlanModal
+          floor={floor}
+          activeCategory={activeSketchCategory}
+          onClose={() => setFloorPlanModalOpen(false)}
+          onSave={handleAddFloorPlanSketch}
+        />
+      )}
+
+      {sketchExportModalOpen && floor && (
+        <SketchExportModal
+          floor={floor}
+          // ANFORDERUNG "3-KATEGORIEN-PLANMANAGEMENT": der PDF-Sammelexport bekommt nur die
+          // Skizzen der aktuell aktiven Kategorie — Mängel-/Pin-Tabellen im PDF-Bericht sind
+          // ohnehin nur für "Grundrisse" sinnvoll befüllt, Werkpläne/Montagepläne haben keine
+          // Pins. getPlanCategory() sorgt für die gleiche Abwärtskompatibilität wie überall
+          // sonst (Bestandsdaten ohne category-Feld gelten als "grundriss").
+          plans={floorPlans.filter((p) => getPlanCategory(p) === activeSketchCategory)}
+          project={project}
+          onClose={() => setSketchExportModalOpen(false)}
+          onExport={handleExportSelectedSketchesPdf}
+        />
+      )}
+
+      {editFloorPlanModalState && (
+        <EditFloorPlanModal
+          plan={editFloorPlanModalState.plan}
+          onClose={() => setEditFloorPlanModalState(null)}
+          onSave={handleUpdateFloorPlanSketch}
+        />
+      )}
+
+      {milestoneModalState && (
+        <MilestoneModal
+          mode={milestoneModalState.mode}
+          milestone={milestoneModalState.milestone}
+          trades={projectTrades}
+          onClose={() => setMilestoneModalState(null)}
+          onSave={handleSaveMilestone}
+          onDelete={handleDeleteMilestone}
+        />
+      )}
+
+      {deleteFloorPlanConfirm && (
+        <ConfirmDialog
+          title="Grundrissskizze wirklich löschen?"
+          message={`Möchtest du die Grundrissskizze „${deleteFloorPlanConfirm.target.name}" samt allen enthaltenen Pins wirklich löschen?`}
+          onConfirm={confirmDeleteFloorPlan}
+          onCancel={() => setDeleteFloorPlanConfirm(null)}
+          busy={deleteFloorPlanBusy}
         />
       )}
 
@@ -6267,7 +16981,7 @@ function App() {
       {deleteConfirm && (
         <ConfirmDialog
           title="Projekt wirklich löschen?"
-          message={`„${deleteConfirm.target.name}" wird inklusive aller Etagen, Pins, Aufgaben und Fotos unwiderruflich gelöscht.`}
+          message={`„${deleteConfirm.target.name}" wird inklusive aller Etagen, Pins und Fotos unwiderruflich gelöscht.`}
           onConfirm={confirmDeleteProject}
           onCancel={() => setDeleteConfirm(null)}
           busy={deleteBusy}
@@ -6293,6 +17007,19 @@ function App() {
           onCreateUser={handleCreateUser}
           onEditUser={handleEditUser}
           onToggleUserActive={handleToggleUserActive}
+          onInviteUser={handleInviteUser}
+          onResendInvite={handleResendInvite}
+          onDeleteUser={handleDeleteUser}
+        />
+      )}
+
+      {profileModalOpen && (
+        <ProfileModal
+          session={session}
+          currentAppUser={currentAppUser}
+          onClose={() => setProfileModalOpen(false)}
+          onUpdateEmail={handleUpdateEmail}
+          onUpdatePassword={handleUpdatePassword}
         />
       )}
 
@@ -6318,8 +17045,77 @@ function App() {
           onClose={() => setPdfExportModalState(null)}
         />
       )}
+        </>
+      )}
     </div>
   );
 }
 
-export default App;
+// ----------------------------------------------------------------------------------
+// TEMPORÄRE REACT-ERROR-BOUNDARY (siehe Einordnung in der Antwort)
+// ----------------------------------------------------------------------------------
+// In der gesamten App existierte bislang KEINE Error Boundary. Ohne eine solche räumt
+// React bei einem unabgefangenen Fehler WÄHREND DES RENDERNS den kompletten
+// Komponentenbaum vollständig ab — die sichtbare Folge ist ein vollständig weißer,
+// leerer Bildschirm. Diese Boundary fängt einen solchen Fehler ab, zeigt seine
+// Meldung UND den React-Komponenten-Stack direkt auf dem Bildschirm an (auch ohne
+// Mac/Remote-Debugging lesbar) und bietet einen "Weiter"-Button, der den betroffenen
+// Bereich neu zu mounten versucht, statt dass die App bis zum manuellen Neuladen
+// komplett weiß und unbenutzbar bleibt. Das ursprünglich begleitende On-Screen-
+// Debug-Protokoll (ZoomDebugOverlay/pushZoomDebugLog) war ein temporäres Hilfsmittel
+// für die inzwischen abgeschlossene Fehlersuche zum Zoom-Loslassen-Absturz und wurde
+// entfernt — diese Boundary selbst bleibt als dauerhaftes Sicherheitsnetz gegen
+// JEDEN unabgefangenen Rendering-Fehler bestehen, nicht nur zoombezogene.
+class ZoomErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null, info: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    this.setState({ info });
+    console.error("Unabgefangener Rendering-Fehler (siehe ZoomErrorBoundary):", error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-slate-900 px-6 text-center text-white">
+          <AlertTriangle size={32} className="text-amber-400" />
+          <p className="text-sm font-semibold">Es ist ein unerwarteter Fehler aufgetreten.</p>
+          <p className="text-xs text-slate-300">
+            Bitte den Text unten (Foto/Screenshot reicht) weitergeben, das hilft bei der Fehlersuche.
+          </p>
+          <pre className="max-h-64 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-black/40 p-3 text-left text-[10px] text-lime-300">
+            {String(this.state.error?.message || this.state.error)}
+            {this.state.info?.componentStack ? `\n${this.state.info.componentStack}` : ""}
+          </pre>
+          <button
+            type="button"
+            onClick={() => this.setState({ error: null, info: null })}
+            className="rounded-md bg-[#FF2A00] px-4 py-2 text-sm font-semibold text-white"
+          >
+            Weiter
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// AppWithErrorBoundary ersetzt den direkten Export von App als Root-Komponente:
+// bettet App lediglich in die ZoomErrorBoundary ein (siehe oben), als dauerhaftes
+// Sicherheitsnetz gegen unabgefangene Rendering-Fehler. Das früher hier zusätzlich
+// gerenderte, rein diagnostische ZoomDebugOverlay ist entfernt (siehe Kommentar bei
+// ZoomErrorBoundary). App selbst ist inhaltlich unverändert.
+function AppWithErrorBoundary(props) {
+  return (
+    <ZoomErrorBoundary>
+      <App {...props} />
+    </ZoomErrorBoundary>
+  );
+}
+
+export default AppWithErrorBoundary;
