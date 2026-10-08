@@ -1,0 +1,808 @@
+@@ -1,5 +1,7 @@
+ import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, forwardRef } from "react";
+ import { createClient } from "@supabase/supabase-js";
++import { supabase } from "./lib/supabaseClient";
++import { OfflineSyncManager, syncEngine, offlineStore, useOfflineSync } from "./offline";
+ import {
+   Search,
+   ChevronLeft,
+@@ -103,7 +105,9 @@
+   );
+ }
+ 
+-const supabase = createClient(supabaseUrl, supabaseAnonKey);
++// Der reguläre Supabase-Client kommt aus ./lib/supabaseClient und wird auch vom Offline-Sync
++// (./offline) verwendet. Zwei getrennte Clients mit demselben Auth-Speicher würden sich
++// gegenseitig die Sitzung und den Token-Refresh streitig machen.
+ 
+ // Eigener, unabhängiger zweiter Supabase-Client ausschließlich für den Admin-
+ // Einladungsversand (siehe inviteUserToApp/resendUserInvite weiter unten). BEWUSST
+@@ -900,6 +904,9 @@
+   return data ?? [];
+ }
+ 
++// Hinweis: Die App lädt Pins seit der Dexie-Umstellung über syncEngine.refreshPlan (./offline,
++// dieselbe Abfrage, siehe pullPlan in offline/syncService.js). Diese Funktion bleibt als
++// Referenz/Direktabfrage erhalten.
+ // Pins einer konkreten Grundrissskizze (Ebene 4) inkl. aller zugehörigen Fotos in
+ // einem einzigen Request laden (verschachtelter Supabase-Select über die
+ // Fremdschlüssel). Strikte Datentrennung: gefiltert wird über plan_id, nicht mehr
+@@ -2161,14 +2168,13 @@
+ function readCachedFloorPlans(floorId) {
+   return readJsonStorage(OFFLINE_CACHE_KEY, {}).plansByFloor?.[floorId] || null;
+ }
+-function cachePinsOffline(planId, pins) {
+-  const cache = readJsonStorage(OFFLINE_CACHE_KEY, {});
+-  writeJsonStorage(OFFLINE_CACHE_KEY, { ...cache, pinsByPlan: { ...(cache.pinsByPlan || {}), [planId]: pins } });
+-}
++// Nur noch Lese-Fallback (einmalige Übernahme alter Caches nach Dexie, siehe Pins-Ladeeffekt
++// in App()). Geschrieben wird dieser Cache nicht mehr: Pins liegen seit der Umstellung auf
++// Offline-First in Dexie (./offline).
+ function readCachedPins(planId) {
+   return readJsonStorage(OFFLINE_CACHE_KEY, {}).pinsByPlan?.[planId] || null;
+ }
+-// Notizen bekommen denselben reinen Lese-Cache wie Pins (siehe cachePinsOffline) —
++// Notizen bekommen einen reinen Lese-Cache (Pins liegen seit der Dexie-Umstellung in ./offline) —
+ // Anlegen/Ändern/Löschen bleibt aber, anders als bei Pins, an eine bestehende
+ // Verbindung gebunden (siehe requireOnline-Guards in App()), es gibt also bewusst
+ // keine analoge Synchronisations-Warteschlange für Notizen.
+@@ -2360,21 +2366,9 @@
+ // aktuellen Pins-Stand einer Skizze aufgerufen (siehe die synchronisierenden
+ // useEffects in App() weiter unten), ein Diffing auf Einzel-Pin-Ebene wäre hier
+ // unnötige Komplexität.
+-async function savePinsToIDB(floorId, pinsArray) {
+-  if (!floorId) return;
+-  try {
+-    const db = await openBaudocIdb();
+-    await new Promise((resolve, reject) => {
+-      const tx = db.transaction(IDB_PINS_STORE, "readwrite");
+-      tx.objectStore(IDB_PINS_STORE).put({ floorId, pins: pinsArray || [], cachedAt: Date.now() });
+-      tx.oncomplete = () => resolve();
+-      tx.onerror = () => reject(tx.error);
+-    });
+-  } catch (err) {
+-    console.warn(`IndexedDB: Pins für "${floorId}" konnten nicht zwischengespeichert werden:`, err);
+-  }
+-}
+-
++// savePinsToIDB entfällt: Pins werden nicht mehr in diesen Store gespiegelt, sondern in Dexie
++// (./offline) geführt. getPinsFromIDB bleibt als Lese-Fallback für die einmalige Übernahme
++// bereits zwischengespeicherter Stände.
+ async function getPinsFromIDB(floorId) {
+   if (!floorId) return null;
+   try {
+@@ -2553,15 +2547,6 @@
+ // (flushSyncQueue) wird die data:-URL wieder in eine echte Datei zurückverwandelt,
+ // damit derselbe uploadPinPhoto()-Pfad wie beim Online-Upload verwendet werden kann.
+ 
+-function fileToDataUrl(file) {
+-  return new Promise((resolve, reject) => {
+-    const reader = new FileReader();
+-    reader.onload = () => resolve(reader.result);
+-    reader.onerror = () => reject(reader.error);
+-    reader.readAsDataURL(file);
+-  });
+-}
+-
+ function dataUrlToFile(dataUrl, fileName, mimeType) {
+   const [header, base64] = dataUrl.split(",");
+   const mime = mimeType || header.match(/:(.*?);/)?.[1] || "application/octet-stream";
+@@ -2593,7 +2578,7 @@
+ // ein Plan/Foto, das auf diesem Gerät noch nie ONLINE geöffnet wurde, kann naturgemäß
+ // nicht offline verfügbar sein — das ist keine Lücke dieser Implementierung, sondern
+ // die Grenze jedes Offline-Caches. Ein offline aufgenommenes/noch unsynchronisiertes
+-// Foto (data:-URL, siehe fileToDataUrl) ist bereits vollständig lokal und läuft
++// Foto (data:-URL) ist bereits vollständig lokal und läuft
+ // bewusst NICHT durch diesen Cache.
+ const ASSET_CACHE_DB_NAME = "baudoc_asset_cache_v1";
+ const ASSET_CACHE_STORE = "assets";
+@@ -14944,6 +14929,8 @@
+   const [online, setOnline] = useState(() => isOnline());
+   const [syncQueue, setSyncQueue] = useState(() => readSyncQueue());
+   const [syncing, setSyncing] = useState(false);
++  // Sync-Status der Dexie-Schicht (./offline): ausstehende Pins, laufender Lauf, Ergebnis des letzten Laufs.
++  const { pendingCount: pendingPinCount, isSyncing: pinsSyncing, lastResult: pinSyncResult } = useOfflineSync();
+ 
+   const project = projects.find((p) => p.id === selectedProjectId);
+   const floor = floors.find((f) => f.id === selectedFloorId);
+@@ -15238,11 +15225,13 @@
+     setActiveSketchCategory("grundriss");
+   }, [selectedFloorId]);
+ 
+-  // ANFORDERUNG "INTEGRATION VON INDEXEDDB-CACHING FÜR GRUNDRISSE & PINS": exakt
+-  // dieselbe Stale-While-Revalidate-Strategie wie beim floorPlans-Effekt oben, hier
+-  // für die Pins der gerade geöffneten Grundrissskizze (siehe getPinsFromIDB/
+-  // savePinsToIDB oben — aufgerufen mit selectedFloorPlanId als Schlüssel, siehe
+-  // Kommentar am "pins"-Store).
++  // Pins der geöffneten Grundrissskizze: Offline-First über Dexie (./offline).
++  // 1. Sofort den lokalen Stand zeigen (kein Warten auf das Netz).
++  // 2. Ist eine Verbindung da: erst lokale, noch nicht übertragene Änderungen hochladen, dann den
++  //    Serverstand per Pull in Dexie einmischen (ungesyncte lokale Änderungen bleiben erhalten)
++  //    und neu anzeigen.
++  // 3. Ohne Verbindung und ohne lokalen Stand: einmalige Übernahme der alten Caches (IndexedDB/
++  //    localStorage aus der Zeit vor Dexie), damit bereits geöffnete Skizzen offline lesbar bleiben.
+   useEffect(() => {
+     if (!selectedFloorPlanId) {
+       setPins([]);
+@@ -15251,37 +15240,45 @@
+     }
+     let cancelled = false;
+     (async () => {
+-      let pinsServedFromIdb = false;
++      let servedLocally = false;
+       try {
+-        const idbPins = await getPinsFromIDB(selectedFloorPlanId);
+-        if (!cancelled && idbPins && idbPins.length > 0) {
+-          setPins(idbPins);
++        const localPins = await offlineStore.loadPlanPins(selectedFloorPlanId);
++        if (!cancelled && localPins.length > 0) {
++          setPins(localPins);
+           setLoadingPins(false);
+-          pinsServedFromIdb = true;
++          servedLocally = true;
+         }
+       } catch (err) {
+-        console.warn("IndexedDB-Zwischenspeicher für Pins konnte nicht gelesen werden:", err);
++        console.warn("Lokaler Pin-Stand (Dexie) konnte nicht gelesen werden:", err);
+       }
+-      if (!pinsServedFromIdb && !cancelled) setLoadingPins(true);
++      if (!servedLocally && !cancelled) setLoadingPins(true);
+       try {
+         if (!isOnline()) throw new Error("Keine Internetverbindung.");
+-        const data = await fetchPinsWithDetails(selectedFloorPlanId);
+-        if (!cancelled) {
+-          setPins(data);
+-          cachePinsOffline(selectedFloorPlanId, data);
+-          savePinsToIDB(selectedFloorPlanId, data);
+-        }
++        await syncEngine.refreshPlan(selectedFloorPlanId);
++        const fresh = await offlineStore.loadPlanPins(selectedFloorPlanId);
++        if (!cancelled) setPins(fresh);
+       } catch (err) {
+-        if (pinsServedFromIdb) {
+-          console.warn(
+-            "Pins konnten im Hintergrund nicht aktualisiert werden, zuletzt zwischengespeicherter Stand (IndexedDB) bleibt sichtbar:",
+-            err
+-          );
++        if (servedLocally) {
++          console.warn("Pins konnten im Hintergrund nicht aktualisiert werden, lokaler Stand (Dexie) bleibt sichtbar:", err);
+         } else {
+-          const cached = readCachedPins(selectedFloorPlanId);
+-          if (cached) {
+-            console.warn("Pins konnten nicht live geladen werden, verwende Offline-Cache:", err);
+-            if (!cancelled) setPins(cached);
++          // Migrationspfad: alte Caches einmalig nach Dexie übernehmen. Pins mit offline_-ID gehören
++          // noch zur alten Warteschlange und werden dort synchronisiert, nicht hier.
++          let legacyPins = null;
++          try {
++            legacyPins = (await getPinsFromIDB(selectedFloorPlanId)) || readCachedPins(selectedFloorPlanId);
++          } catch {
++            legacyPins = readCachedPins(selectedFloorPlanId);
++          }
++          const importable = (legacyPins || []).filter((p) => !isOfflineId(p.id));
++          if (importable.length > 0) {
++            console.warn("Pins konnten nicht live geladen werden, übernehme alten Offline-Cache nach Dexie:", err);
++            try {
++              await offlineStore.cacheServerPins(importable);
++              if (!cancelled) setPins(await offlineStore.loadPlanPins(selectedFloorPlanId));
++            } catch (importErr) {
++              console.error("Alter Offline-Cache konnte nicht nach Dexie übernommen werden:", importErr);
++              if (!cancelled) setPins(importable);
++            }
+           } else {
+             console.error("Pins konnten nicht geladen werden:", err);
+             if (!cancelled) setGlobalError("Pins konnten nicht geladen werden. Bitte erneut versuchen.");
+@@ -15337,12 +15334,8 @@
+   useEffect(() => {
+     if (selectedFloorId) saveSketchesForFloorToIDB(selectedFloorId, floorPlans);
+   }, [floorPlans, selectedFloorId]);
+-  useEffect(() => {
+-    if (selectedFloorPlanId) savePinsToIDB(selectedFloorPlanId, pins);
+-  }, [pins, selectedFloorPlanId]);
+-  useEffect(() => {
+-    if (selectedFloorPlanId) cachePinsOffline(selectedFloorPlanId, pins);
+-  }, [pins, selectedFloorPlanId]);
++  // Pins werden hier bewusst nicht mehr gespiegelt: Dexie (./offline) ist die Quelle der Wahrheit
++  // und wird von den Pin-Handlern selbst geschrieben.
+   useEffect(() => {
+     if (selectedFloorPlanId) cachePlanNotesOffline(selectedFloorPlanId, planNotes);
+   }, [planNotes, selectedFloorPlanId]);
+@@ -15425,13 +15418,33 @@
+     };
+   }, []);
+ 
+-  // Ein Pin gilt als "noch nicht synchronisiert", solange irgendein Eintrag in der
+-  // Warteschlange sich auf ihn bezieht — entweder über seine (dann noch lokale)
+-  // Offline-ID, oder weil bereits eine Folgeänderung für ihn wartet. Weitere
+-  // Bearbeitungen an einem solchen Pin werden bewusst ebenfalls eingereiht (statt
+-  // direkt an Supabase gesendet), damit die Reihenfolge der Änderungen erhalten
+-  // bleibt, auch wenn zwischenzeitlich kurz wieder eine Verbindung bestand.
+-  const isPinPendingSync = (pinId) => isOfflineId(pinId) || syncQueue.some((q) => q.pinId === pinId || q.localId === pinId);
++  // Hinweis: Pins, Pin-Fotos, Verlauf und Löschungen laufen seit der Umstellung auf Dexie
++  // (./offline) nicht mehr über diese Warteschlange. Sie nimmt nur noch Einträge auf, die
++  // noch nicht umgestellt sind (reorder_floors, update_photo für bereits synchronisierte
++  // Fotos) sowie Altbestände aus der Zeit vor der Umstellung (create_pin/update_pin/
++  // upload_photo/delete_pin), die beim ersten Online-Gang nach dem Update noch abgearbeitet werden.
++
++  // Meldet fehlgeschlagene Übertragungen der Dexie-Schicht. Reine Verbindungsabbrüche bleiben still,
++  // sie werden automatisch beim nächsten "online" wiederholt (der Status-Indikator zeigt die ausstehenden).
++  useEffect(() => {
++    if (!pinSyncResult || pinSyncResult.failed === 0) return;
++    if (pinSyncResult.aborted === "network" || pinSyncResult.aborted === "offline") return;
++    setGlobalError(
++      pinSyncResult.aborted === "session"
++        ? "Die Anmeldung ist abgelaufen. Lokal gespeicherte Änderungen werden übertragen, sobald du wieder angemeldet bist."
++        : "Ein Teil der lokal gespeicherten Änderungen konnte noch nicht übertragen werden. Die App versucht es automatisch erneut."
++    );
++  }, [pinSyncResult]);
++
++  // Frisch hochgeladene Pin-Fotos für die Offline-Anzeige vormerken (best effort, siehe
++  // cacheAssetForOfflineUseInBackground): lokal wird nach dem Upload kein Blob mehr vorgehalten.
++  useEffect(
++    () =>
++      syncEngine.onSynced((result) => {
++        (result.uploadedPhotoUrls || []).forEach((url) => cacheAssetForOfflineUseInBackground(url));
++      }),
++    []
++  );
+ 
+   // Arbeitet die Warteschlange sequenziell (FIFO) ab, sobald wieder eine Verbindung
+   // besteht — ein einzelner fehlschlagender Eintrag beendet den Lauf, alle bereits
+@@ -15539,8 +15552,9 @@
+     }
+     if (selectedFloorPlanId) {
+       try {
+-        const freshPins = await fetchPinsWithDetails(selectedFloorPlanId);
+-        setPins(freshPins);
++        // Erst lokale Änderungen hochladen, dann Serverstand holen und in Dexie einmischen.
++        await syncEngine.refreshPlan(selectedFloorPlanId);
++        setPins(await offlineStore.loadPlanPins(selectedFloorPlanId));
+       } catch (err) {
+         console.error("Pins konnten nach der Synchronisation nicht aktualisiert werden:", err);
+       }
+@@ -16189,62 +16203,25 @@
+     const overrides = {};
+     const createdDetail = "Mängel-Pin angelegt";
+     try {
+-      // Offline-First (Punkt 15): ohne Verbindung wird der Pin sofort lokal mit einer
+-      // eigenen Offline-ID angelegt (sichtbar, bearbeitbar, fotografierbar wie jeder
+-      // andere Pin) und die Anlage in die Warteschlange eingereiht. flushSyncQueue
+-      // ersetzt die Offline-ID beim nächsten Synchronisationslauf durch die echte.
+-      if (!online) {
+-        const localId = generateOfflineId();
+-        const nowIso = new Date().toISOString();
+-        const offlinePin = {
+-          id: localId,
+-          plan_id: plan.id,
+-          floor_id: floor.id,
+-          title: overrides.title || "Neuer Eintrag",
+-          description: overrides.description || "",
+-          status: "offen",
+-          priority: overrides.priority || "mittel",
+-          assigned_to: "",
+-          trade_ids: overrides.trade_ids || [],
+-          x,
+-          y,
+-          angle: 0,
+-          created_at: nowIso,
+-          updated_at: nowIso,
+-          created_by: currentActor?.email || null,
+-          updated_by: currentActor?.email || null,
+-          pin_photos: [],
+-          pin_activity_log: [
+-            {
+-              id: generateOfflineId(),
+-              pin_id: localId,
+-              action: "created",
+-              detail: `${createdDetail} (offline erfasst, wird synchronisiert)`,
+-              actor_email: currentActor?.email || null,
+-              actor_name: currentActor?.name || null,
+-              created_at: nowIso,
+-            },
+-          ],
+-        };
+-        setPins((prev) => [...prev, offlinePin]);
+-        addPinSummary(floor.id, plan.id, offlinePin);
+-        setSyncQueue(
+-          enqueueSyncItem({ type: "create_pin", localId, planId: plan.id, floorId: floor.id, x, y, overrides, actor: currentActor })
+-        );
+-        setModalState({ pinId: localId, isNew: true });
+-        return;
+-      }
+-      const newPin = await createPin(plan.id, floor.id, x, y, currentActor, overrides);
+-      // Abschnitt 3: automatische Zeit-/Benutzererfassung — jede Pin-Erstellung wird
+-      // sofort mit einem eigenen Eintrag in der Bearbeitungshistorie protokolliert.
+-      const activity = await logPinActivity(newPin.id, "created", createdDetail, currentActor);
+-      const pinWithActivity = { ...newPin, pin_activity_log: [activity] };
+-      setPins((prev) => [...prev, pinWithActivity]);
+-      addPinSummary(floor.id, plan.id, pinWithActivity);
++      // Offline-First: der Pin wird IMMER zuerst lokal in Dexie angelegt, online wie offline. Die UUID
++      // entsteht auf dem Gerät und ist identisch mit der späteren Supabase-ID, es gibt keine
++      // Offline-ID und kein ID-Mapping mehr. Der Upload läuft im Hintergrund (syncEngine).
++      const newPin = await offlineStore.createPinLocal({
++        planId: plan.id,
++        floorId: floor.id,
++        x,
++        y,
++        actor: currentActor,
++        overrides,
++        activityDetail: online ? createdDetail : `${createdDetail} (offline erfasst)`,
++      });
++      setPins((prev) => [...prev, newPin]);
++      addPinSummary(floor.id, plan.id, newPin);
+       setModalState({ pinId: newPin.id, isNew: true });
++      syncEngine.requestSync();
+     } catch (err) {
+-      console.error("Pin konnte nicht angelegt werden:", err);
+-      setGlobalError("Der neue Pin konnte nicht angelegt werden. Bitte Verbindung prüfen und erneut versuchen.");
++      console.error("Pin konnte nicht lokal angelegt werden:", err);
++      setGlobalError("Der neue Pin konnte nicht gespeichert werden. Bitte erneut versuchen.");
+     } finally {
+       setCreatingPin(false);
+     }
+@@ -16274,6 +16251,9 @@
+         currentActor
+       );
+       const pinWithActivity = { ...newPin, pin_activity_log: [activity] };
++      // Die Kopie wurde direkt in Supabase angelegt: lokal (Dexie) als bereits synchronisiert ablegen,
++      // damit sie auch offline sichtbar, bearbeitbar und löschbar ist.
++      await offlineStore.cacheServerPin(pinWithActivity);
+       setPins((prev) => [...prev, pinWithActivity]);
+       addPinSummary(floor.id, plan.id, pinWithActivity);
+       setModalState({ pinId: newPin.id, isNew: false });
+@@ -16294,22 +16274,21 @@
+     const prevPin = pins.find((p) => p.id === pinId);
+     if (!prevPin) return;
+     setPins((prev) => prev.map((p) => (p.id === pinId ? { ...p, x, y } : p))); // optimistisches Update
+-    if (!online || isPinPendingSync(pinId)) {
+-      setSyncQueue(enqueueSyncItem({ type: "update_pin", pinId, fields: { x, y }, actor: currentActor }));
+-      appendPinActivity(pinId, {
+-        id: generateOfflineId(),
+-        pin_id: pinId,
+-        action: "moved",
+-        detail: "Position auf dem Grundriss verschoben (offline erfasst, wird synchronisiert)",
+-        actor_email: currentActor?.email || null,
+-        actor_name: currentActor?.name || null,
+-        created_at: new Date().toISOString(),
+-      });
+-      return;
+-    }
+     try {
+-      await updatePin(pinId, { x, y }, currentActor);
+-      appendPinActivity(pinId, await logPinActivity(pinId, "moved", "Position auf dem Grundriss verschoben", currentActor));
++      const { pin: updated, activities } = await offlineStore.updatePinLocal(
++        pinId,
++        { x, y },
++        {
++          actor: currentActor,
++          activities: [{ action: "moved", detail: `Position auf dem Grundriss verschoben${online ? "" : " (offline erfasst)"}` }],
++        }
++      );
++      setPins((prev) =>
++        prev.map((p) =>
++          p.id === pinId ? { ...p, ...updated, pin_activity_log: [...(p.pin_activity_log || []), ...activities] } : p
++        )
++      );
++      syncEngine.requestSync();
+     } catch (err) {
+       console.error("Pin-Position konnte nicht gespeichert werden:", err);
+       setGlobalError("Die neue Position des Pins konnte nicht gespeichert werden.");
+@@ -16319,98 +16298,46 @@
+ 
+   const handleSaveFields = async (pinId, fields) => {
+     const prevPin = pins.find((p) => p.id === pinId);
+-    if (!online || isPinPendingSync(pinId)) {
+-      // Offline-First (Punkt 15): Feldänderungen (Titel, Beschreibung, Gewerk,
+-      // Bereich, Priorität) UND Statuswechsel (Offen → In Bearbeitung →
+-      // Abgeschlossen/Freigabe) laufen über denselben Save-Aufruf wie online — der
+-      // Unterschied ist ausschließlich, dass hier lokal aktualisiert und in die
+-      // Warteschlange eingereiht statt sofort an Supabase gesendet wird.
+-      const nowIso = new Date().toISOString();
+-      let statusChangeDetail = null;
+-      let updatedDetail = null;
+-      const newActivity = [];
+-      if (prevPin && fields.status !== undefined && fields.status !== prevPin.status) {
+-        const fromLabel = STATUS[prevPin.status]?.label || prevPin.status;
+-        const toLabel = STATUS[fields.status]?.label || fields.status;
+-        statusChangeDetail = `Status: ${fromLabel} → ${toLabel}`;
+-        newActivity.push({
+-          id: generateOfflineId(),
+-          pin_id: pinId,
+-          action: "status_changed",
+-          detail: `${statusChangeDetail} (offline erfasst, wird synchronisiert)`,
+-          actor_email: currentActor?.email || null,
+-          actor_name: currentActor?.name || null,
+-          created_at: nowIso,
+-        });
+-      }
+-      if (prevPin) {
+-        // pinFieldValueChanged statt eines rohen !==-Vergleichs: bei trade_ids (Array,
+-        // siehe Multi-Select Gewerke) entsteht bei JEDEM Speichern ein neues Array-
+-        // Objekt, ein reiner Referenzvergleich hätte hier fälschlich immer "geändert"
+-        // protokolliert. getPinTradeIds(prevPin) statt prevPin.trade_ids direkt fängt
+-        // zusätzlich ältere, noch nicht auf trade_ids migrierte Pin-Datensätze ab.
+-        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter((key) => {
+-          if (!Object.prototype.hasOwnProperty.call(fields, key)) return false;
+-          const oldVal = key === "trade_ids" ? getPinTradeIds(prevPin) : prevPin[key];
+-          return pinFieldValueChanged(key, fields[key], oldVal);
++    const suffix = online ? "" : " (offline erfasst)";
++    // Feldänderungen (Titel, Beschreibung, Gewerk, Bereich, Priorität) und Statuswechsel laufen über
++    // denselben Weg: erst lokal in Dexie, dann im Hintergrund nach Supabase. Die Verlaufseinträge
++    // werden dabei mitgeschrieben und mit dem Pin übertragen.
++    const activities = [];
++    // Statusänderungen (inkl. Freigabe/Abschluss auf "erledigt") werden bewusst als eigener, klar
++    // benannter Verlaufseintrag protokolliert statt nur als generisches "aktualisiert" (Abschnitt 3).
++    if (prevPin && fields.status !== undefined && fields.status !== prevPin.status) {
++      const fromLabel = STATUS[prevPin.status]?.label || prevPin.status;
++      const toLabel = STATUS[fields.status]?.label || fields.status;
++      activities.push({ action: "status_changed", detail: `Status: ${fromLabel} → ${toLabel}${suffix}` });
++    }
++    if (prevPin) {
++      // pinFieldValueChanged statt eines rohen !==-Vergleichs: bei trade_ids (Array, siehe Multi-Select
++      // Gewerke) entsteht bei JEDEM Speichern ein neues Array-Objekt, ein reiner Referenzvergleich hätte
++      // hier fälschlich immer "geändert" protokolliert. getPinTradeIds(prevPin) statt prevPin.trade_ids
++      // direkt fängt zusätzlich ältere, noch nicht auf trade_ids migrierte Pin-Datensätze ab.
++      const changedLabels = Object.keys(PIN_FIELD_LABELS).filter((key) => {
++        if (!Object.prototype.hasOwnProperty.call(fields, key)) return false;
++        const oldVal = key === "trade_ids" ? getPinTradeIds(prevPin) : prevPin[key];
++        return pinFieldValueChanged(key, fields[key], oldVal);
++      });
++      if (changedLabels.length > 0) {
++        activities.push({
++          action: "updated",
++          detail: `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}${suffix}`,
+         });
+-        if (changedLabels.length > 0) {
+-          updatedDetail = `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}`;
+-          newActivity.push({
+-            id: generateOfflineId(),
+-            pin_id: pinId,
+-            action: "updated",
+-            detail: `${updatedDetail} (offline erfasst, wird synchronisiert)`,
+-            actor_email: currentActor?.email || null,
+-            actor_name: currentActor?.name || null,
+-            created_at: nowIso,
+-          });
+-        }
+       }
+-      setPins((prev) =>
+-        prev.map((p) =>
+-          p.id === pinId
+-            ? { ...p, ...fields, updated_by: currentActor?.email || null, updated_at: nowIso, pin_activity_log: [...(p.pin_activity_log || []), ...newActivity] }
+-            : p
+-        )
+-      );
+-      if (floor && plan && fields.status !== undefined) updatePinSummaryStatus(floor.id, plan.id, pinId, fields.status);
+-      setSyncQueue(enqueueSyncItem({ type: "update_pin", pinId, fields, actor: currentActor, statusChangeDetail, updatedDetail }));
+-      setModalState(null);
+-      return;
+     }
+     try {
+-      const updated = await updatePin(pinId, fields, currentActor);
+-      const newActivity = [];
+-      // Statusänderungen (inkl. Freigabe/Abschluss auf "erledigt") werden bewusst als
+-      // eigener, klar benannter Verlaufseintrag protokolliert statt nur als generisches
+-      // "aktualisiert" — Abschnitt 3 verlangt das explizit.
+-      if (prevPin && fields.status !== undefined && fields.status !== prevPin.status) {
+-        const fromLabel = STATUS[prevPin.status]?.label || prevPin.status;
+-        const toLabel = STATUS[fields.status]?.label || fields.status;
+-        newActivity.push(await logPinActivity(pinId, "status_changed", `Status: ${fromLabel} → ${toLabel}`, currentActor));
+-      }
+-      if (prevPin) {
+-        // pinFieldValueChanged statt eines rohen !==-Vergleichs: bei trade_ids (Array,
+-        // siehe Multi-Select Gewerke) entsteht bei JEDEM Speichern ein neues Array-
+-        // Objekt, ein reiner Referenzvergleich hätte hier fälschlich immer "geändert"
+-        // protokolliert. getPinTradeIds(prevPin) statt prevPin.trade_ids direkt fängt
+-        // zusätzlich ältere, noch nicht auf trade_ids migrierte Pin-Datensätze ab.
+-        const changedLabels = Object.keys(PIN_FIELD_LABELS).filter((key) => {
+-          if (!Object.prototype.hasOwnProperty.call(fields, key)) return false;
+-          const oldVal = key === "trade_ids" ? getPinTradeIds(prevPin) : prevPin[key];
+-          return pinFieldValueChanged(key, fields[key], oldVal);
+-        });
+-        if (changedLabels.length > 0) {
+-          const detail = `Aktualisiert: ${changedLabels.map((k) => PIN_FIELD_LABELS[k]).join(", ")}`;
+-          newActivity.push(await logPinActivity(pinId, "updated", detail, currentActor));
+-        }
+-      }
++      const { pin: updated, activities: written } = await offlineStore.updatePinLocal(pinId, fields, {
++        actor: currentActor,
++        activities,
++      });
+       setPins((prev) =>
+-        prev.map((p) => (p.id === pinId ? { ...p, ...updated, pin_activity_log: [...(p.pin_activity_log || []), ...newActivity] } : p))
++        prev.map((p) => (p.id === pinId ? { ...p, ...updated, pin_activity_log: [...(p.pin_activity_log || []), ...written] } : p))
+       );
+       if (floor && plan) updatePinSummaryStatus(floor.id, plan.id, pinId, updated.status);
+       setModalState(null);
++      syncEngine.requestSync();
+     } catch (err) {
+       console.error("Pin konnte nicht gespeichert werden:", err);
+       setGlobalError("Die Änderungen am Pin konnten nicht gespeichert werden. Bitte erneut versuchen.");
+@@ -16433,34 +16360,19 @@
+   const handleDeletePin = async (pinId) => {
+     if (!floor || !plan) return;
+     const pinToDelete = pins.find((p) => p.id === pinId);
+-    if (!online || isPinPendingSync(pinId)) {
+-      // Offline-First (Erweiterung Löschungen): ein Pin, der auf diesem Gerät noch nie
+-      // synchronisiert wurde (offline angelegt, siehe isOfflineId/readOfflineIdMap),
+-      // existiert serverseitig noch gar nicht — dafür reicht es, ihn samt aller noch
+-      // ausstehenden Warteschlangen-Einträge (create_pin/update_pin/upload_photo/
+-      // update_photo) ersatzlos zu entfernen, statt einen "delete_pin"-Eintrag
+-      // anzulegen, der beim Synchronisieren ohnehin ins Leere liefe. Ein bereits
+-      // synchronisierter Pin bekommt stattdessen einen eigenen "delete_pin"-Eintrag,
+-      // der die Löschung nachholt, sobald wieder eine Verbindung besteht.
+-      if (isOfflineId(pinId) && !readOfflineIdMap()[pinId]) {
+-        const remaining = readSyncQueue().filter((q) => q.localId !== pinId && q.pinId !== pinId);
+-        writeSyncQueue(remaining);
+-        setSyncQueue(remaining);
+-      } else {
+-        setSyncQueue(
+-          enqueueSyncItem({ type: "delete_pin", pinId, photos: pinToDelete?.pin_photos || [], actor: currentActor })
+-        );
+-      }
+-      setPins((prev) => prev.filter((p) => p.id !== pinId));
+-      removePinSummary(floor.id, plan.id, pinId);
+-      setModalState(null);
+-      return;
+-    }
+     try {
+-      await deletePin(pinToDelete || { id: pinId, pin_photos: [] });
++      // Ein noch nie synchronisierter Pin verschwindet lokal ersatzlos. Ein bereits auf dem Server
++      // vorhandener bekommt einen Löschmarker, den die Sync-Engine nachzieht (inkl. Storage-Dateien).
++      const outcome = await offlineStore.deletePinLocal(pinId);
++      if (outcome === "none") {
++        // Pin ist lokal (Dexie) nicht bekannt, z. B. aus einem Altbestand: nur online direkt löschbar.
++        if (!requireOnline("Dieser Pin kann")) return;
++        await deletePin(pinToDelete || { id: pinId, pin_photos: [] });
++      }
+       setPins((prev) => prev.filter((p) => p.id !== pinId));
+       removePinSummary(floor.id, plan.id, pinId);
+       setModalState(null);
++      syncEngine.requestSync();
+     } catch (err) {
+       console.error("Pin konnte nicht gelöscht werden:", err);
+       setGlobalError("Der Pin konnte nicht gelöscht werden. Bitte erneut versuchen.");
+@@ -16551,70 +16463,16 @@
+   const handleUploadPhotos = async (pinId, files) => {
+     for (const file of files) {
+       try {
+-        // Client-seitige Komprimierung IMMER zuerst, für Offline- UND Online-Pfad
+-        // gleichermaßen — beide Zweige unten arbeiten ab hier ausschließlich mit
+-        // compressedFile, nie mit dem unkomprimierten Original. compressImage()
+-        // wirft nie selbst (siehe dortiger Kommentar), ein einzelnes fehlerhaftes
+-        // Foto fällt also bestenfalls auf die Originaldatei zurück, blockiert aber
+-        // nie den Upload als solchen.
++        // Client-seitige Komprimierung IMMER zuerst. compressImage() wirft nie selbst (siehe dortiger
++        // Kommentar), ein einzelnes fehlerhaftes Foto fällt also bestenfalls auf die Originaldatei zurück.
+         const compressedFile = await compressImage(file);
+-        // Offline-First (Punkt 15): das Foto wird sofort als data:-URL am Pin
+-        // angezeigt (Kamera-Aufnahme/Auswahl funktioniert unverändert) und der
+-        // eigentliche Supabase-Upload in die Warteschlange eingereiht. Die
+-        // Dropbox-Archivierung läuft ausschließlich für online aufgenommene Fotos
+-        // (siehe Kommentar im Offline-Modul der Datenschicht).
+-        if (!online || isPinPendingSync(pinId)) {
+-          const dataUrl = await fileToDataUrl(compressedFile);
+-          const nowIso = new Date().toISOString();
+-          const localPhoto = {
+-            id: generateOfflineId(),
+-            pin_id: pinId,
+-            photo_url: dataUrl,
+-            uploaded_by: currentActor?.email || null,
+-            created_at: nowIso,
+-          };
+-          setPins((prev) =>
+-            prev.map((p) =>
+-              p.id === pinId
+-                ? {
+-                    ...p,
+-                    pin_photos: [...(p.pin_photos || []), localPhoto],
+-                    pin_activity_log: [
+-                      ...(p.pin_activity_log || []),
+-                      {
+-                        id: generateOfflineId(),
+-                        pin_id: pinId,
+-                        action: "photo_added",
+-                        detail: `Foto hochgeladen: „${compressedFile.name}" (offline erfasst, wird synchronisiert)`,
+-                        actor_email: currentActor?.email || null,
+-                        actor_name: currentActor?.name || null,
+-                        created_at: nowIso,
+-                      },
+-                    ],
+-                  }
+-                : p
+-            )
+-          );
+-          setSyncQueue(
+-            enqueueSyncItem({
+-              type: "upload_photo",
+-              pinId,
+-              dataUrl,
+-              fileName: compressedFile.name,
+-              mimeType: compressedFile.type,
+-              actor: currentActor,
+-              // localPhotoId verknüpft diesen Warteschlangen-Eintrag mit dem lokal
+-              // angezeigten Foto — wird ein noch unsynchronisiertes Offline-Foto per
+-              // Markup-Editor bearbeitet (siehe handleSavePhotoMarkup), wird darüber
+-              // GENAU dieser Eintrag gefunden und seine dataUrl durch die bearbeitete
+-              // Fassung ersetzt, statt das unbearbeitete Original hochzuladen.
+-              localPhotoId: localPhoto.id,
+-            })
+-          );
+-          continue;
+-        }
+-        const photo = await uploadPinPhoto(pinId, compressedFile, currentActor);
+-        const activity = await logPinActivity(pinId, "photo_added", `Foto hochgeladen: „${compressedFile.name}"`, currentActor);
++        // Offline-First: das Foto liegt zuerst als Blob in Dexie (kein Base64 im localStorage mehr) und
++        // wird sofort am Pin angezeigt. Der Upload in den Storage samt pin_photos-Zeile läuft im
++        // Hintergrund (syncEngine), online wie offline.
++        const { photo, activity } = await offlineStore.addPhotoLocal(pinId, compressedFile, {
++          actor: currentActor,
++          activityDetail: `Foto hochgeladen: „${compressedFile.name}"${online ? "" : " (offline erfasst)"}`,
++        });
+         setPins((prev) =>
+           prev.map((p) =>
+             p.id === pinId
+@@ -16622,30 +16480,53 @@
+               : p
+           )
+         );
+-        // Dropbox-Archivierung (Abschnitt 4) ist bewusst best effort: sie läuft NACH
+-        // dem primären, bereits erfolgreichen Supabase-Upload und darf diesen bei
+-        // einem Fehlschlag weder rückgängig machen noch blockieren. Nutzt bewusst
+-        // dieselbe komprimierte Fassung wie der Supabase-Upload, nicht das Original —
+-        // sonst würden in Supabase und Dropbox zwei unterschiedliche Qualitätsstufen
+-        // desselben Fotos abgelegt.
+-        if (dropboxConnected && currentAppUser?.kuerzel) {
++        syncEngine.requestSync();
++        // Dropbox-Archivierung (Abschnitt 4) ist bewusst best effort und läuft nur für online
++        // aufgenommene Fotos. Sie nutzt dieselbe komprimierte Fassung wie der Supabase-Upload.
++        if (online && dropboxConnected && currentAppUser?.kuerzel) {
+           syncPhotoToDropbox(compressedFile, currentAppUser.kuerzel).catch((err) => {
+             console.error("Dropbox-Sync fehlgeschlagen:", err);
+             setGlobalError(`Foto wurde gespeichert, die Dropbox-Archivierung ist aber fehlgeschlagen: ${err?.message || err}`);
+           });
+         }
+       } catch (err) {
+-        console.error("Foto konnte nicht hochgeladen werden:", err);
+-        setGlobalError(`Foto "${file.name}" konnte nicht hochgeladen werden.`);
++        console.error("Foto konnte nicht gespeichert werden:", err);
++        setGlobalError(`Foto "${file.name}" konnte nicht gespeichert werden.`);
+       }
+     }
+   };
+ 
+   const handleRemovePhoto = async (pinId, photo) => {
+-    if (!requireOnline("Ein Foto kann")) return;
+     try {
+-      await deletePinPhoto(photo);
+-      const activity = await logPinActivity(pinId, "photo_removed", "Foto entfernt", currentActor);
++      // Foto, das noch gar nicht hochgeladen wurde: existiert nur lokal und lässt sich auch offline verwerfen.
++      if (await offlineStore.removePendingPhoto(photo.id)) {
++        const activity = await offlineStore.addActivityLocal(pinId, {
++          action: "photo_removed",
++          detail: `Foto entfernt${online ? "" : " (offline erfasst)"}`,
++          actor: currentActor,
++        });
++        setPins((prev) =>
++          prev.map((p) =>
++            p.id === pinId
++              ? {
++                  ...p,
++                  pin_photos: (p.pin_photos || []).filter((ph) => ph.id !== photo.id),
++                  pin_activity_log: [...(p.pin_activity_log || []), activity],
++                }
++              : p
++          )
++        );
++        syncEngine.requestSync();
++        return;
++      }
++      // Bereits hochgeladenes Foto: bleibt bewusst an eine bestehende Verbindung gebunden.
++      if (!requireOnline("Ein Foto kann")) return;
++      // Frisch aufgenommene Fotos zeigt die App bis zum nächsten Laden noch als data:-URL, für das
++      // Aufräumen im Storage wird die echte URL aus Dexie gebraucht.
++      const realUrl = (await offlineStore.getPhotoRemoteUrl(photo.id)) || photo.photo_url;
++      await deletePinPhoto({ ...photo, photo_url: realUrl });
++      await offlineStore.dropPhotoRow(photo.id);
++      const activity = await offlineStore.addActivityLocal(pinId, { action: "photo_removed", detail: "Foto entfernt", actor: currentActor });
+       setPins((prev) =>
+         prev.map((p) =>
+           p.id === pinId
+@@ -16657,25 +16538,22 @@
+             : p
+         )
+       );
++      syncEngine.requestSync();
+     } catch (err) {
+       console.error("Foto konnte nicht gelöscht werden:", err);
+       setGlobalError("Das Foto konnte nicht gelöscht werden.");
+     }
+   };
+ 
+-  // Foto-Markup (siehe PhotoMarkupEditor): das bearbeitete Bild wird sofort und
+-  // unabhängig vom Online-Status lokal im Pin-State hinterlegt ("im State des Pins
+-  // gesichert", siehe Anforderung) — die dauerhafte Speicherung läuft je nach
+-  // Herkunft/Verbindung über einen von drei Pfaden:
+-  //  1. Foto wurde offline aufgenommen und wartet SELBST noch auf Synchronisation
+-  //     (isOfflineId) → die bereits wartende "upload_photo"-Warteschlangen-Position
+-  //     wird direkt gepatcht (siehe localPhotoId oben), damit gleich die bearbeitete
+-  //     Fassung hochgeladen wird.
+-  //  2. Foto ist bereits synchronisiert, aber gerade keine Verbindung → eigener
+-  //     "update_photo"-Warteschlangen-Eintrag (siehe flushSyncQueue).
+-  //  3. Online & synchronisiert → direkter Upload via updatePinPhotoUrl.
++  // Foto-Markup (siehe PhotoMarkupEditor): das bearbeitete Bild wird sofort und unabhängig vom
++  // Online-Status lokal im Pin-State hinterlegt. Die dauerhafte Speicherung läuft je nach Herkunft
++  // über einen von drei Pfaden:
++  //  1. Foto wartet selbst noch auf den Upload (Blob in Dexie) -> das lokale Blob wird durch die
++  //     bearbeitete Fassung ersetzt, hochgeladen wird gleich die bearbeitete Version.
++  //  2. Foto ist bereits synchronisiert, aber gerade keine Verbindung -> "update_photo"-Eintrag in der
++  //     bestehenden Warteschlange (siehe flushSyncQueue).
++  //  3. Online & synchronisiert -> direkter Upload via updatePinPhotoUrl.
+   const handleSavePhotoMarkup = async (pinId, photo, editedDataUrl) => {
+-    const previousUrl = photo.photo_url;
+     setPins((prev) =>
+       prev.map((p) =>
+         p.id === pinId
+@@ -16684,17 +16562,21 @@
+       )
+     );
+ 
+-    if (isOfflineId(photo.id)) {
+-      const queue = readSyncQueue();
+-      const idx = queue.findIndex((q) => q.type === "upload_photo" && q.localPhotoId === photo.id);
+-      if (idx !== -1) {
+-        queue[idx] = { ...queue[idx], dataUrl: editedDataUrl };
+-        writeSyncQueue(queue);
+-        setSyncQueue(queue);
++    try {
++      if (await offlineStore.isPhotoPending(photo.id)) {
++        await offlineStore.replacePendingPhotoBlob(photo.id, offlineStore.dataUrlToBlob(editedDataUrl));
++        syncEngine.requestSync();
++        return;
+       }
++    } catch (err) {
++      console.error("Bearbeitetes Foto konnte nicht lokal gespeichert werden:", err);
++      setGlobalError("Das bearbeitete Foto konnte nicht lokal gespeichert werden.");
+       return;
+     }
+ 
++    // Echte Storage-URL der bisherigen Fassung (die App zeigt frisch hochgeladene Fotos noch als data:-URL).
++    const previousUrl = (await offlineStore.getPhotoRemoteUrl(photo.id)) || photo.photo_url;
++
+     if (!online) {
+       setSyncQueue(
+         enqueueSyncItem({ type: "update_photo", pinId, photoId: photo.id, oldPhotoUrl: previousUrl, dataUrl: editedDataUrl, actor: currentActor })
+@@ -16713,10 +16595,12 @@
+ 
+     try {
+       const updated = await updatePinPhotoUrl({ ...photo, photo_url: previousUrl }, editedDataUrl, currentActor);
++      await offlineStore.setPhotoUrlLocal(photo.id, updated.photo_url);
+       setPins((prev) =>
+         prev.map((p) => (p.id === pinId ? { ...p, pin_photos: (p.pin_photos || []).map((ph) => (ph.id === photo.id ? updated : ph)) } : p))
+       );
+-      appendPinActivity(pinId, await logPinActivity(pinId, "photo_edited", "Foto bearbeitet", currentActor));
++      appendPinActivity(pinId, await offlineStore.addActivityLocal(pinId, { action: "photo_edited", detail: "Foto bearbeitet", actor: currentActor }));
++      syncEngine.requestSync();
+     } catch (err) {
+       console.error("Bearbeitetes Foto konnte nicht dauerhaft gespeichert werden:", err);
+       setGlobalError("Das bearbeitete Foto konnte nicht dauerhaft gespeichert werden — die Änderung ist vorerst nur lokal sichtbar.");
+@@ -16726,6 +16610,10 @@
+   return (
+     <div className="min-h-screen w-full bg-slate-50 font-sans text-slate-900">
+       <SplashScreen />
++      {/* Startet den Offline-Sync (Dexie -> Supabase) beim Laden, bei "online" und beim Zurückkehren
++          in den Vordergrund. Erst nach dem Login aktiv (Row-Level-Security). Der Status wird über
++          den bestehenden OfflineStatusIndicator angezeigt, daher ohne eigenen Chip. */}
++      <OfflineSyncManager enabled={!!session} showBadge={false} />
+       {/* Verpflichtende App-Zugriffssperre (siehe isAuthenticated in App()): solange sie
+           aktiv ist, wird ausschließlich LoginScreen gerendert — weder Kopfzeile/
+           Navigation noch Projektlisten, Etagen, Grundrisse oder Pins existieren dann im
+@@ -16800,7 +16688,7 @@
+                 Zugriff (Anlegen/Umbenennen/Deaktivieren/Sortieren) erfolgt ausschließlich
+                 kontextbezogen aus dem Projektformular heraus, siehe onManageTrades bei
+                 ProjectFormModal weiter unten. */}
+-            <OfflineStatusIndicator online={online} pendingCount={syncQueue.length} syncing={syncing} />
++            <OfflineStatusIndicator online={online} pendingCount={syncQueue.length + pendingPinCount} syncing={syncing || pinsSyncing} />
+             <button
+               onClick={openDropboxModal}
+               title="Dropbox-Verbindung (Foto-Archivierung)"

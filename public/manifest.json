@@ -1,0 +1,21 @@
+{
+  "name": "BauDoc Baustellen App",
+  "short_name": "BauDoc",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1e293b",
+  "description": "Baustellendokumentation & Mängelverwaltung",
+  "icons": [
+    {
+      "src": "https://placehold.co/192x192/1e293b/ffffff.png?text=BauDoc",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://placehold.co/512x512/1e293b/ffffff.png?text=BauDoc",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
